@@ -1,0 +1,24 @@
+# Python runtime/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Observer runtime data contains prompts, tool output, PIDs, and local history.
+data/
+
+# Frontend dependencies and generated TypeScript metadata
+viewer/node_modules/
+viewer/*.tsbuildinfo
+viewer/vite.config.js
+viewer/vite.config.d.ts
+viewer/dist/**/*.map
+
+# Local agent scratch files
+.claude/
+.codex/
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
