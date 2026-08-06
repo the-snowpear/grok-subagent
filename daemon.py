@@ -44,6 +44,10 @@ RETENTION_DAYS = 7
 TERMINAL = {"completed", "failed", "cancelled"}
 ACTIVE_TURN = {"queued", "running"}
 EVENT_LOCK = threading.Lock()
+# Serializes the "check active/queue limits → INSERT" critical sections in
+# create_agent/send/update_agent so concurrent control connections cannot race
+# past MAX_ACTIVE_* / MAX_QUEUE_DEPTH (ThreadingTCPServer handles each in a thread).
+CREATE_LOCK = threading.RLock()
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 
@@ -55,6 +59,12 @@ SESSION_FLUSH_WAIT_S = 0.25
 SESSION_FINAL_DRAIN_EXTRA_S = 0.15
 # Rate-limit monitor error events to avoid storming SQLite / UI.
 MONITOR_ERROR_MIN_INTERVAL_S = 2.0
+
+# Concurrency limits (override via env). Same cwd is always allowed; warn only.
+# Per-thread = one Codex conversation (agents.thread_id / CODEX_THREAD_ID).
+MAX_ACTIVE_PER_THREAD = int(os.environ.get("GROK_OBSERVER_MAX_PER_THREAD", "5"))
+MAX_ACTIVE_AGENTS = int(os.environ.get("GROK_OBSERVER_MAX_ACTIVE", "16"))
+MAX_QUEUE_DEPTH = int(os.environ.get("GROK_OBSERVER_MAX_QUEUE", "20"))
 
 # Session-log event types that duplicate streaming-json stdout (skip in monitor).
 SESSION_SKIP_TYPES = frozenset({
@@ -118,6 +128,14 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """Parse a query-string int without letting malformed input crash a handler."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def path_is_within(path: Path, root: Path) -> bool:
     """True iff resolved path is root or a descendant (pathlib boundary, not startswith)."""
     try:
@@ -127,10 +145,14 @@ def path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def fully_unquote(value: str, rounds: int = 5) -> str:
-    """Decode %XX sequences until stable (catches double/triple encoding)."""
+def fully_unquote(value: str, max_rounds: int = 20) -> str:
+    """Decode %XX sequences until stable (catches double/triple encoding).
+
+    Loops to a fixed point rather than a fixed count so deeply nested encodings
+    are fully resolved; max_rounds only bounds pathological input.
+    """
     cur = value
-    for _ in range(rounds):
+    for _ in range(max_rounds):
         nxt = urllib.parse.unquote(cur)
         if nxt == cur:
             break
@@ -250,6 +272,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS tasks(
               thread_id TEXT PRIMARY KEY, title TEXT, cwd TEXT, origin TEXT,
+              pinned INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS agents(
@@ -258,6 +281,8 @@ def init_db() -> None:
               status TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
               current_turn INTEGER, final_text TEXT DEFAULT '', error TEXT DEFAULT '',
               signoff_verdict TEXT, signoff_summary TEXT, verification TEXT,
+              display_title TEXT DEFAULT '', pinned INTEGER NOT NULL DEFAULT 0,
+              archived INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS turns(
@@ -282,8 +307,36 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_events_agent_seq ON events(agent_id, seq);
             CREATE INDEX IF NOT EXISTS idx_agents_thread ON agents(thread_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_turns_agent ON turns(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_changes_agent ON changes(agent_id);
             """
         )
+        # Best-effort migrations for older local DBs.
+        for stmt in (
+            "ALTER TABLE agents ADD COLUMN child_pid INTEGER",
+            "ALTER TABLE agents ADD COLUMN child_started_at TEXT",
+            "ALTER TABLE agents ADD COLUMN display_title TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE changes ADD COLUMN source TEXT DEFAULT 'observed'",
+            "ALTER TABLE changes ADD COLUMN shared INTEGER DEFAULT 0",
+            "ALTER TABLE changes ADD COLUMN tool_name TEXT",
+            "ALTER TABLE changes ADD COLUMN tool_call_id TEXT",
+        ):
+            try:
+                db.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+        # Backfill empty display titles from agent name (one-shot, cheap).
+        try:
+            db.execute(
+                "UPDATE agents SET display_title=name "
+                "WHERE (display_title IS NULL OR TRIM(display_title)='') AND name IS NOT NULL AND name!=''"
+            )
+        except sqlite3.OperationalError:
+            pass
 
 
 def artifact(agent_id: str, label: str, content: str) -> str:
@@ -297,12 +350,50 @@ def artifact(agent_id: str, label: str, content: str) -> str:
     return str(path.relative_to(ROOT))
 
 
+# Catalog (sidebar) waiters: one global condition; bumped on any agent/task meta change.
+CATALOG_CONDITION = threading.Condition()
+CATALOG_REVISION = 0
+# SSE wait/poll tuning.
+SSE_WAIT_TIMEOUT_S = 15.0
+SSE_STREAM_MAX_S = 600.0
+SSE_CATALOG_HEARTBEAT_S = 25.0
+
+
 def notify_agent(agent_id: str) -> None:
+    """Wake wait() and per-agent SSE streams for this agent."""
     with CONDITIONS_LOCK:
         condition = CONDITIONS.get(agent_id)
     if condition:
         with condition:
             condition.notify_all()
+    notify_catalog(agent_id)
+
+
+def notify_catalog(agent_id: str | None = None) -> None:
+    """Wake sidebar/catalog SSE so the viewer can soft-refresh without tight polling."""
+    global CATALOG_REVISION
+    with CATALOG_CONDITION:
+        CATALOG_REVISION += 1
+        CATALOG_CONDITION.notify_all()
+
+
+def derive_display_title(agent_name: str, prompt: str) -> str:
+    """Pick a short list title: prefer human agent_name, else first prompt line."""
+    name = (agent_name or "").strip()
+    # UUID-like names are poor labels in the sidebar.
+    uuidish = bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", name))
+    if name and not uuidish and name.lower() not in {"agent", "grok", "subagent"}:
+        return name[:80]
+    line = ""
+    for raw in (prompt or "").strip().splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if line:
+            break
+    if not line:
+        return (name or "未命名代理")[:80]
+    if len(line) > 60:
+        return line[:57] + "…"
+    return line
 
 
 def add_event(agent_id: str, turn_id: int | None, event_type: str, summary: str, payload=None) -> int:
@@ -486,11 +577,18 @@ def fs_path_excluded(rel: str) -> bool:
     return False
 
 
-def fs_snapshot(cwd: Path) -> dict:
-    """Strict per-turn filesystem snapshot: rel path -> size/mtime_ns/sha256."""
+def fs_snapshot(cwd: Path, prior: dict | None = None) -> dict:
+    """Strict per-turn filesystem snapshot: rel path -> size/mtime_ns/sha256.
+
+    When `prior` is a previous fs snapshot, files whose (size, mtime_ns) are
+    unchanged reuse the recorded sha256 instead of being re-hashed — safe because
+    a content change bumps mtime, and it roughly halves per-turn hashing cost.
+    """
     entries: dict[str, dict] = {}
     digests: dict[str, str | None] = {}
     total_bytes = 0
+    prior_entries: dict[str, dict] = (prior or {}).get("entries") or {}
+    prior_digests: dict[str, str | None] = (prior or {}).get("digests") or {}
     try:
         root = cwd.resolve()
     except OSError as exc:
@@ -546,11 +644,22 @@ def fs_snapshot(cwd: Path) -> dict:
                         "entries": {},
                         "digests": {},
                     }
-                digest = _file_digest(root, rel)
+                mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+                prior_meta = prior_entries.get(rel)
+                if (
+                    prior_meta is not None
+                    and prior_meta.get("size") == size
+                    and prior_meta.get("mtime_ns") == mtime_ns
+                    and rel in prior_digests
+                ):
+                    # Unchanged since the prior snapshot — reuse its hash, skip re-read.
+                    digest = prior_digests[rel]
+                else:
+                    digest = _file_digest(root, rel)
                 meta = {
                     "kind": "present",
                     "size": size,
-                    "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+                    "mtime_ns": mtime_ns,
                     "sha256": digest,
                 }
                 entries[rel] = meta
@@ -576,74 +685,212 @@ def fs_snapshot(cwd: Path) -> dict:
     }
 
 
-def workspace_snapshot(cwd: Path) -> dict:
+def workspace_snapshot(cwd: Path, prior: dict | None = None) -> dict:
     """Prefer Git incremental snapshot; fall back to non-Git FS snapshot (never init Git)."""
     git = git_snapshot(cwd)
     if git.get("available"):
         git = dict(git)
         git["mode"] = "git"
         return git
-    return fs_snapshot(cwd)
+    # Only fs snapshots carry a reusable digest cache; ignore a git-mode prior.
+    fs_prior = prior if prior and prior.get("mode") == "fs" else None
+    return fs_snapshot(cwd, prior=fs_prior)
 
 
-def record_changes(agent_id: str, turn_id: int, before: dict, after: dict) -> int:
-    """Record only this turn's incremental changes vs the pre-turn snapshot."""
-    before_mode = before.get("mode") or ("git" if before.get("available") else None)
-    after_mode = after.get("mode") or ("git" if after.get("available") else None)
+# ── Tool edit ledger (claimed paths from write-like tools) ─────────────────
 
-    # Non-Git FS path: require a valid start snapshot for strict start/end deltas.
-    # An unavailable/empty before with mode=fs must not treat the whole workspace as "added".
-    if after.get("available") and after.get("mode") == "fs":
-        if not (before.get("available") and before.get("mode") == "fs"):
-            add_event(
-                agent_id,
-                turn_id,
-                "changes",
-                "工作区变更检测不可用",
-                {
-                    "available": False,
-                    "count": 0,
-                    "reason": before.get("reason") or "changes_unavailable",
-                    "error": before.get("error") or "missing start snapshot for non-git workspace",
-                    "mode": "fs",
-                },
-            )
-            return 0
-        return _record_fs_changes(agent_id, turn_id, before, after)
+WRITE_TOOL_NAMES = frozenset({
+    "search_replace",
+    "str_replace",
+    "write",
+    "write_file",
+    "create_file",
+    "delete_file",
+    "apply_patch",
+    "edit",
+    "edit_file",
+})
+READ_ONLY_TOOL_NAMES = frozenset({
+    "read_file",
+    "read",
+    "list_dir",
+    "glob",
+    "grep",
+    "search",
+    "web_search",
+    "run_terminal_command",
+    "bash",
+})
+TITLE_PATH_RE = re.compile(
+    r"(?i)^(?:edit|write|create|delete|update)\s+`([^`]+)`",
+)
+TOOL_EVENT_TYPES = frozenset({"tool_call", "tool_call_update"})
 
-    if not before.get("available") and not after.get("available"):
-        reason = after.get("reason") or before.get("reason") or "changes_unavailable"
-        add_event(
-            agent_id,
-            turn_id,
-            "changes",
-            "工作区变更检测不可用",
-            {
-                "available": False,
-                "count": 0,
-                "reason": reason,
-                "error": after.get("error") or before.get("error"),
-                "mode": after_mode or before_mode,
-            },
-        )
-        return 0
-    if not after.get("available"):
-        add_event(
-            agent_id,
-            turn_id,
-            "changes",
-            "工作区变更检测不可用",
-            {
-                "available": False,
-                "count": 0,
-                "reason": after.get("reason") or "changes_unavailable",
-                "error": after.get("error"),
-                "mode": after_mode,
-            },
-        )
-        return 0
 
-    # Git path (existing incremental porcelain logic).
+def normalize_edit_path(path: str) -> str:
+    """Normalize a tool-reported path for the changes ledger."""
+    value = (path or "").replace("\\", "/").strip()
+    while value.startswith("./"):
+        value = value[2:]
+    return value.strip("/")
+
+
+def _pick_str(obj: dict, *keys: str) -> str | None:
+    for key in keys:
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _tool_update_root(payload: dict) -> dict:
+    """Locate the tool update object inside session JSON or flattened storage."""
+    if not isinstance(payload, dict):
+        return {}
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else None
+    if params and isinstance(params.get("update"), dict):
+        return params["update"]
+    if isinstance(payload.get("update"), dict):
+        return payload["update"]
+    # Already a flattened tool_call-like dict (or streaming-json wrap).
+    return payload
+
+
+def _tool_identity(payload: dict) -> tuple[str, str, str, str | None]:
+    """Return (tool_name, title, kind_meta, tool_call_id) from mixed payload shapes."""
+    update = _tool_update_root(payload)
+    meta = update.get("_meta") if isinstance(update.get("_meta"), dict) else {}
+    tool_meta = meta.get("x.ai/tool") if isinstance(meta.get("x.ai/tool"), dict) else {}
+    name = (
+        _pick_str(tool_meta, "name", "label")
+        or _pick_str(update, "name", "tool", "toolName", "tool_name")
+        or _pick_str(payload, "name", "tool", "toolName")
+        or ""
+    )
+    title = _pick_str(update, "title") or _pick_str(payload, "title") or ""
+    kind = str(tool_meta.get("kind") or update.get("kind") or payload.get("kind") or "").lower()
+    call_id = (
+        _pick_str(update, "toolCallId", "tool_call_id", "callId", "id")
+        or _pick_str(payload, "toolCallId", "tool_call_id", "callId")
+    )
+    return name.lower(), title, kind, call_id
+
+
+def is_write_like_tool(tool_name: str, title: str, kind: str) -> bool:
+    """True when this tool should contribute a claimed edit path."""
+    name = (tool_name or "").lower().strip()
+    if name in READ_ONLY_TOOL_NAMES:
+        return False
+    if name in WRITE_TOOL_NAMES:
+        return True
+    if kind == "edit":
+        return True
+    if any(tok in name for tok in ("search_replace", "str_replace", "apply_patch", "write_file", "delete_file")):
+        return True
+    if TITLE_PATH_RE.match((title or "").strip()):
+        return True
+    return False
+
+
+def _paths_from_mapping(mapping: dict) -> list[str]:
+    found: list[str] = []
+    for key in ("file_path", "path", "filePath", "target_file"):
+        val = mapping.get(key)
+        if isinstance(val, str) and val.strip():
+            found.append(val.strip())
+    for nest_key in ("EditsApplied", "FileContent", "Write", "Delete"):
+        nested = mapping.get(nest_key)
+        if isinstance(nested, dict):
+            p = _pick_str(nested, "path", "file_path", "filePath")
+            if p:
+                found.append(p)
+    return found
+
+
+def extract_edit_claims_from_payload(payload) -> list[dict]:
+    """
+    Extract claimed write paths from a stored tool event payload.
+    Returns list of {path, tool_name, tool_call_id, kind}.
+    """
+    if not isinstance(payload, dict):
+        return []
+    # Session lines store full JSONL objects; dig into params.update when present.
+    update = _tool_update_root(payload)
+    if not isinstance(update, dict) or not update:
+        return []
+
+    tool_name, title, kind_meta, call_id = _tool_identity(payload)
+    if not is_write_like_tool(tool_name, title, kind_meta):
+        return []
+
+    candidates: list[str] = []
+    for blob in (
+        update.get("rawInput"),
+        update.get("rawOutput"),
+        update.get("input"),
+        update.get("arguments"),
+        payload.get("rawInput"),
+        payload.get("rawOutput"),
+        payload.get("input"),
+        payload.get("arguments"),
+        payload.get("data") if isinstance(payload.get("data"), dict) else None,
+    ):
+        if isinstance(blob, dict):
+            candidates.extend(_paths_from_mapping(blob))
+
+    m = TITLE_PATH_RE.match(title.strip()) if title else None
+    if m:
+        candidates.append(m.group(1))
+
+    # Infer kind for claimed-only rows.
+    claim_kind = "modified"
+    title_l = title.lower()
+    if "delete" in tool_name or title_l.startswith("delete"):
+        claim_kind = "deleted"
+    elif "create" in tool_name or tool_name in {"write", "write_file"} or title_l.startswith(("write", "create")):
+        claim_kind = "added"
+
+    results: list[dict] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        path = normalize_edit_path(raw)
+        if not path or path in seen:
+            continue
+        # Skip absurd absolute Windows paths that are clearly not repo-relative? still keep.
+        seen.add(path)
+        results.append({
+            "path": path,
+            "tool_name": tool_name or None,
+            "tool_call_id": call_id,
+            "kind": claim_kind,
+        })
+    return results
+
+
+def collect_claimed_edits(agent_id: str, turn_id: int) -> dict[str, dict]:
+    """Scan this turn's tool events → path -> claim meta (last write wins for tool_name)."""
+    claims: dict[str, dict] = {}
+    with connect() as db:
+        rows = db.execute(
+            "SELECT type, payload FROM events WHERE agent_id=? AND turn_id=? "
+            "AND type IN ('tool_call','tool_call_update') ORDER BY seq",
+            (agent_id, turn_id),
+        ).fetchall()
+    for row in rows:
+        raw = row["payload"]
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for claim in extract_edit_claims_from_payload(payload):
+            claims[claim["path"]] = claim
+    return claims
+
+
+def _compute_git_observed(before: dict, after: dict) -> tuple[dict[str, dict], str | None]:
+    """Return (path -> {kind, preexisting, display_path, added, deleted}, diff_ref_text)."""
     before_entries: dict[str, dict] = before.get("entries") or parse_porcelain_z(before.get("status", ""))
     after_entries: dict[str, dict] = after.get("entries") or parse_porcelain_z(after.get("status", ""))
     before_digests: dict[str, str | None] = before.get("digests") or {}
@@ -653,119 +900,302 @@ def record_changes(agent_id: str, turn_id: int, before: dict, after: dict) -> in
     for line in after.get("numstat", "").splitlines():
         parts = line.split("\t", 2)
         if len(parts) == 3:
-            stats[parts[2]] = (int(parts[0]) if parts[0].isdigit() else 0, int(parts[1]) if parts[1].isdigit() else 0)
+            stats[parts[2]] = (
+                int(parts[0]) if parts[0].isdigit() else 0,
+                int(parts[1]) if parts[1].isdigit() else 0,
+            )
 
-    # Build this-turn delta only.
-    delta: list[tuple[str, str, int, str | None]] = []
+    observed: dict[str, dict] = {}
     for path, meta in after_entries.items():
         prior = before_entries.get(path)
         if prior is None:
-            delta.append((path, meta["kind"], 0, meta.get("rename_from")))
-            continue
-        # Preexisting dirty: only record if kind/digest/rename changed this turn.
-        changed = (
-            prior.get("xy") != meta.get("xy")
-            or prior.get("rename_from") != meta.get("rename_from")
-            or before_digests.get(path) != after_digests.get(path)
-        )
-        if changed:
-            delta.append((path, meta["kind"], 1, meta.get("rename_from")))
+            kind = meta.get("kind") or "modified"
+            preexisting = 0
+        else:
+            changed = (
+                prior.get("xy") != meta.get("xy")
+                or prior.get("rename_from") != meta.get("rename_from")
+                or before_digests.get(path) != after_digests.get(path)
+            )
+            if not changed:
+                continue
+            kind = meta.get("kind") or "modified"
+            preexisting = 1
+        rename_from = meta.get("rename_from")
+        display = f"{rename_from} → {path}" if rename_from and kind == "renamed" else path
+        added, deleted = stats.get(path, (0, 0))
+        observed[path] = {
+            "kind": kind,
+            "preexisting": preexisting,
+            "display_path": display,
+            "added": added,
+            "deleted": deleted,
+        }
 
     for path, meta in before_entries.items():
         if path in after_entries:
             continue
-        # Dirty before, gone after → cleaned or deleted this turn.
-        kind = "deleted"
-        delta.append((path, kind, 1, meta.get("rename_from")))
+        observed[path] = {
+            "kind": "deleted",
+            "preexisting": 1,
+            "display_path": path,
+            "added": 0,
+            "deleted": 0,
+        }
 
-    if not delta:
-        add_event(agent_id, turn_id, "changes", "本轮无工作区增量变更", {"count": 0, "mode": "git"})
-        return 0
-
-    diff_text = after.get("diff", "")
-    diff_ref = artifact(agent_id, "git-diff", diff_text) if diff_text else None
-    unique_paths: set[str] = set()
-    with connect() as db:
-        for path, kind, preexisting, rename_from in delta:
-            unique_paths.add(path)
-            added, deleted = stats.get(path, (0, 0))
-            display_path = f"{rename_from} → {path}" if rename_from and kind == "renamed" else path
-            db.execute(
-                "INSERT INTO changes(agent_id,turn_id,path,kind,preexisting,added,deleted,diff_artifact,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (agent_id, turn_id, display_path if kind == "renamed" and rename_from else path, kind, preexisting, added, deleted, diff_ref, now()),
-            )
-            db.execute("INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)", (agent_id, "change", path))
-    count = len(unique_paths)
-    add_event(agent_id, turn_id, "changes", f"检测到 {count} 个本轮工作区变更", {"count": count, "paths": sorted(unique_paths), "mode": "git"})
-    return count
+    diff_text = after.get("diff") or ""
+    return observed, diff_text if diff_text else None
 
 
-def _record_fs_changes(agent_id: str, turn_id: int, before: dict, after: dict) -> int:
-    """Diff two FS snapshots: added / modified / deleted (unchanged omitted)."""
-    if not after.get("available"):
-        add_event(
-            agent_id,
-            turn_id,
-            "changes",
-            "工作区变更检测不可用",
-            {
-                "available": False,
-                "count": 0,
-                "reason": after.get("reason") or "changes_unavailable",
-                "error": after.get("error"),
-                "mode": "fs",
-            },
-        )
-        return 0
-
+def _compute_fs_observed(before: dict, after: dict) -> dict[str, dict]:
     before_entries: dict[str, dict] = before.get("entries") or {}
     after_entries: dict[str, dict] = after.get("entries") or {}
     before_digests: dict[str, str | None] = before.get("digests") or {}
     after_digests: dict[str, str | None] = after.get("digests") or {}
 
-    delta: list[tuple[str, str, int]] = []
+    observed: dict[str, dict] = {}
     for path, meta in after_entries.items():
         prior = before_entries.get(path)
         if prior is None:
-            delta.append((path, "added", 0))
+            observed[path] = {
+                "kind": "added",
+                "preexisting": 0,
+                "display_path": path,
+                "added": 0,
+                "deleted": 0,
+            }
             continue
-        same = (
-            before_digests.get(path) == after_digests.get(path)
-            and prior.get("size") == meta.get("size")
-            and prior.get("mtime_ns") == meta.get("mtime_ns")
-        )
-        # Digest is authoritative; mtime-only noise without digest change is ignored.
         if before_digests.get(path) != after_digests.get(path):
-            delta.append((path, "modified", 1 if prior else 0))
-        elif not same and before_digests.get(path) is None and after_digests.get(path) is None:
-            # Both digests missing — fall back to size.
+            observed[path] = {
+                "kind": "modified",
+                "preexisting": 1 if prior else 0,
+                "display_path": path,
+                "added": 0,
+                "deleted": 0,
+            }
+        elif before_digests.get(path) is None and after_digests.get(path) is None:
             if prior.get("size") != meta.get("size"):
-                delta.append((path, "modified", 1))
+                observed[path] = {
+                    "kind": "modified",
+                    "preexisting": 1,
+                    "display_path": path,
+                    "added": 0,
+                    "deleted": 0,
+                }
 
     for path in before_entries:
         if path not in after_entries:
-            delta.append((path, "deleted", 1))
+            observed[path] = {
+                "kind": "deleted",
+                "preexisting": 1,
+                "display_path": path,
+                "added": 0,
+                "deleted": 0,
+            }
+    return observed
 
-    if not delta:
-        add_event(agent_id, turn_id, "changes", "本轮无工作区增量变更", {"count": 0, "mode": "fs"})
+
+def concurrent_cwd_peer_ids(agent_id: str) -> list[str]:
+    """Other agents on the same cwd that are still queued/running."""
+    with connect() as db:
+        row = db.execute("SELECT cwd FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if not row:
+            return []
+        peers = db.execute(
+            "SELECT id FROM agents WHERE cwd=? AND id!=? AND status IN ('queued','running')",
+            (row["cwd"], agent_id),
+        ).fetchall()
+    return [r["id"] for r in peers]
+
+
+def peer_claimed_paths(peer_ids: list[str]) -> set[str]:
+    """Paths other agents already recorded as claimed/both (for shared marking)."""
+    if not peer_ids:
+        return set()
+    placeholders = ",".join("?" * len(peer_ids))
+    with connect() as db:
+        # source column may be null on very old rows → treat as observed only.
+        rows = db.execute(
+            f"SELECT DISTINCT path FROM changes WHERE agent_id IN ({placeholders}) "
+            f"AND (source IN ('claimed','both') OR tool_name IS NOT NULL)",
+            peer_ids,
+        ).fetchall()
+    return {normalize_edit_path(r["path"]) for r in rows if r["path"]}
+
+
+def record_changes(agent_id: str, turn_id: int, before: dict, after: dict) -> int:
+    """
+    Merge tool edit ledger (claimed) with workspace snapshot delta (observed).
+    Parallel same-cwd peers mark ambiguous paths as shared.
+    """
+    claimed = collect_claimed_edits(agent_id, turn_id)
+    peers = concurrent_cwd_peer_ids(agent_id)
+    peer_claims = peer_claimed_paths(peers)
+    has_peers = bool(peers)
+
+    observed: dict[str, dict] = {}
+    diff_text: str | None = None
+    mode = "unavailable"
+    snapshot_error: str | None = None
+
+    after_mode = after.get("mode") or ("git" if after.get("available") else None)
+    before_mode = before.get("mode") or ("git" if before.get("available") else None)
+
+    if after.get("available") and after.get("mode") == "fs":
+        if before.get("available") and before.get("mode") == "fs":
+            observed = _compute_fs_observed(before, after)
+            mode = "fs"
+        else:
+            snapshot_error = before.get("error") or "missing start snapshot for non-git workspace"
+            mode = "fs"
+    elif after.get("available") and (after.get("mode") == "git" or after.get("available")):
+        if after.get("mode") == "git" or before.get("available"):
+            # Git path: allow empty before (fresh dirty) via existing logic.
+            observed, diff_text = _compute_git_observed(before, after)
+            mode = "git"
+        else:
+            snapshot_error = after.get("error") or "changes_unavailable"
+    else:
+        snapshot_error = after.get("error") or before.get("error") or "changes_unavailable"
+        mode = after_mode or before_mode or "unavailable"
+
+    all_paths = set(claimed) | set(observed)
+    if not all_paths:
+        if snapshot_error and not claimed:
+            add_event(
+                agent_id,
+                turn_id,
+                "changes",
+                "工作区变更检测不可用" if not claimed else "本轮无变更",
+                {
+                    "available": False,
+                    "count": 0,
+                    "reason": "changes_unavailable",
+                    "error": snapshot_error,
+                    "mode": mode,
+                    "claimed": 0,
+                    "observed": 0,
+                },
+            )
+            return 0
+        add_event(
+            agent_id,
+            turn_id,
+            "changes",
+            "本轮无工作区增量变更",
+            {"count": 0, "mode": mode, "claimed": 0, "observed": 0},
+        )
         return 0
 
-    unique_paths: set[str] = set()
+    diff_ref = artifact(agent_id, "git-diff", diff_text) if diff_text else None
+    stamp = now()
+    claimed_n = observed_n = shared_n = 0
+
     with connect() as db:
-        for path, kind, preexisting in delta:
-            unique_paths.add(path)
+        for path in sorted(all_paths):
+            c = claimed.get(path)
+            o = observed.get(path)
+            if c and o:
+                source = "both"
+                claimed_n += 1
+                observed_n += 1
+            elif c:
+                source = "claimed"
+                claimed_n += 1
+            else:
+                source = "observed"
+                observed_n += 1
+
+            # Shared: peers active and (observed-only OR peer also claimed this path).
+            shared = 0
+            if has_peers:
+                if source == "observed":
+                    shared = 1
+                elif path in peer_claims:
+                    shared = 1
+            if shared:
+                shared_n += 1
+
+            if o:
+                kind = o["kind"]
+                preexisting = int(o.get("preexisting") or 0)
+                display_path = o.get("display_path") or path
+                added = int(o.get("added") or 0)
+                deleted = int(o.get("deleted") or 0)
+                row_diff = diff_ref
+            else:
+                kind = (c or {}).get("kind") or "modified"
+                preexisting = 0
+                display_path = path
+                added = 0
+                deleted = 0
+                row_diff = None
+
+            tool_name = (c or {}).get("tool_name")
+            tool_call_id = (c or {}).get("tool_call_id")
+
+            try:
+                db.execute(
+                    "INSERT INTO changes(agent_id,turn_id,path,kind,preexisting,added,deleted,"
+                    "diff_artifact,created_at,source,shared,tool_name,tool_call_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        agent_id,
+                        turn_id,
+                        display_path,
+                        kind,
+                        preexisting,
+                        added,
+                        deleted,
+                        row_diff,
+                        stamp,
+                        source,
+                        shared,
+                        tool_name,
+                        tool_call_id,
+                    ),
+                )
+            except sqlite3.OperationalError:
+                # Pre-migration DB fallback without new columns.
+                db.execute(
+                    "INSERT INTO changes(agent_id,turn_id,path,kind,preexisting,added,deleted,"
+                    "diff_artifact,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        agent_id,
+                        turn_id,
+                        display_path,
+                        kind,
+                        preexisting,
+                        added,
+                        deleted,
+                        row_diff,
+                        stamp,
+                    ),
+                )
             db.execute(
-                "INSERT INTO changes(agent_id,turn_id,path,kind,preexisting,added,deleted,diff_artifact,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (agent_id, turn_id, path, kind, preexisting, 0, 0, None, now()),
+                "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
+                (agent_id, "change", path),
             )
-            db.execute("INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)", (agent_id, "change", path))
-    count = len(unique_paths)
+
+    count = len(all_paths)
+    summary = f"工具编辑 {claimed_n} · 工作区观测 {observed_n}"
+    if shared_n:
+        summary += f" · 交叉 {shared_n}"
     add_event(
         agent_id,
         turn_id,
         "changes",
-        f"检测到 {count} 个本轮工作区变更",
-        {"count": count, "paths": sorted(unique_paths), "mode": "fs"},
+        summary,
+        {
+            "count": count,
+            "paths": sorted(all_paths),
+            "mode": mode,
+            "claimed": claimed_n,
+            "observed": observed_n,
+            "shared": shared_n,
+            "peers": peers,
+            "snapshot_error": snapshot_error,
+        },
     )
     return count
 
@@ -1101,6 +1531,7 @@ def _ingest_session_line(
                 state.seen_output_fps.add(fp)
 
         add_event(agent_id, turn_id, str(event_type), summary, payload)
+        notify_runner_tool_activity(agent_id, turn_id, str(event_type), summary, payload)
         if event_id:
             state.seen_event_ids.add(event_id)
         return True
@@ -1262,6 +1693,81 @@ RUNNERS_LOCK = threading.Lock()
 CONDITIONS: dict[str, threading.Condition] = {}
 CONDITIONS_LOCK = threading.Lock()
 
+# Streaming / session events that can open or close in-flight tools.
+TOOL_ACTIVITY_TYPES = frozenset({
+    "tool_call",
+    "tool_call_update",
+    "tool_started",
+    "tool_completed",
+    "tool_result",
+    "tool_output",
+})
+TOOL_OPEN_EVENT_TYPES = frozenset({"tool_call", "tool_started"})
+TOOL_CLOSE_EVENT_TYPES = frozenset({"tool_completed", "tool_result"})
+TOOL_OPEN_STATUSES = frozenset({"", "running", "in_progress", "pending", "started", "accepted"})
+TOOL_CLOSED_STATUSES = frozenset({
+    "completed", "done", "success", "failed", "error", "cancelled", "canceled", "rejected",
+})
+UPDATE_MODES = frozenset({"auto", "immediate", "tool_boundary"})
+
+
+class PendingBoundaryUpdate:
+    """One replacement turn waiting for a tool-completion boundary (or timeout)."""
+
+    __slots__ = (
+        "turn_id", "turn_no", "prompt", "requested_mode", "timeout_seconds",
+        "registered_at", "timer",
+    )
+
+    def __init__(
+        self,
+        turn_id: int,
+        turn_no: int,
+        prompt: str,
+        requested_mode: str,
+        timeout_seconds: int,
+    ):
+        self.turn_id = turn_id
+        self.turn_no = turn_no
+        self.prompt = prompt
+        self.requested_mode = requested_mode
+        self.timeout_seconds = timeout_seconds
+        self.registered_at = time.time()
+        self.timer: threading.Timer | None = None
+
+
+def _tool_status_from_payload(payload) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    update = _tool_update_root(payload)
+    status = str(update.get("status") or payload.get("status") or "").lower().strip()
+    outcome = str(update.get("outcome") or payload.get("outcome") or "").lower().strip()
+    if outcome in {"success", "ok"}:
+        return "completed"
+    if outcome in {"failed", "error", "cancelled", "canceled", "rejected"}:
+        return outcome
+    return status
+
+
+def _is_tool_closed_status(status: str) -> bool:
+    return (status or "").lower().strip() in TOOL_CLOSED_STATUSES
+
+
+def notify_runner_tool_activity(
+    agent_id: str,
+    turn_id: int | None,
+    event_type: str,
+    summary: str,
+    payload,
+) -> None:
+    """Push tool lifecycle signals into the in-memory runner (no DB polling)."""
+    if turn_id is None or event_type not in TOOL_ACTIVITY_TYPES:
+        return
+    with RUNNERS_LOCK:
+        runner = RUNNERS.get(agent_id)
+    if runner is not None:
+        runner.observe_tool_event(int(turn_id), str(event_type), summary or "", payload)
+
 
 def pending_turn_count(agent_id: str) -> int:
     with connect() as db:
@@ -1286,6 +1792,14 @@ class AgentRunner:
         self.cancelled = threading.Event()
         self._shutdown = threading.Event()
         self._proc_lock = threading.Lock()
+        # Turn ids stopped by update_agent. This is distinct from permanent cancel:
+        # the worker remains usable and immediately continues with the replacement turn.
+        self._interrupted_turns: set[int] = set()
+        # In-memory tool-flight + boundary-wait state (never polled from SQLite).
+        self._flight_lock = threading.Lock()
+        self._active_turn_id: int | None = None
+        self._open_tools: dict[str, dict] = {}  # call_id -> {name, title, summary}
+        self._pending_boundary: list[PendingBoundaryUpdate] = []
         self.thread = threading.Thread(target=self._work, name=f"grok-{agent_id[:8]}", daemon=True)
         self.thread.start()
 
@@ -1301,6 +1815,212 @@ class AgentRunner:
     def queue_nonempty(self) -> bool:
         return not self.queue.empty()
 
+    def has_inflight_tools(self) -> bool:
+        with self._flight_lock:
+            return bool(self._open_tools)
+
+    def inflight_tool_snapshot(self) -> list[dict]:
+        with self._flight_lock:
+            return [dict(v, call_id=k) for k, v in self._open_tools.items()]
+
+    def begin_turn(self, turn_id: int) -> None:
+        """Reset tool-flight tracking for a newly started turn."""
+        with self._flight_lock:
+            self._active_turn_id = turn_id
+            self._open_tools.clear()
+
+    def end_turn(self, turn_id: int) -> None:
+        """Drop flight state when a turn finishes; release boundary waiters without re-interrupt."""
+        with self._flight_lock:
+            if self._active_turn_id != turn_id:
+                return
+            pendings = list(self._pending_boundary)
+            self._pending_boundary.clear()
+            self._active_turn_id = None
+            self._open_tools.clear()
+        for pending in pendings:
+            self._cancel_pending_timer(pending)
+            # Replacement turns are already queued; surface that the wait is over.
+            add_event(
+                self.agent_id,
+                turn_id,
+                "update_applied",
+                f"回合结束，按更新继续 (turn {pending.turn_no})",
+                {
+                    "mode_used": "queued_after_completion",
+                    "requested_mode": pending.requested_mode,
+                    "trigger": "turn_end",
+                    "replacement_turn": pending.turn_no,
+                    "replacement_turn_id": pending.turn_id,
+                    "lossless_interject": False,
+                },
+            )
+
+    def observe_tool_event(self, turn_id: int, event_type: str, summary: str, payload) -> None:
+        """Track open tools from stdout/session events; fire boundary when the last tool closes."""
+        if event_type not in TOOL_ACTIVITY_TYPES:
+            return
+        name, title, _kind, call_id = _tool_identity(payload if isinstance(payload, dict) else {})
+        status = _tool_status_from_payload(payload)
+        if not call_id:
+            # Anonymous lifecycle: open on start events, close on completed/result.
+            call_id = f"anon:{(name or title or summary or event_type)[:80]}"
+        should_fire = False
+        trigger_tool: dict | None = None
+        with self._flight_lock:
+            if self._active_turn_id != turn_id:
+                return
+            opened_before = bool(self._open_tools)
+            if event_type in TOOL_OPEN_EVENT_TYPES or (
+                event_type == "tool_call_update" and not _is_tool_closed_status(status)
+            ):
+                if event_type != "tool_output":
+                    self._open_tools[call_id] = {
+                        "name": name or "",
+                        "title": title or summary or "",
+                        "summary": (summary or "")[:200],
+                        "event_type": event_type,
+                    }
+            if event_type in TOOL_CLOSE_EVENT_TYPES or (
+                event_type == "tool_call_update" and _is_tool_closed_status(status)
+            ):
+                closed = self._open_tools.pop(call_id, None)
+                # If call_id mismatched, still clear a single open tool with same name.
+                if closed is None and len(self._open_tools) == 1 and name:
+                    for key, meta in list(self._open_tools.items()):
+                        if meta.get("name") == name:
+                            closed = self._open_tools.pop(key, None)
+                            call_id = key
+                            break
+                if closed is not None:
+                    trigger_tool = dict(closed, call_id=call_id)
+            # Boundary: last in-flight tool closed while updates wait.
+            if opened_before and not self._open_tools and self._pending_boundary:
+                should_fire = True
+                if trigger_tool is None:
+                    trigger_tool = {"name": name, "title": title, "call_id": call_id, "event_type": event_type}
+        if should_fire:
+            self._fire_boundary_updates(reason="tool_boundary", trigger_tool=trigger_tool)
+
+    def register_boundary_wait(self, pending: PendingBoundaryUpdate) -> str:
+        """
+        Wait for tool completion before interrupting.
+        Returns 'waiting_tool_boundary', or 'immediate' if no tools remain (race).
+        """
+        with self._flight_lock:
+            if self.cancelled.is_set() or self._shutdown.is_set():
+                return "immediate"
+            if not self._open_tools or self._active_turn_id is None:
+                return "immediate"
+            self._pending_boundary.append(pending)
+
+            def _on_timeout(turn_id: int = pending.turn_id) -> None:
+                # Only fire if this pending entry is still waiting.
+                self._fire_boundary_updates(reason="timeout", for_turn_id=turn_id)
+
+            timer = threading.Timer(max(1, int(pending.timeout_seconds)), _on_timeout)
+            timer.daemon = True
+            pending.timer = timer
+            timer.start()
+            return "waiting_tool_boundary"
+
+    def force_apply_pending_as_immediate(self) -> list[PendingBoundaryUpdate]:
+        """Cancel boundary waits (e.g. a later immediate update supersedes them)."""
+        with self._flight_lock:
+            pendings = list(self._pending_boundary)
+            self._pending_boundary.clear()
+        for pending in pendings:
+            self._cancel_pending_timer(pending)
+        return pendings
+
+    def release_all_boundary_waits(self) -> None:
+        """Cancel timers on cancel/shutdown so threads never outlive the runner."""
+        with self._flight_lock:
+            pendings = list(self._pending_boundary)
+            self._pending_boundary.clear()
+            self._open_tools.clear()
+            self._active_turn_id = None
+        for pending in pendings:
+            self._cancel_pending_timer(pending)
+
+    @staticmethod
+    def _cancel_pending_timer(pending: PendingBoundaryUpdate) -> None:
+        timer = pending.timer
+        pending.timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _fire_boundary_updates(
+        self,
+        *,
+        reason: str,
+        trigger_tool: dict | None = None,
+        for_turn_id: int | None = None,
+    ) -> None:
+        """
+        Interrupt the active turn once and mark all waiting replacements applied.
+        reason: tool_boundary | timeout
+        """
+        with self._flight_lock:
+            if self.cancelled.is_set() or self._shutdown.is_set():
+                pendings = list(self._pending_boundary)
+                self._pending_boundary.clear()
+                active = None
+            else:
+                if for_turn_id is not None:
+                    # Timeout for one entry: only fire if that entry still pending.
+                    still = [p for p in self._pending_boundary if p.turn_id == for_turn_id]
+                    if not still:
+                        return
+                pendings = list(self._pending_boundary)
+                if not pendings:
+                    return
+                self._pending_boundary.clear()
+                active = self._active_turn_id
+        for pending in pendings:
+            self._cancel_pending_timer(pending)
+        if active is None or self.cancelled.is_set() or self._shutdown.is_set():
+            return
+        mode_used = "immediate_timeout" if reason == "timeout" else "interrupt_and_resume"
+        for pending in pendings:
+            add_event(
+                self.agent_id,
+                active,
+                "interjection",
+                pending.prompt,
+                {
+                    "mode": mode_used,
+                    "requested_mode": pending.requested_mode,
+                    "replacement_turn": pending.turn_no,
+                    "trigger": reason,
+                    "lossless_interject": False,
+                },
+            )
+            add_event(
+                self.agent_id,
+                active,
+                "update_applied",
+                (
+                    f"超时后立即中断并更新 (turn {pending.turn_no})"
+                    if reason == "timeout"
+                    else f"工具边界后中断并更新 (turn {pending.turn_no})"
+                ),
+                {
+                    "mode_used": mode_used,
+                    "requested_mode": pending.requested_mode,
+                    "trigger": reason,
+                    "tool": trigger_tool,
+                    "replacement_turn": pending.turn_no,
+                    "replacement_turn_id": pending.turn_id,
+                    "lossless_interject": False,
+                },
+            )
+        # Single interrupt for the whole batch — queued replacements run in order.
+        self.interrupt_turn(active)
+
     def _terminate_process(self) -> None:
         with self._proc_lock:
             proc = self.process
@@ -1315,6 +2035,16 @@ class AgentRunner:
                 proc.wait(timeout=2)
         except OSError:
             pass
+
+    def interrupt_turn(self, turn_id: int) -> bool:
+        """Stop one active turn without cancelling the reusable agent conversation."""
+        with self._proc_lock:
+            proc = self.process
+            self._interrupted_turns.add(turn_id)
+            active = bool(proc and proc.poll() is None)
+        if active:
+            self._terminate_process()
+        return True
 
     def _drain_queue(self) -> list[int]:
         drained: list[int] = []
@@ -1333,6 +2063,7 @@ class AgentRunner:
     def cancel(self) -> None:
         """Persist cancel: flag, kill process, clear queue, mark all active turns cancelled."""
         self.cancelled.set()
+        self.release_all_boundary_waits()
         drained = self._drain_queue()
         self._terminate_process()
         stamp = now()
@@ -1340,8 +2071,9 @@ class AgentRunner:
             agent = db.execute("SELECT id FROM agents WHERE id=?", (self.agent_id,)).fetchone()
             if not agent:
                 return
+            # Clear child_pid once the process is gone (cancel path).
             db.execute(
-                "UPDATE agents SET status='cancelled',updated_at=?,revision=revision+1 WHERE id=?",
+                "UPDATE agents SET status='cancelled',child_pid=NULL,updated_at=?,revision=revision+1 WHERE id=?",
                 (stamp, self.agent_id),
             )
             db.execute(
@@ -1356,6 +2088,13 @@ class AgentRunner:
                 )
         add_event(self.agent_id, None, "cancelled", "Codex 已取消此代理")
         notify_agent(self.agent_id)
+        # Stop the worker so it does not spin on queue.get for the daemon's life.
+        # A cancelled agent rejects further send/update, so the thread is not needed.
+        self._shutdown.set()
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     def shutdown(self) -> None:
         """Idempotent: stop worker so it does not block forever on queue.get."""
@@ -1364,6 +2103,7 @@ class AgentRunner:
             return
         self._shutdown.set()
         self.cancelled.set()
+        self.release_all_boundary_waits()
         self._drain_queue()
         self._terminate_process()
         try:
@@ -1426,6 +2166,7 @@ class AgentRunner:
                 (turn_id, now(), self.agent_id),
             )
             db.execute("UPDATE turns SET status='running',started_at=? WHERE id=?", (now(), turn_id))
+        self.begin_turn(turn_id)
         cwd = Path(agent["cwd"])
         # Capture workspace + session-log baselines BEFORE process start to avoid races
         # and to prevent resume turns from replaying historical updates.jsonl.
@@ -1462,6 +2203,8 @@ class AgentRunner:
             if proxy_source:
                 add_event(self.agent_id, turn_id, "network", f"Grok 已使用代理：{proxy_source}", {"source": proxy_source})
             with self._proc_lock:
+                if turn_id in self._interrupted_turns:
+                    raise RuntimeError("turn interrupted before Grok process start")
                 self.process = subprocess.Popen(
                     command,
                     cwd=cwd,
@@ -1475,6 +2218,14 @@ class AgentRunner:
                     creationflags=NO_WINDOW,
                 )
             proc = self.process
+            # Persist child PID + its creation time so recover() can reap orphans
+            # after a daemon crash without risking a reused-PID mis-kill.
+            created = process_create_time(proc.pid)
+            with connect() as db:
+                db.execute(
+                    "UPDATE agents SET child_pid=?,child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
+                    (proc.pid, str(created) if created is not None else None, now(), self.agent_id),
+                )
 
             def read_stderr():
                 assert proc and proc.stderr
@@ -1526,6 +2277,10 @@ class AgentRunner:
                 if event_type == "end":
                     stop_reason = str(event.get("stopReason", ""))
                 add_event(self.agent_id, turn_id, event_type, data or event_type, event)
+                # streaming-json may also surface tool lifecycle on some builds.
+                notify_runner_tool_activity(
+                    self.agent_id, turn_id, str(event_type), data or event_type, event
+                )
             flush_chunks()
             returncode = proc.wait()
             stderr_thread.join(timeout=2)
@@ -1534,6 +2289,9 @@ class AgentRunner:
             errors.append(str(exc))
             add_event(self.agent_id, turn_id, "error", str(exc), {"exception": repr(exc)})
         finally:
+            # End flight tracking before monitor join so late tool closes can still
+            # race; release boundary waiters once the process path is done.
+            self.end_turn(turn_id)
             # Stop monitor so it runs final drain (flush wait + two deterministic passes).
             stopped.set()
             monitor.join(timeout=5)
@@ -1559,10 +2317,24 @@ class AgentRunner:
                             stream.close()
                         except OSError:
                             pass
+            # Process ended (or never started); drop durable PID marker.
+            with connect() as db:
+                db.execute(
+                    "UPDATE agents SET child_pid=NULL,updated_at=? WHERE id=?",
+                    (now(), self.agent_id),
+                )
 
         final_text = "".join(chunks).strip()
+        # Fallback when streaming-json never emitted text chunks (session-only / odd formats).
+        if not final_text and not self.cancelled.is_set():
+            final_text = final_text_from_events(self.agent_id, turn_id)
         error_text = "\n".join(errors)[-12000:]
+        with self._proc_lock:
+            was_interrupted = turn_id in self._interrupted_turns
+            self._interrupted_turns.discard(turn_id)
         turn_status = "completed" if returncode == 0 else "failed"
+        if was_interrupted:
+            turn_status = "interrupted"
         if self.cancelled.is_set():
             turn_status = "cancelled"
 
@@ -1588,13 +2360,17 @@ class AgentRunner:
                 else:
                     agent_status = turn_status
             db.execute(
-                "UPDATE agents SET status=?,final_text=?,error=?,updated_at=?,revision=revision+1 WHERE id=?",
+                "UPDATE agents SET status=?,final_text=?,error=?,child_pid=NULL,updated_at=?,revision=revision+1 WHERE id=?",
                 (agent_status, final_text, error_text, now(), self.agent_id),
             )
             db.execute("INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)", (self.agent_id, "result", final_text + "\n" + error_text))
         if turn_status != "cancelled":
-            record_changes(self.agent_id, turn_id, before, workspace_snapshot(cwd))
-        terminal_summary = {"completed": "Grok 已完成", "cancelled": "Grok 已取消"}.get(turn_status, "Grok 执行失败")
+            record_changes(self.agent_id, turn_id, before, workspace_snapshot(cwd, prior=before))
+        terminal_summary = {
+            "completed": "Grok 已完成",
+            "cancelled": "Grok 已取消",
+            "interrupted": "当前回合已中断，正在按更新继续",
+        }.get(turn_status, "Grok 执行失败")
         add_event(self.agent_id, turn_id, turn_status, terminal_summary, {"returncode": returncode, "stop_reason": stop_reason})
         notify_agent(self.agent_id)
 
@@ -1654,6 +2430,46 @@ def agent_wait_done(agent_id: str) -> tuple[bool, dict]:
         "pending_turns": int(pending),
         "changed_files": unique_changed_files(agent_id),
     }
+
+
+def final_text_from_events(agent_id: str, turn_id: int, *, limit: int = 40, cap: int = 12_000) -> str:
+    """Reconstruct final_text from recent text-like events when stdout chunks were empty."""
+    with connect() as db:
+        rows = db.execute(
+            "SELECT type, summary, payload, seq FROM events "
+            "WHERE agent_id=? AND turn_id=? AND type IN ('text','agent_message_chunk') "
+            "ORDER BY seq DESC LIMIT ?",
+            (agent_id, turn_id, limit),
+        ).fetchall()
+    if not rows:
+        return ""
+    # Chronological order for concatenation.
+    parts: list[str] = []
+    for row in reversed(list(rows)):
+        piece = ""
+        payload_raw = row["payload"]
+        if payload_raw:
+            try:
+                payload = json.loads(payload_raw)
+            except (TypeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                data = payload.get("data")
+                if data is None:
+                    data = payload.get("message")
+                if data is not None:
+                    piece = str(data)
+            elif isinstance(payload, str):
+                piece = payload
+        if not piece:
+            piece = str(row["summary"] or "")
+        piece = piece.strip()
+        if piece:
+            parts.append(piece)
+    text = "\n".join(parts).strip()
+    if len(text) > cap:
+        text = text[-cap:]
+    return text
 
 
 def build_search_snippet(content: str, term: str, radius: int = 40) -> dict:
@@ -1718,21 +2534,83 @@ def action(name: str, args: dict, context: dict) -> dict:
         thread_id = context.get("codex_thread_id") or "unknown"
         cwd = str(Path(args.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
         stamp = now()
-        with connect() as db:
-            same_cwd = db.execute("SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')", (cwd,)).fetchall()
-            db.execute("INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)", (thread_id, args.get("codex_thread_title") or thread_id, cwd, context.get("codex_origin", "Codex"), stamp, stamp))
-            db.execute("UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?", (args.get("codex_thread_title") or thread_id, cwd, stamp, thread_id))
-            db.execute("INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?)", (agent_id, thread_id, agent_name, cwd, agent_id, stamp, stamp))
+        with CREATE_LOCK, connect() as db:
+            # 1) Per-conversation (thread) cap — primary product limit.
+            thread_active = db.execute(
+                "SELECT COUNT(*) AS c FROM agents "
+                "WHERE thread_id=? AND status IN ('queued','running')",
+                (thread_id,),
+            ).fetchone()["c"]
+            if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
+                raise ValueError(
+                    f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
+                    f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
+                )
+            # 2) Global safety net across all conversations.
+            active_count = db.execute(
+                "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
+            ).fetchone()["c"]
+            if int(active_count) >= MAX_ACTIVE_AGENTS:
+                raise ValueError(
+                    f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
+                    f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
+                )
+            # Same cwd is allowed (parallel subagents); used only for soft warning.
+            same_cwd = db.execute(
+                "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
+                (cwd,),
+            ).fetchall()
+            task_title = str(args.get("codex_thread_title") or "").strip() or thread_id
+            display_title = derive_display_title(agent_name, prompt)
+            db.execute(
+                "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
+            )
+            # Refresh path/title for known threads; keep user pin/archive flags.
+            db.execute(
+                "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
+                (task_title, cwd, stamp, thread_id),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?)",
+                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, stamp, stamp),
+            )
             cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt, stamp))
             turn_id = cursor.lastrowid
-            db.execute("INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)", (agent_id, "metadata", f"{agent_name}\n{prompt}\n{thread_id}\n{args.get('codex_thread_title','')}"))
+            db.execute(
+                "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
+                (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt}\n{thread_id}\n{task_title}"),
+            )
         with CONDITIONS_LOCK:
             CONDITIONS[agent_id] = threading.Condition()
         rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
         add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
         if same_cwd:
-            add_event(agent_id, turn_id, "concurrency_warning", "同一工作目录已有其他 Grok 代理运行，文件变更归因可能不精确", {"other_agents": [dict(row) for row in same_cwd]})
-        get_runner(agent_id).enqueue(turn_id, prompt)
+            add_event(
+                agent_id,
+                turn_id,
+                "concurrency_warning",
+                "同一工作目录已有其他 Grok 代理运行，Changes 页文件变更归因可能交叉、不够精确",
+                {
+                    "other_agents": [dict(row) for row in same_cwd],
+                    "hint": "parallel same-cwd agents share the workspace; diffs are recorded per agent/turn but overlapping edits may be attributed to more than one",
+                },
+            )
+        runner = get_runner(agent_id)
+        assert runner is not None
+        with CREATE_LOCK:
+            if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
+                # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
+                with connect() as db:
+                    db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
+                    db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+                reclaim_agent_resources(agent_id)
+                raise ValueError(
+                    f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
+                    f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
+                )
+            runner.enqueue(turn_id, prompt)
         opened = ensure_viewer(agent_id)
         return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
     if name == "send":
@@ -1757,14 +2635,167 @@ def action(name: str, args: dict, context: dict) -> dict:
                 db.execute("UPDATE agents SET updated_at=?,revision=revision+1 WHERE id=?", (now(), agent_id))
         runner = get_runner(agent_id)
         assert runner is not None
-        try:
-            runner.enqueue(turn_id, prompt)
-        except ValueError:
-            with connect() as db:
-                db.execute("UPDATE turns SET status='cancelled',completed_at=? WHERE id=?", (now(), turn_id))
-            raise
+        with CREATE_LOCK:
+            if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
+                with connect() as db:
+                    db.execute("UPDATE turns SET status='cancelled',completed_at=? WHERE id=?", (now(), turn_id))
+                raise ValueError(
+                    f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
+                    f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
+                )
+            try:
+                runner.enqueue(turn_id, prompt)
+            except ValueError:
+                with connect() as db:
+                    db.execute("UPDATE turns SET status='cancelled',completed_at=? WHERE id=?", (now(), turn_id))
+                raise
         notify_agent(agent_id)
         return {"agent_id": agent_id, "turn_id": turn_id, "turn_no": number, "status": "queued"}
+    if name == "update_agent":
+        agent_id, prompt = args.get("agent_id"), str(args.get("prompt", "")).strip()
+        if not prompt:
+            raise ValueError("prompt is required")
+        requested_mode = str(args.get("mode") or "auto").strip().lower()
+        if requested_mode not in UPDATE_MODES:
+            raise ValueError("mode must be one of: auto, immediate, tool_boundary")
+        try:
+            timeout_seconds = int(args.get("timeout_seconds", 30))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeout_seconds must be an integer") from exc
+        timeout_seconds = min(max(timeout_seconds, 1), 300)
+
+        with connect() as db:
+            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if not agent:
+                raise ValueError("agent not found")
+            if agent["status"] == "cancelled":
+                raise ValueError("agent is cancelled; update is rejected")
+            if agent["status"] == "failed":
+                raise ValueError("agent has failed; create a new agent instead")
+            number = db.execute(
+                "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?", (agent_id,)
+            ).fetchone()["n"]
+            cursor = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)",
+                (agent_id, number, prompt, now()),
+            )
+            turn_id = cursor.lastrowid
+            current_turn = int(agent["current_turn"] or 0)
+            was_running = agent["status"] == "running" and current_turn > 0
+            db.execute(
+                "UPDATE agents SET status=?,updated_at=?,revision=revision+1 WHERE id=?",
+                ("running" if was_running else "queued", now(), agent_id),
+            )
+        runner = get_runner(agent_id)
+        assert runner is not None
+        with CREATE_LOCK:
+            if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
+                with connect() as db:
+                    db.execute("UPDATE turns SET status='cancelled',completed_at=? WHERE id=?", (now(), turn_id))
+                raise ValueError(
+                    f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
+                    f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
+                )
+            # Each update is an independent replacement turn; worker drains them in order.
+            runner.enqueue(turn_id, prompt)
+
+        mode = "follow_up"
+        if was_running:
+            # Resolve auto against in-memory tool flight (no DB polling).
+            if requested_mode == "auto":
+                resolved = "tool_boundary" if runner.has_inflight_tools() else "immediate"
+            else:
+                resolved = requested_mode
+
+            if resolved == "tool_boundary" and runner.has_inflight_tools():
+                pending = PendingBoundaryUpdate(
+                    turn_id=int(turn_id),
+                    turn_no=int(number),
+                    prompt=prompt,
+                    requested_mode=requested_mode,
+                    timeout_seconds=timeout_seconds,
+                )
+                wait_mode = runner.register_boundary_wait(pending)
+                if wait_mode == "waiting_tool_boundary":
+                    inflight = runner.inflight_tool_snapshot()
+                    add_event(
+                        agent_id,
+                        current_turn,
+                        "pending_update",
+                        f"等待工具边界后更新 (timeout={timeout_seconds}s)",
+                        {
+                            "mode": "waiting_tool_boundary",
+                            "requested_mode": requested_mode,
+                            "timeout_seconds": timeout_seconds,
+                            "replacement_turn": number,
+                            "replacement_turn_id": turn_id,
+                            "inflight_tools": inflight,
+                            "lossless_interject": False,
+                        },
+                    )
+                    mode = "waiting_tool_boundary"
+                else:
+                    # Race: tools closed between check and register → immediate interrupt.
+                    resolved = "immediate"
+
+            if mode != "waiting_tool_boundary":
+                # Immediate path (explicit, auto-no-tools, or boundary race fallback).
+                # A later immediate also cancels any prior boundary waits for this turn.
+                prior = runner.force_apply_pending_as_immediate()
+                for old in prior:
+                    add_event(
+                        agent_id,
+                        current_turn,
+                        "update_applied",
+                        f"被立即更新抢占 (turn {old.turn_no})",
+                        {
+                            "mode_used": "interrupt_and_resume",
+                            "requested_mode": old.requested_mode,
+                            "trigger": "superseded_by_immediate",
+                            "replacement_turn": old.turn_no,
+                            "replacement_turn_id": old.turn_id,
+                            "lossless_interject": False,
+                        },
+                    )
+                add_event(
+                    agent_id,
+                    current_turn,
+                    "interjection",
+                    prompt,
+                    {
+                        "mode": "interrupt_and_resume",
+                        "requested_mode": requested_mode,
+                        "replacement_turn": number,
+                        "lossless_interject": False,
+                    },
+                )
+                add_event(
+                    agent_id,
+                    current_turn,
+                    "update_applied",
+                    f"立即中断并更新 (turn {number})",
+                    {
+                        "mode_used": "interrupt_and_resume",
+                        "requested_mode": requested_mode,
+                        "trigger": "immediate",
+                        "replacement_turn": number,
+                        "replacement_turn_id": turn_id,
+                        "lossless_interject": False,
+                    },
+                )
+                if runner.interrupt_turn(current_turn):
+                    mode = "interrupt_and_resume"
+        notify_agent(agent_id)
+        return {
+            "agent_id": agent_id,
+            "turn_id": turn_id,
+            "turn_no": number,
+            "status": "queued",
+            "requested_mode": requested_mode,
+            "mode": mode,
+            "timeout_seconds": timeout_seconds,
+            "lossless_interject": False,
+        }
     if name in {"status", "result"}:
         with connect() as db:
             agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (args.get("agent_id"),)).fetchone())
@@ -1772,6 +2803,7 @@ def action(name: str, args: dict, context: dict) -> dict:
                 raise ValueError("agent not found")
             turns = db.execute("SELECT COUNT(*) AS count FROM turns WHERE agent_id=?", (agent["id"],)).fetchone()["count"]
             turn_rows = []
+            last_completed_result = ""
             if name == "result":
                 turn_rows = [
                     dict(row)
@@ -1780,12 +2812,20 @@ def action(name: str, args: dict, context: dict) -> dict:
                         (agent["id"],),
                     )
                 ]
+                last_done = db.execute(
+                    "SELECT result FROM turns WHERE agent_id=? AND status='completed' "
+                    "ORDER BY turn_no DESC LIMIT 1",
+                    (agent["id"],),
+                ).fetchone()
+                if last_done and last_done["result"]:
+                    last_completed_result = str(last_done["result"])
         base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "signoff_verdict")}
         base.update({"turns": turns, "changed_files": unique_changed_files(agent["id"])})
         if name == "result":
-            # final_text is the latest completed turn text (already stored on agent).
+            # Prefer agent.final_text; fall back to last completed turn.result when empty.
+            final_text = (agent["final_text"] or "").strip() or last_completed_result
             base.update({
-                "final_text": agent["final_text"],
+                "final_text": final_text,
                 "error": agent["error"],
                 "signoff_summary": agent["signoff_summary"],
                 "verification": agent["verification"],
@@ -1896,16 +2936,64 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         return
 
+    def _host_is_local(self) -> bool:
+        """Reject cross-origin/DNS-rebinding: the Host header must name loopback.
+
+        The socket is already bound to 127.0.0.1, but a hostile page can point a
+        DNS name at 127.0.0.1 and read local agent data / artifacts through the
+        victim's browser. A rebound request carries the attacker's hostname in
+        Host; only genuine localhost clients send a loopback Host.
+        """
+        raw = (self.headers.get("Host", "") or "").strip()
+        if not raw:
+            # Missing Host is HTTP/1.0 or a direct socket client, never a browser
+            # cross-origin fetch (those always send Host). Treat as local.
+            return True
+        if raw.startswith("["):
+            # IPv6 literal: [::1] or [::1]:port
+            host = raw[1:].split("]", 1)[0]
+        elif raw.count(":") == 1:
+            # host:port (IPv4 / name); bare "::1" has >1 colon and no port
+            host = raw.rsplit(":", 1)[0]
+        else:
+            host = raw
+        return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
     def do_GET(self):
+        if not self._host_is_local():
+            return json_response(self, {"error": "forbidden"}, 403)
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/api/bootstrap":
             with connect() as db:
-                tasks = [dict(row) for row in db.execute("SELECT * FROM tasks ORDER BY updated_at DESC")]
-                agents = [dict(row) for row in db.execute("SELECT id,thread_id,name,cwd,status,revision,signoff_verdict,created_at,updated_at FROM agents ORDER BY updated_at DESC")]
-            return json_response(self, {"tasks": tasks, "agents": agents, "retention_days": RETENTION_DAYS})
+                tasks = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM tasks ORDER BY pinned DESC, archived ASC, updated_at DESC"
+                    )
+                ]
+                agents = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT id,thread_id,name,cwd,status,revision,signoff_verdict,"
+                        "display_title,pinned,archived,created_at,updated_at "
+                        "FROM agents ORDER BY pinned DESC, archived ASC, updated_at DESC"
+                    )
+                ]
+            return json_response(
+                self,
+                {
+                    "tasks": tasks,
+                    "agents": agents,
+                    "retention_days": RETENTION_DAYS,
+                    "catalog_revision": CATALOG_REVISION,
+                },
+            )
         if parsed.path.startswith("/api/agents/"):
             agent_id = parsed.path.rsplit("/", 1)[-1]
+            # Ignore sub-routes that belong to POST (meta/delete).
+            if agent_id in {"meta", "delete"} or not re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or ""):
+                return json_response(self, {"error": "not found"}, 404)
             with connect() as db:
                 agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
                 if not agent:
@@ -1915,7 +3003,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             return json_response(self, {"agent": agent, "turns": turns, "changes": changes})
         if parsed.path == "/api/events":
             agent_id = query.get("agent_id", [""])[0]
-            after = int(query.get("after", ["0"])[0])
+            after = _safe_int(query.get("after", ["0"])[0])
             with connect() as db:
                 events = [dict(row) for row in db.execute("SELECT * FROM events WHERE agent_id=? AND seq>? ORDER BY seq LIMIT 1000", (agent_id, after))]
             return json_response(self, {"events": events})
@@ -1923,7 +3011,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
             term = query.get("q", [""])[0].strip()
             if not term:
                 return json_response(self, {"results": []})
-            # Escape FTS5 special characters by quoting the query as a phrase when needed.
+            # Pass the term straight to FTS5 MATCH; on a syntax error (special
+            # tokens) fall back to a LIKE scan below. No manual escaping is done.
             fts_term = term
             with connect() as db:
                 try:
@@ -1939,14 +3028,45 @@ class ViewerHandler(BaseHTTPRequestHandler):
                         (like,),
                     ).fetchall()
             results = []
+            like = f"%{term}%" if len(term) >= 2 else None
+            # Batch the deep-link lookup: one grouped query for the latest matching
+            # event per agent, instead of a per-row LIKE scan (was N+1, up to 100).
+            deep_links: dict[str, dict] = {}
+            if like is not None:
+                agent_ids = list(dict.fromkeys(row["agent_id"] for row in rows if row["agent_id"]))
+                if agent_ids:
+                    placeholders = ",".join("?" * len(agent_ids))
+                    with connect() as db:
+                        latest = db.execute(
+                            f"SELECT agent_id, MAX(id) AS mid FROM events "
+                            f"WHERE agent_id IN ({placeholders}) AND (summary LIKE ? OR payload LIKE ?) "
+                            f"GROUP BY agent_id",
+                            (*agent_ids, like, like),
+                        ).fetchall()
+                        mids = [r["mid"] for r in latest if r["mid"] is not None]
+                        if mids:
+                            id_ph = ",".join("?" * len(mids))
+                            for hit in db.execute(
+                                f"SELECT id, agent_id, turn_id, seq FROM events WHERE id IN ({id_ph})",
+                                mids,
+                            ):
+                                deep_links[hit["agent_id"]] = {
+                                    "event_id": hit["id"],
+                                    "turn_id": hit["turn_id"],
+                                    "event_seq": hit["seq"],
+                                }
             for row in rows:
                 snippet = build_search_snippet(row["content"] or "", term)
-                results.append({
+                item = {
                     "agent_id": row["agent_id"],
                     "kind": row["kind"],
                     "snippet": snippet["text"],
                     "matches": snippet["matches"],
-                })
+                }
+                link = deep_links.get(row["agent_id"])
+                if link:
+                    item.update(link)
+                results.append(item)
             return json_response(self, {"results": results})
         if parsed.path == "/api/artifact":
             rel = safe_artifact_relpath(query.get("path", [""])[0])
@@ -1962,10 +3082,30 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 content = handle.read()
             return json_response(self, {"content": content})
         if parsed.path == "/api/stream":
-            return self.stream(query.get("agent_id", [""])[0], int(query.get("after", ["0"])[0]))
+            return self.stream(query.get("agent_id", [""])[0], _safe_int(query.get("after", ["0"])[0]))
+        if parsed.path == "/api/stream/catalog":
+            return self.stream_catalog()
         return self.static(parsed.path)
 
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        if length > 64_000:
+            raise ValueError("body too large")
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        data = json.loads(raw.decode("utf-8"))
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        return data
+
     def do_POST(self):
+        if not self._host_is_local():
+            return json_response(self, {"error": "forbidden"}, 403)
         origin = self.headers.get("Origin", "")
         if origin and origin not in {viewer_url(), viewer_url().replace("127.0.0.1", "localhost")}:
             return json_response(self, {"error": "invalid origin"}, 403)
@@ -1973,7 +3113,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             json_response(self, {"stopping": True})
             threading.Thread(target=stop_viewer, daemon=True).start()
             return
-        match = re.fullmatch(r"/api/agents/([0-9a-f-]+)/delete", self.path)
+        match = re.fullmatch(r"/api/agents/([0-9a-fA-F-]{36})/delete", self.path)
         if match:
             agent_id = match.group(1)
             with connect() as db:
@@ -1990,7 +3130,83 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
                 db.execute("DELETE FROM tasks WHERE thread_id=? AND NOT EXISTS(SELECT 1 FROM agents WHERE thread_id=?)", (thread_id, thread_id))
             shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
+            notify_catalog(agent_id)
             return json_response(self, {"deleted": True, "agent_id": agent_id})
+        match = re.fullmatch(r"/api/agents/([0-9a-fA-F-]{36})/meta", self.path)
+        if match:
+            agent_id = match.group(1)
+            try:
+                body = self._read_json_body()
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                return json_response(self, {"error": str(exc)}, 400)
+            with connect() as db:
+                agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+                if not agent:
+                    return json_response(self, {"error": "not found"}, 404)
+                pinned = agent.get("pinned") or 0
+                archived = agent.get("archived") or 0
+                display_title = agent.get("display_title") or agent.get("name") or ""
+                if "pinned" in body:
+                    pinned = 1 if body.get("pinned") else 0
+                if "archived" in body:
+                    archived = 1 if body.get("archived") else 0
+                if "display_title" in body:
+                    title = str(body.get("display_title") or "").strip()
+                    if not title:
+                        return json_response(self, {"error": "display_title cannot be empty"}, 400)
+                    if len(title) > 120:
+                        title = title[:120]
+                    display_title = title
+                stamp = now()
+                db.execute(
+                    "UPDATE agents SET pinned=?,archived=?,display_title=?,updated_at=?,revision=revision+1 WHERE id=?",
+                    (pinned, archived, display_title, stamp, agent_id),
+                )
+                db.execute("UPDATE tasks SET updated_at=? WHERE thread_id=?", (stamp, agent["thread_id"]))
+                updated = rowdict(
+                    db.execute(
+                        "SELECT id,thread_id,name,cwd,status,revision,signoff_verdict,"
+                        "display_title,pinned,archived,created_at,updated_at FROM agents WHERE id=?",
+                        (agent_id,),
+                    ).fetchone()
+                )
+            notify_agent(agent_id)
+            return json_response(self, {"agent": updated})
+        match = re.fullmatch(r"/api/tasks/([^/]+)/meta", self.path)
+        if match:
+            thread_id = urllib.parse.unquote(match.group(1))
+            if not thread_id or thread_id.startswith("_orphan:"):
+                return json_response(self, {"error": "virtual sessions cannot be edited"}, 400)
+            try:
+                body = self._read_json_body()
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                return json_response(self, {"error": str(exc)}, 400)
+            with connect() as db:
+                task = rowdict(db.execute("SELECT * FROM tasks WHERE thread_id=?", (thread_id,)).fetchone())
+                if not task:
+                    return json_response(self, {"error": "not found"}, 404)
+                pinned = task.get("pinned") or 0
+                archived = task.get("archived") or 0
+                title = task.get("title") or thread_id
+                if "pinned" in body:
+                    pinned = 1 if body.get("pinned") else 0
+                if "archived" in body:
+                    archived = 1 if body.get("archived") else 0
+                if "title" in body:
+                    new_title = str(body.get("title") or "").strip()
+                    if not new_title:
+                        return json_response(self, {"error": "title cannot be empty"}, 400)
+                    if len(new_title) > 120:
+                        new_title = new_title[:120]
+                    title = new_title
+                stamp = now()
+                db.execute(
+                    "UPDATE tasks SET pinned=?,archived=?,title=?,updated_at=? WHERE thread_id=?",
+                    (pinned, archived, title, stamp, thread_id),
+                )
+                updated = rowdict(db.execute("SELECT * FROM tasks WHERE thread_id=?", (thread_id,)).fetchone())
+            notify_catalog(None)
+            return json_response(self, {"task": updated})
         return json_response(self, {"error": "not found"}, 404)
 
     def static(self, path: str):
@@ -2030,23 +3246,110 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def stream(self, agent_id: str, after: int):
+        """Event-driven SSE: wait on agent condition instead of 1Hz SQLite polling."""
+        # Windows may raise ConnectionAbortedError when the EventSource closes.
+        _sse_disconnect = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
-        last = after
+        # Advise clients to reconnect after ~3s if the stream drops.
         try:
-            for _ in range(600):
+            self.wfile.write(b"retry: 3000\n\n")
+            self.wfile.flush()
+        except _sse_disconnect:
+            return
+        if not agent_id:
+            try:
+                self.wfile.write(b'event: bye\ndata: {"reason":"missing_agent"}\n\n')
+                self.wfile.flush()
+            except _sse_disconnect:
+                pass
+            return
+        # Ensure a waitable condition even for agents created before this stream.
+        with CONDITIONS_LOCK:
+            condition = CONDITIONS.setdefault(agent_id, threading.Condition())
+        last = after
+        deadline = time.time() + SSE_STREAM_MAX_S
+        try:
+            while time.time() < deadline:
                 with connect() as db:
-                    rows = db.execute("SELECT * FROM events WHERE agent_id=? AND seq>? ORDER BY seq LIMIT 200", (agent_id, last)).fetchall()
+                    rows = db.execute(
+                        "SELECT * FROM events WHERE agent_id=? AND seq>? ORDER BY seq LIMIT 200",
+                        (agent_id, last),
+                    ).fetchall()
+                emitted = False
                 for row in rows:
                     last = row["seq"]
-                    self.wfile.write(("data: " + json.dumps(dict(row), ensure_ascii=False) + "\n\n").encode("utf-8"))
+                    self.wfile.write(
+                        ("data: " + json.dumps(dict(row), ensure_ascii=False) + "\n\n").encode("utf-8")
+                    )
+                    emitted = True
+                if emitted:
+                    self.wfile.flush()
+                    # Drain immediately if more events may already be queued.
+                    continue
+                # Idle: heartbeat then block until notify_agent or timeout.
                 self.wfile.write(b": heartbeat\n\n")
                 self.wfile.flush()
-                time.sleep(1)
-        except (BrokenPipeError, ConnectionResetError):
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                with condition:
+                    condition.wait(min(SSE_WAIT_TIMEOUT_S, remaining))
+            # Graceful end so EventSource clients can reconnect cleanly.
+            self.wfile.write(b'event: bye\ndata: {"reason":"timeout"}\n\n')
+            self.wfile.flush()
+        except _sse_disconnect:
+            return
+
+    def stream_catalog(self):
+        """Lightweight SSE for sidebar/list refresh (no tight bootstrap polling)."""
+        _sse_disconnect = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            self.wfile.write(b"retry: 3000\n\n")
+            # Seed client with current revision so it can skip stale work.
+            with CATALOG_CONDITION:
+                rev = CATALOG_REVISION
+            self.wfile.write(
+                ("data: " + json.dumps({"revision": rev, "kind": "hello"}) + "\n\n").encode("utf-8")
+            )
+            self.wfile.flush()
+        except _sse_disconnect:
+            return
+        last_rev = rev
+        deadline = time.time() + SSE_STREAM_MAX_S
+        try:
+            while time.time() < deadline:
+                with CATALOG_CONDITION:
+                    # Wait until revision advances or heartbeat interval elapses.
+                    if CATALOG_REVISION == last_rev:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            break
+                        CATALOG_CONDITION.wait(min(SSE_CATALOG_HEARTBEAT_S, remaining))
+                    rev = CATALOG_REVISION
+                if rev != last_rev:
+                    last_rev = rev
+                    self.wfile.write(
+                        (
+                            "data: "
+                            + json.dumps({"revision": rev, "kind": "change"})
+                            + "\n\n"
+                        ).encode("utf-8")
+                    )
+                else:
+                    self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+            self.wfile.write(b'event: bye\ndata: {"reason":"timeout"}\n\n')
+            self.wfile.flush()
+        except _sse_disconnect:
             return
 
 
@@ -2100,15 +3403,82 @@ def write_state() -> None:
         "updated_at": now(),
     }
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, STATE_PATH)
+    # Unique temp name: write_state runs from several threads (ensure_viewer /
+    # stop_viewer / main); a shared .tmp would let concurrent writers interleave.
+    tmp = STATE_PATH.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def read_state() -> dict | None:
     try:
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+
+
+def process_create_time(pid: int) -> float | None:
+    """Best-effort process creation time (epoch seconds), or None if unavailable.
+
+    Used to detect PID reuse: a recorded child_pid whose live creation time no
+    longer matches what we stored is a different, unrelated process.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_t = wintypes.FILETIME()
+            kernel_t = wintypes.FILETIME()
+            user_t = wintypes.FILETIME()
+            ok = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_t),
+                ctypes.byref(kernel_t),
+                ctypes.byref(user_t),
+            )
+            if not ok:
+                return None
+            # FILETIME is 100ns ticks since 1601-01-01; convert to Unix epoch seconds.
+            ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            if ticks == 0:
+                return None
+            return ticks / 10_000_000 - 11_644_473_600
+        finally:
+            kernel32.CloseHandle(handle)
+    # POSIX: derive from /proc/<pid>/stat starttime relative to boot time.
+    try:
+        raw = open(f"/proc/{pid}/stat", "rb").read()
+        # comm (field 2) may contain spaces/parens; slice past the final ')'.
+        after = raw[raw.rindex(b")") + 2:].split(b" ")
+        starttime_ticks = int(after[19])
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        btime = 0
+        with open("/proc/stat", "rb") as sf:
+            for line in sf:
+                if line.startswith(b"btime "):
+                    btime = int(line.split()[1])
+                    break
+        if not btime or not clk_tck:
+            return None
+        return btime + starttime_ticks / clk_tck
+    except (OSError, ValueError, IndexError):
         return None
 
 
@@ -2135,6 +3505,43 @@ def pid_is_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def terminate_pid(pid: int) -> None:
+    """Best-effort terminate/kill of a process by pid. Never targets pid 0 or self."""
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return
+    if not pid_is_alive(pid):
+        return
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_TERMINATE = 0x0001
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return
+        try:
+            ctypes.windll.kernel32.TerminateProcess(handle, 1)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        # Brief grace so subsequent alive checks observe death.
+        for _ in range(20):
+            if not pid_is_alive(pid):
+                return
+            time.sleep(0.05)
+        return
+    try:
+        os.kill(pid, 15)  # SIGTERM
+    except OSError:
+        return
+    for _ in range(20):
+        if not pid_is_alive(pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, 9)  # SIGKILL
+    except OSError:
+        pass
 
 
 def control_ping(port: int, timeout: float = 1.0) -> bool:
@@ -2242,6 +3649,11 @@ def cleanup() -> None:
         shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
     with connect() as db:
         db.execute("DELETE FROM tasks WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM agents)")
+        if ids:
+            try:
+                db.execute("PRAGMA optimize")
+            except sqlite3.Error:
+                pass
 
 
 def cleanup_loop() -> None:
@@ -2251,17 +3663,51 @@ def cleanup_loop() -> None:
 
 
 def recover() -> None:
+    """On daemon restart: kill recorded orphan children and fail in-flight agents."""
     with connect() as db:
-        stale = db.execute("SELECT id FROM agents WHERE status IN ('running','queued')").fetchall()
-        for row in stale:
+        stale = db.execute(
+            "SELECT id, child_pid, child_started_at FROM agents WHERE status IN ('running','queued')"
+        ).fetchall()
+    for row in stale:
+        agent_id = row["id"]
+        child_pid = row["child_pid"]
+        reaped = False
+        skipped_reuse = False
+        if child_pid is not None:
+            try:
+                pid = int(child_pid)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid > 0 and pid_is_alive(pid):
+                # Guard against PID reuse: only kill if the live process's creation
+                # time still matches what we recorded for this child (±2s tolerance).
+                expected = row["child_started_at"]
+                actual = process_create_time(pid)
+                if expected is not None and actual is not None:
+                    try:
+                        mismatch = abs(actual - float(expected)) > 2.0
+                    except (TypeError, ValueError):
+                        mismatch = False
+                    if mismatch:
+                        skipped_reuse = True
+                if not skipped_reuse:
+                    terminate_pid(pid)
+                    reaped = True
+        error = "Observer daemon restarted before completion"
+        if reaped:
+            error += f"; orphan process reaped (pid={pid})"
+        elif skipped_reuse:
+            error += f"; recorded pid={pid} was reused by another process, not killed"
+        stamp = now()
+        with connect() as db:
             db.execute(
-                "UPDATE agents SET status='failed',error='Observer daemon restarted before completion',updated_at=?,revision=revision+1 WHERE id=?",
-                (now(), row["id"]),
+                "UPDATE agents SET status='failed',error=?,child_pid=NULL,updated_at=?,revision=revision+1 WHERE id=?",
+                (error, stamp, agent_id),
             )
             db.execute(
                 "UPDATE turns SET status='failed',completed_at=COALESCE(completed_at, ?) "
                 "WHERE agent_id=? AND status IN ('queued','running')",
-                (now(), row["id"]),
+                (stamp, agent_id),
             )
 
 
@@ -2290,6 +3736,7 @@ def main() -> None:
         sys.exit(1)
 
     _WE_OWN_STATE = True
+    print(f"observer daemon starting pid={os.getpid()}", file=sys.stderr, flush=True)
     init_db()
     cleanup()
     recover()

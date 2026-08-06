@@ -1,0 +1,39 @@
+{
+  "name": "grok-subagent",
+  "version": "0.1.0",
+  "description": "Observable Grok subagents for Codex with workflow skills: help, discuss, plan, review, fix, work, and generic delegation.",
+  "author": {
+    "name": "thesnowpear",
+    "url": "https://github.com/thesnowpear"
+  },
+  "homepage": "https://github.com/thesnowpear/grok-subagent#readme",
+  "repository": "https://github.com/thesnowpear/grok-subagent",
+  "license": "MIT",
+  "keywords": [
+    "grok",
+    "subagent",
+    "delegation",
+    "observer",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Grok Subagent",
+    "shortDescription": "Delegate and orchestrate observable Grok agents",
+    "longDescription": "Create asynchronous Grok subagents, observe them in a local React viewer, and run Codex workflow skills (help, discuss, plan, review, fix, work) with local verification and signoff.",
+    "developerName": "thesnowpear",
+    "websiteURL": "https://github.com/thesnowpear/grok-subagent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Ask Grok for a second opinion while I keep implementing",
+      "Have Grok independently review these changes",
+      "Contract this implementation to Grok; I will supervise and verify"
+    ],
+    "brandColor": "#111827"
+  }
+}

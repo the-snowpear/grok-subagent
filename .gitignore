@@ -16,6 +16,7 @@ viewer/dist/**/*.map
 # Local agent scratch files
 .claude/
 .codex/
+.workbuddy/
 
 # Editor and OS noise
 .idea/

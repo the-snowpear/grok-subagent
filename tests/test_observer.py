@@ -20,8 +20,10 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 import daemon
+import server as mcp_server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +61,40 @@ def _raw_http_get(host: str, port: int, raw_path: str, timeout: float = 3.0) -> 
     status_line = header_blob.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
     status = int(status_line.split()[1])
     return status, body
+
+
+def _raw_http_request(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    host_header: str | None = None,
+    extra_headers: dict | None = None,
+    body: bytes = b"",
+    timeout: float = 3.0,
+) -> tuple[int, bytes]:
+    """Send a request with a caller-controlled Host header (for rebinding tests)."""
+    lines = [f"{method} {path} HTTP/1.1"]
+    lines.append(f"Host: {host_header if host_header is not None else f'{host}:{port}'}")
+    for key, value in (extra_headers or {}).items():
+        lines.append(f"{key}: {value}")
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    lines.append("Connection: close")
+    request = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii", errors="replace") + body
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(request)
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    header_blob, _, resp_body = data.partition(b"\r\n\r\n")
+    status_line = header_blob.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+    status = int(status_line.split()[1])
+    return status, resp_body
 
 
 class _IsolatedDbMixin:
@@ -159,7 +195,67 @@ class ObserverSmokeTest(unittest.TestCase):
         )
         responses = [json.loads(line) for line in completed.stdout.splitlines()]
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        self.assertEqual(names, {"create_agent", "send", "status", "wait", "result", "cancel", "signoff"})
+        self.assertEqual(names, {"create_agent", "send", "update_agent", "status", "wait", "result", "cancel", "signoff"})
+        instructions = responses[0]["result"]["instructions"]
+        self.assertIn("viewer_url", instructions)
+        create_description = next(
+            tool["description"]
+            for tool in responses[1]["result"]["tools"]
+            if tool["name"] == "create_agent"
+        )
+        self.assertIn("clickable Markdown link", create_description)
+
+    def test_create_agent_result_promotes_observer_link(self):
+        data = {
+            "agent_id": "agent-123",
+            "status": "queued",
+            "viewer_url": "http://127.0.0.1:47831/#/agents/agent-123",
+        }
+        with (
+            mock.patch.object(mcp_server, "_ensure_daemon"),
+            mock.patch.object(mcp_server, "_request", return_value=data),
+        ):
+            result = mcp_server.call_tool(
+                "create_agent",
+                {"agent_name": "reviewer", "prompt": "review this"},
+            )
+
+        self.assertEqual(result["structuredContent"], data)
+        self.assertEqual(json.loads(result["content"][0]["text"]), data)
+        self.assertEqual(len(result["content"]), 2)
+        display = result["content"][1]
+        self.assertEqual(display["type"], "text")
+        self.assertEqual(display["annotations"]["audience"], ["user", "assistant"])
+        self.assertIn("[View Grok execution]", display["text"])
+        self.assertIn(f"({data['viewer_url']})", display["text"])
+        self.assertFalse(any(item.get("type") == "resource_link" for item in result["content"]))
+
+    def test_other_tools_do_not_attach_observer_link(self):
+        data = {
+            "agent_id": "agent-123",
+            "status": "running",
+            "viewer_url": "http://127.0.0.1:47831/#/agents/agent-123",
+            "verdict": "accepted",
+        }
+        cases = (
+            ("send", {"agent_id": "agent-123", "prompt": "more work"}),
+            ("update_agent", {"agent_id": "agent-123", "prompt": "new direction"}),
+            ("result", {"agent_id": "agent-123"}),
+            ("signoff", {"agent_id": "agent-123", "verdict": "accepted", "summary": "ok"}),
+        )
+        for name, args in cases:
+            with self.subTest(tool=name):
+                with (
+                    mock.patch.object(mcp_server, "_ensure_daemon"),
+                    mock.patch.object(mcp_server, "_request", return_value=data),
+                ):
+                    result = mcp_server.call_tool(name, args)
+                self.assertEqual(result["structuredContent"], data)
+                self.assertEqual(len(result["content"]), 1)
+                self.assertEqual(json.loads(result["content"][0]["text"]), data)
+                self.assertFalse(any(item.get("type") == "resource_link" for item in result["content"]))
+                self.assertNotIn("[View Grok execution]", result["content"][0]["text"])
+                self.assertNotIn("ASSISTANT DISPLAY ACTION", result["content"][0]["text"])
 
     def test_terminal_ansi_is_removed(self):
         value = "\x1b[2m2026-07-11\x1b[0m \x1b[33mWARN\x1b[0m normal text"
@@ -167,6 +263,32 @@ class ObserverSmokeTest(unittest.TestCase):
 
 
 class WaitSemanticsTest(_IsolatedDbMixin, unittest.TestCase):
+    def test_update_agent_interrupts_running_turn_then_resumes(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_OBSERVER_NO_BROWSER"] = "1"
+        os.environ["GROK_FAKE_DURATION"] = "2"
+
+        created = self._create("long first turn")
+        agent_id = created["agent_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if daemon.action("status", {"agent_id": agent_id}, {})["status"] == "running":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("first turn never started")
+
+        updated = daemon.action("update_agent", {"agent_id": agent_id, "prompt": "new direction"}, {})
+        self.assertEqual(updated["mode"], "interrupt_and_resume")
+        self.assertEqual(updated["requested_mode"], "auto")
+        self.assertFalse(updated["lossless_interject"])
+
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        self.assertTrue(final["done"], final)
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
+        self.assertEqual(result["turn_results"][1]["prompt"], "new direction")
+
     def test_wait_ignores_intermediate_events_until_terminal_state(self):
         agent_id = str(uuid.uuid4())
         stamp = daemon.now()
@@ -310,6 +432,27 @@ class CancelLifecycleTest(_IsolatedDbMixin, unittest.TestCase):
             rows = db.execute("SELECT status FROM turns WHERE agent_id=?", (agent_id,)).fetchall()
         self.assertTrue(all(r["status"] == "cancelled" for r in rows))
 
+    def test_cancel_stops_worker_thread(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_OBSERVER_NO_BROWSER"] = "1"
+        os.environ["GROK_FAKE_DURATION"] = "3.0"
+        marker = self.folder / "thread_marker.txt"
+        os.environ["GROK_FAKE_MARKER"] = str(marker)
+
+        created = self._create("long running")
+        agent_id = created["agent_id"]
+        runner = daemon.get_runner(agent_id, create=False)
+        self.assertIsNotNone(runner)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not runner.thread.is_alive():
+            time.sleep(0.05)
+
+        daemon.action("cancel", {"agent_id": agent_id}, {})
+        # Worker must exit after cancel (no perpetual queue.get spin).
+        runner.thread.join(timeout=5)
+        self.assertFalse(runner.thread.is_alive(), "cancel must stop the worker thread")
+
     def test_cancel_queued_and_multi_turn_queue(self):
         os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
         os.environ["GROK_OBSERVER_NO_BROWSER"] = "1"
@@ -440,6 +583,79 @@ class StaticPathTest(_IsolatedDbMixin, unittest.TestCase):
             f"http://127.0.0.1:{self.port}/api/artifact?path={urllib.parse.quote('../secret.txt')}"
         )
         self.assertEqual(status3, 404)
+
+
+class HostHeaderGuardTest(_IsolatedDbMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        daemon.STATIC = ROOT / "viewer" / "dist"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), daemon.ViewerHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def test_local_host_allowed(self):
+        for host in (f"127.0.0.1:{self.port}", "localhost", f"localhost:{self.port}"):
+            status, _ = _raw_http_request(
+                "127.0.0.1", self.port, "GET", "/api/bootstrap", host_header=host
+            )
+            self.assertEqual(status, 200, host)
+
+    def test_rebinding_host_rejected_on_get(self):
+        # DNS-rebinding: attacker domain resolves to 127.0.0.1 but Host is theirs.
+        for host in ("evil.example.com", f"evil.example.com:{self.port}", "169.254.1.1"):
+            status, body = _raw_http_request(
+                "127.0.0.1", self.port, "GET", "/api/bootstrap", host_header=host
+            )
+            self.assertEqual(status, 403, host)
+            self.assertIn(b"forbidden", body)
+
+    def test_rebinding_host_rejected_on_post(self):
+        status, body = _raw_http_request(
+            "127.0.0.1",
+            self.port,
+            "POST",
+            "/api/viewer/shutdown",
+            host_header="evil.example.com",
+        )
+        self.assertEqual(status, 403)
+        self.assertIn(b"forbidden", body)
+
+    def test_missing_host_treated_as_local(self):
+        # HTTP/1.0-style clients / direct sockets never carry a rebinding origin.
+        self.assertTrue(daemon.ViewerHandler._host_is_local.__doc__ is not None)
+
+
+class MalformedQueryTest(_IsolatedDbMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), daemon.ViewerHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def test_events_after_non_integer_does_not_500(self):
+        status, body, _ = _http_get(
+            f"http://127.0.0.1:{self.port}/api/events?agent_id=x&after=not-an-int"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode())["events"], [])
+
+    def test_safe_int_helper(self):
+        self.assertEqual(daemon._safe_int("12"), 12)
+        self.assertEqual(daemon._safe_int("abc"), 0)
+        self.assertEqual(daemon._safe_int(None, 7), 7)
+        self.assertEqual(daemon._safe_int("", 3), 3)
 
 
 class SearchInjectionTest(_IsolatedDbMixin, unittest.TestCase):
@@ -611,6 +827,147 @@ class CleanupResourceTest(_IsolatedDbMixin, unittest.TestCase):
             self.assertNotIn(agent_id, daemon.CONDITIONS)
         self.assertFalse(runner.thread.is_alive())
         self.assertFalse(art.exists())
+
+    def test_derive_display_title_prefers_name_then_prompt(self):
+        self.assertEqual(daemon.derive_display_title("fix-login", "long body"), "fix-login")
+        title = daemon.derive_display_title(str(uuid.uuid4()), "  First line\nsecond")
+        self.assertEqual(title, "First line")
+        long_prompt = "x" * 80
+        self.assertTrue(daemon.derive_display_title("agent", long_prompt).endswith("…"))
+        self.assertLessEqual(len(daemon.derive_display_title("agent", long_prompt)), 60)
+
+    def test_agent_and_task_meta_pin_archive_title(self):
+        agent_id = str(uuid.uuid4())
+        thread_id = "meta-thread"
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (thread_id, "original", str(self.folder), "t", stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'completed',?,?,?)",
+                (agent_id, thread_id, "raw-name", str(self.folder), agent_id, "raw-name", stamp, stamp),
+            )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), daemon.ViewerHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # Agent meta
+            body = json.dumps(
+                {"pinned": True, "archived": True, "display_title": "  漂亮标题  "}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/agents/{agent_id}/meta",
+                method="POST",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                payload = json.loads(resp.read().decode())
+            self.assertEqual(payload["agent"]["display_title"], "漂亮标题")
+            self.assertEqual(int(payload["agent"]["pinned"]), 1)
+            self.assertEqual(int(payload["agent"]["archived"]), 1)
+
+            # Task meta
+            body = json.dumps(
+                {"pinned": True, "title": "会话新标题", "archived": False}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/tasks/{urllib.parse.quote(thread_id)}/meta",
+                method="POST",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                payload = json.loads(resp.read().decode())
+            self.assertEqual(payload["task"]["title"], "会话新标题")
+            self.assertEqual(int(payload["task"]["pinned"]), 1)
+            self.assertEqual(int(payload["task"]["archived"]), 0)
+
+            status, raw, _ = _http_get(f"http://127.0.0.1:{port}/api/bootstrap")
+            self.assertEqual(status, 200)
+            boot = json.loads(raw.decode())
+            agent_row = next(a for a in boot["agents"] if a["id"] == agent_id)
+            task_row = next(t for t in boot["tasks"] if t["thread_id"] == thread_id)
+            self.assertEqual(agent_row["display_title"], "漂亮标题")
+            self.assertEqual(int(agent_row["pinned"]), 1)
+            self.assertEqual(task_row["title"], "会话新标题")
+            # Pinned rows sort before others of same age when mixed later; flags present.
+            self.assertIn("catalog_revision", boot)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_sse_stream_wakes_on_add_event_without_1s_poll(self):
+        agent_id = str(uuid.uuid4())
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("sse", "sse", str(self.folder), "t", stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'running',?,?)",
+                (agent_id, "sse", "sse-agent", str(self.folder), agent_id, stamp, stamp),
+            )
+        with daemon.CONDITIONS_LOCK:
+            daemon.CONDITIONS[agent_id] = threading.Condition()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), daemon.ViewerHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        received = []
+        error_box = []
+
+        def reader():
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/stream?agent_id={agent_id}&after=0"
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    # Read until we see one data event or the socket idles.
+                    buf = b""
+                    deadline = time.time() + 4
+                    while time.time() < deadline:
+                        chunk = resp.read(1)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        if b"\n\n" in buf:
+                            parts = buf.split(b"\n\n")
+                            for part in parts[:-1]:
+                                text = part.decode("utf-8", errors="replace")
+                                for line in text.splitlines():
+                                    if line.startswith("data: "):
+                                        received.append(line[6:])
+                            buf = parts[-1]
+                            if received:
+                                break
+            except Exception as exc:
+                error_box.append(repr(exc))
+
+        worker = threading.Thread(target=reader, daemon=True)
+        worker.start()
+        time.sleep(0.15)
+        t0 = time.time()
+        daemon.add_event(agent_id, None, "text", "hello-sse", {"type": "text", "data": "hello-sse"})
+        worker.join(3)
+        elapsed = time.time() - t0
+        try:
+            self.assertFalse(error_box, error_box)
+            self.assertTrue(received, "SSE should deliver the new event")
+            self.assertIn("hello-sse", received[0])
+            # Event-driven path should not need a full 1s poll cycle.
+            self.assertLess(elapsed, 1.0, f"SSE latency too high: {elapsed:.3f}s")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class GitChangesDeltaTest(unittest.TestCase):
@@ -883,6 +1240,733 @@ class PorcelainParseTest(unittest.TestCase):
         self.assertEqual(entries["newname.txt"]["kind"], "renamed")
         self.assertEqual(entries["newname.txt"]["rename_from"], "oldname.txt")
         self.assertIn("plain.txt", entries)
+
+
+class ChildPidRecoverTest(_IsolatedDbMixin, unittest.TestCase):
+    def test_terminate_pid_noops_for_self_and_zero(self):
+        # Must not raise or kill the test process.
+        daemon.terminate_pid(0)
+        daemon.terminate_pid(-1)
+        daemon.terminate_pid(os.getpid())
+
+    def test_recover_reaps_alive_child_and_fails_agent(self):
+        # Spawn a long-lived child so recover must kill it.
+        alive = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        # Short-lived process that already exited (dead pid path).
+        dead = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        dead.wait(timeout=5)
+        self.assertFalse(daemon.pid_is_alive(dead.pid))
+        self.assertTrue(daemon.pid_is_alive(alive.pid))
+
+        alive_id = str(uuid.uuid4())
+        dead_id = str(uuid.uuid4())
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("rec", "rec", str(self.folder), "t", stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,child_pid,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'running',?,?,?)",
+                (alive_id, "rec", "alive", str(self.folder), alive_id, alive.pid, stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'running',?)",
+                (alive_id, "p", stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,child_pid,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?)",
+                (dead_id, "rec", "dead", str(self.folder), dead_id, dead.pid, stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)",
+                (dead_id, "p", stamp),
+            )
+
+        try:
+            daemon.recover()
+            deadline = time.time() + 3
+            while time.time() < deadline and daemon.pid_is_alive(alive.pid):
+                time.sleep(0.05)
+            self.assertFalse(daemon.pid_is_alive(alive.pid), "recover should terminate orphan child")
+            with daemon.connect() as db:
+                a = db.execute("SELECT status,error,child_pid FROM agents WHERE id=?", (alive_id,)).fetchone()
+                d = db.execute("SELECT status,error,child_pid FROM agents WHERE id=?", (dead_id,)).fetchone()
+                self.assertEqual(a["status"], "failed")
+                self.assertIsNone(a["child_pid"])
+                self.assertIn("orphan process reaped", a["error"] or "")
+                self.assertEqual(d["status"], "failed")
+                self.assertIsNone(d["child_pid"])
+                self.assertIn("restarted", (d["error"] or "").lower())
+                turn_a = db.execute("SELECT status FROM turns WHERE agent_id=?", (alive_id,)).fetchone()
+                self.assertEqual(turn_a["status"], "failed")
+        finally:
+            if daemon.pid_is_alive(alive.pid):
+                daemon.terminate_pid(alive.pid)
+            try:
+                alive.wait(timeout=2)
+            except Exception:
+                pass
+
+    def test_recover_skips_reused_pid(self):
+        # Alive process, but recorded child_started_at does not match its real
+        # creation time → recover must treat the pid as reused and NOT kill it.
+        alive = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            self.assertTrue(daemon.pid_is_alive(alive.pid))
+            # Only meaningful when we can actually read a creation time.
+            if daemon.process_create_time(alive.pid) is None:
+                self.skipTest("process_create_time unavailable on this platform")
+            agent_id = str(uuid.uuid4())
+            stamp = daemon.now()
+            with daemon.connect() as db:
+                db.execute(
+                    "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    ("reuse", "reuse", str(self.folder), "t", stamp, stamp),
+                )
+                db.execute(
+                    "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,child_pid,child_started_at,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,'running',?,?,?,?)",
+                    (agent_id, "reuse", "a", str(self.folder), agent_id, alive.pid, "1.0", stamp, stamp),
+                )
+                db.execute(
+                    "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'running',?)",
+                    (agent_id, "p", stamp),
+                )
+            daemon.recover()
+            time.sleep(0.3)
+            self.assertTrue(daemon.pid_is_alive(alive.pid), "reused pid must not be killed")
+            with daemon.connect() as db:
+                row = db.execute("SELECT status,error,child_pid FROM agents WHERE id=?", (agent_id,)).fetchone()
+            self.assertEqual(row["status"], "failed")
+            self.assertIsNone(row["child_pid"])
+            self.assertIn("reused", (row["error"] or "").lower())
+        finally:
+            if daemon.pid_is_alive(alive.pid):
+                daemon.terminate_pid(alive.pid)
+            try:
+                alive.wait(timeout=2)
+            except Exception:
+                pass
+
+
+class ConcurrencyLimitTest(_IsolatedDbMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig_limits = {
+            "MAX_ACTIVE_PER_THREAD": daemon.MAX_ACTIVE_PER_THREAD,
+            "MAX_ACTIVE_AGENTS": daemon.MAX_ACTIVE_AGENTS,
+            "MAX_QUEUE_DEPTH": daemon.MAX_QUEUE_DEPTH,
+        }
+        self._created_ids: list[str] = []
+
+    def tearDown(self):
+        for agent_id in self._created_ids:
+            try:
+                daemon.action("cancel", {"agent_id": agent_id}, {})
+            except Exception:
+                pass
+        for key, value in self._orig_limits.items():
+            setattr(daemon, key, value)
+        super().tearDown()
+
+    def _create_tracked(self, prompt: str, *, name: str = "agent", cwd: str | None = None, thread_id: str = "test-thread"):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ.setdefault("GROK_FAKE_DURATION", "3.0")
+        data = daemon.action(
+            "create_agent",
+            {
+                "agent_name": name,
+                "prompt": prompt,
+                "cwd": cwd or str(self.folder),
+            },
+            {"codex_thread_id": thread_id, "codex_origin": "test"},
+        )
+        self._created_ids.append(data["agent_id"])
+        return data
+
+    def test_allows_concurrent_same_cwd(self):
+        """Same workspace may host multiple active agents; second gets a soft warning."""
+        os.environ["GROK_FAKE_DURATION"] = "3.0"
+        daemon.MAX_ACTIVE_PER_THREAD = 5
+        first = self._create_tracked("first parallel", name="a1", thread_id="cwd-thread")
+        second = self._create_tracked("second parallel", name="a2", thread_id="cwd-thread")
+        self.assertNotEqual(first["agent_id"], second["agent_id"])
+        with daemon.connect() as db:
+            warn = db.execute(
+                "SELECT COUNT(*) AS c FROM events WHERE agent_id=? AND type='concurrency_warning'",
+                (second["agent_id"],),
+            ).fetchone()["c"]
+        self.assertGreaterEqual(int(warn), 1)
+
+    def test_max_per_thread_rejected(self):
+        os.environ["GROK_FAKE_DURATION"] = "3.0"
+        daemon.MAX_ACTIVE_PER_THREAD = 2
+        daemon.MAX_ACTIVE_AGENTS = 16
+        self._create_tracked("t1", name="p1", thread_id="limit-thread")
+        self._create_tracked("t2", name="p2", thread_id="limit-thread")
+        with self.assertRaises(ValueError) as ctx:
+            self._create_tracked("t3", name="p3", thread_id="limit-thread")
+        msg = str(ctx.exception)
+        self.assertIn("MAX_ACTIVE_PER_THREAD", msg)
+        self.assertIn("GROK_OBSERVER_MAX_PER_THREAD", msg)
+
+    def test_max_per_thread_independent_threads(self):
+        """Filling thread A must not block thread B (even on the same cwd)."""
+        os.environ["GROK_FAKE_DURATION"] = "3.0"
+        daemon.MAX_ACTIVE_PER_THREAD = 2
+        daemon.MAX_ACTIVE_AGENTS = 16
+        self._create_tracked("a1", name="a1", thread_id="thread-A")
+        self._create_tracked("a2", name="a2", thread_id="thread-A")
+        with self.assertRaises(ValueError):
+            self._create_tracked("a3", name="a3", thread_id="thread-A")
+        other = self._create_tracked("b1", name="b1", thread_id="thread-B")
+        self.assertIn("agent_id", other)
+
+    def test_max_active_agents_rejected(self):
+        os.environ["GROK_FAKE_DURATION"] = "3.0"
+        daemon.MAX_ACTIVE_PER_THREAD = 5
+        daemon.MAX_ACTIVE_AGENTS = 1
+        other_cwd = self.folder / "other"
+        other_cwd.mkdir(exist_ok=True)
+        first = self._create_tracked("only", name="solo", thread_id="g1")
+        with self.assertRaises(ValueError) as ctx:
+            self._create_tracked(
+                "overflow",
+                name="too-many",
+                cwd=str(other_cwd),
+                thread_id="g2",
+            )
+        self.assertIn("MAX_ACTIVE_AGENTS", str(ctx.exception))
+        self.assertIn(first["agent_id"], self._created_ids)
+
+
+class FinalTextFallbackTest(_IsolatedDbMixin, unittest.TestCase):
+    def test_final_text_from_events_concatenates_chronologically(self):
+        agent_id = str(uuid.uuid4())
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("ft", "ft", str(self.folder), "t", stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'running',?,?)",
+                (agent_id, "ft", "ft", str(self.folder), agent_id, stamp, stamp),
+            )
+            cur = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'running',?)",
+                (agent_id, "p", stamp),
+            )
+            turn_id = cur.lastrowid
+
+        daemon.add_event(agent_id, turn_id, "text", "hello", {"type": "text", "data": "Hello "})
+        daemon.add_event(agent_id, turn_id, "thought", "noise", {"type": "thought", "data": "skip me"})
+        daemon.add_event(
+            agent_id,
+            turn_id,
+            "agent_message_chunk",
+            "world",
+            {"type": "agent_message_chunk", "data": "world"},
+        )
+
+        text = daemon.final_text_from_events(agent_id, turn_id)
+        self.assertIn("Hello", text)
+        self.assertIn("world", text)
+        self.assertNotIn("skip me", text)
+
+    def test_result_falls_back_to_last_completed_turn(self):
+        agent_id = str(uuid.uuid4())
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("rf", "rf", str(self.folder), "t", stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,final_text,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'completed','',?,?)",
+                (agent_id, "rf", "rf", str(self.folder), agent_id, stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,result,created_at,completed_at) "
+                "VALUES(?,1,?,'completed',?,?,?)",
+                (agent_id, "p", "turn result body", stamp, stamp),
+            )
+        out = daemon.action("result", {"agent_id": agent_id}, {})
+        self.assertEqual(out["final_text"], "turn result body")
+
+
+class EditLedgerTest(_IsolatedDbMixin, unittest.TestCase):
+    """Tool edit ledger: claimed paths + merge with observed + shared peers."""
+
+    def _seed_agent(self, agent_id: str, *, status: str = "running", name: str = "led") -> int:
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("ledger", "ledger", str(self.folder), "t", stamp, stamp),
+            )
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (agent_id, "ledger", name, str(self.folder), agent_id, status, stamp, stamp),
+            )
+            cur = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'running',?)",
+                (agent_id, "edit something", stamp),
+            )
+            return int(cur.lastrowid)
+
+    def test_extract_search_replace_session_payload(self):
+        line = {
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "title": "Edit `hello.txt`",
+                    "rawInput": {
+                        "file_path": "hello.txt",
+                        "old_string": "a",
+                        "new_string": "b",
+                    },
+                    "_meta": {
+                        "x.ai/tool": {
+                            "name": "search_replace",
+                            "kind": "edit",
+                        }
+                    },
+                }
+            },
+        }
+        claims = daemon.extract_edit_claims_from_payload(line)
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0]["path"], "hello.txt")
+        self.assertEqual(claims[0]["tool_name"], "search_replace")
+        self.assertEqual(claims[0]["tool_call_id"], "call-1")
+
+    def test_extract_ignores_read_file(self):
+        line = {
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Read `README.md`",
+                    "rawInput": {"target_file": "README.md"},
+                    "_meta": {"x.ai/tool": {"name": "read_file", "kind": "read"}},
+                }
+            }
+        }
+        self.assertEqual(daemon.extract_edit_claims_from_payload(line), [])
+
+    def test_record_changes_claimed_only(self):
+        agent_id = str(uuid.uuid4())
+        turn_id = self._seed_agent(agent_id)
+        payload = {
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "c-edit",
+                    "title": "Edit `only-claimed.txt`",
+                    "rawInput": {"file_path": "only-claimed.txt", "old_string": "x", "new_string": "y"},
+                    "_meta": {"x.ai/tool": {"name": "search_replace", "kind": "edit"}},
+                }
+            }
+        }
+        daemon.add_event(agent_id, turn_id, "tool_call_update", "Edit", payload)
+        # Snapshots unavailable → still record claimed.
+        count = daemon.record_changes(
+            agent_id,
+            turn_id,
+            {"available": False, "mode": "git"},
+            {"available": False, "mode": "git"},
+        )
+        self.assertEqual(count, 1)
+        with daemon.connect() as db:
+            row = db.execute(
+                "SELECT path,source,shared,tool_name FROM changes WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
+        self.assertEqual(row["path"], "only-claimed.txt")
+        self.assertEqual(row["source"], "claimed")
+        self.assertEqual(int(row["shared"] or 0), 0)
+        self.assertEqual(row["tool_name"], "search_replace")
+
+    def test_record_changes_both_when_fs_observes_same_path(self):
+        agent_id = str(uuid.uuid4())
+        turn_id = self._seed_agent(agent_id)
+        rel = "touch-me.txt"
+        target = self.folder / rel
+        target.write_text("before\n", encoding="utf-8")
+        before = daemon.fs_snapshot(self.folder)
+        target.write_text("after\n", encoding="utf-8")
+        after = daemon.fs_snapshot(self.folder)
+        daemon.add_event(
+            agent_id,
+            turn_id,
+            "tool_call_update",
+            "Edit",
+            {
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "c2",
+                        "title": f"Edit `{rel}`",
+                        "rawInput": {"file_path": rel, "old_string": "before", "new_string": "after"},
+                        "_meta": {"x.ai/tool": {"name": "search_replace", "kind": "edit"}},
+                    }
+                }
+            },
+        )
+        count = daemon.record_changes(agent_id, turn_id, before, after)
+        self.assertGreaterEqual(count, 1)
+        with daemon.connect() as db:
+            row = db.execute(
+                "SELECT path,source FROM changes WHERE agent_id=? AND path=?",
+                (agent_id, rel),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["source"], "both")
+
+    def test_observed_shared_when_peer_running(self):
+        agent_a = str(uuid.uuid4())
+        agent_b = str(uuid.uuid4())
+        turn_a = self._seed_agent(agent_a, name="a")
+        self._seed_agent(agent_b, name="b", status="running")
+        rel = "peer-touch.txt"
+        target = self.folder / rel
+        target.write_text("v1\n", encoding="utf-8")
+        before = daemon.fs_snapshot(self.folder)
+        target.write_text("v2\n", encoding="utf-8")
+        after = daemon.fs_snapshot(self.folder)
+        # No tool claim — pure observed; peer running → shared=1
+        count = daemon.record_changes(agent_a, turn_a, before, after)
+        self.assertGreaterEqual(count, 1)
+        with daemon.connect() as db:
+            row = db.execute(
+                "SELECT path,source,shared FROM changes WHERE agent_id=? AND path=?",
+                (agent_a, rel),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["source"], "observed")
+        self.assertEqual(int(row["shared"]), 1)
+
+
+class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
+    """update_agent modes: immediate / idle / tool_boundary / timeout / cancel."""
+
+    def _wait_running(self, agent_id: str, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if daemon.action("status", {"agent_id": agent_id}, {})["status"] == "running":
+                return
+            time.sleep(0.05)
+        self.fail("agent never reached running")
+
+    def _events(self, agent_id: str) -> list[dict]:
+        with daemon.connect() as db:
+            rows = db.execute(
+                "SELECT type,summary,payload FROM events WHERE agent_id=? ORDER BY seq",
+                (agent_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            item = {"type": row["type"], "summary": row["summary"], "payload": {}}
+            if row["payload"]:
+                try:
+                    item["payload"] = json.loads(row["payload"])
+                except json.JSONDecodeError:
+                    item["payload"] = {}
+            out.append(item)
+        return out
+
+    def _inject_open_tool(self, agent_id: str, call_id: str = "t1", name: str = "read_file") -> int:
+        runner = daemon.get_runner(agent_id, create=False)
+        self.assertIsNotNone(runner)
+        assert runner is not None
+        with daemon.connect() as db:
+            turn = db.execute(
+                "SELECT id FROM turns WHERE agent_id=? AND status='running' ORDER BY turn_no DESC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+        self.assertIsNotNone(turn)
+        turn_id = int(turn["id"])
+        # Ensure flight tracking is bound to this turn (begin_turn already ran).
+        payload = {
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": call_id,
+                    "title": name,
+                    "status": "in_progress",
+                    "_meta": {"x.ai/tool": {"name": name}},
+                }
+            }
+        }
+        runner.observe_tool_event(turn_id, "tool_call", name, payload)
+        self.assertTrue(runner.has_inflight_tools())
+        return turn_id
+
+    def test_immediate_mode_interrupts(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "2"
+        agent_id = self._create("long")["agent_id"]
+        self._wait_running(agent_id)
+        updated = daemon.action(
+            "update_agent",
+            {"agent_id": agent_id, "prompt": "steer now", "mode": "immediate"},
+            {},
+        )
+        self.assertEqual(updated["requested_mode"], "immediate")
+        self.assertEqual(updated["mode"], "interrupt_and_resume")
+        self.assertFalse(updated["lossless_interject"])
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        self.assertTrue(final["done"], final)
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
+        types = [e["type"] for e in self._events(agent_id)]
+        self.assertIn("interjection", types)
+        self.assertIn("update_applied", types)
+
+    def test_idle_follow_up(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "0.05"
+        agent_id = self._create("quick")["agent_id"]
+        done = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 10}, {})
+        self.assertTrue(done["done"], done)
+        updated = daemon.action(
+            "update_agent",
+            {"agent_id": agent_id, "prompt": "second turn", "mode": "tool_boundary"},
+            {},
+        )
+        self.assertEqual(updated["requested_mode"], "tool_boundary")
+        self.assertEqual(updated["mode"], "follow_up")
+        self.assertFalse(updated["lossless_interject"])
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 10}, {})
+        self.assertTrue(final["done"], final)
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        statuses = [t["status"] for t in result["turn_results"]]
+        self.assertEqual(statuses, ["completed", "completed"])
+        self.assertEqual(result["turn_results"][1]["prompt"], "second turn")
+
+    def test_tool_boundary_waits_then_interrupts(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "3"
+        agent_id = self._create("toolish")["agent_id"]
+        self._wait_running(agent_id)
+        turn_id = self._inject_open_tool(agent_id, call_id="bound1")
+
+        updated = daemon.action(
+            "update_agent",
+            {
+                "agent_id": agent_id,
+                "prompt": "after tools",
+                "mode": "tool_boundary",
+                "timeout_seconds": 30,
+            },
+            {},
+        )
+        self.assertEqual(updated["mode"], "waiting_tool_boundary")
+        self.assertEqual(updated["requested_mode"], "tool_boundary")
+
+        # Still running — must not have interrupted yet.
+        time.sleep(0.15)
+        st = daemon.action("status", {"agent_id": agent_id}, {})
+        self.assertEqual(st["status"], "running")
+        types_mid = [e["type"] for e in self._events(agent_id)]
+        self.assertIn("pending_update", types_mid)
+        self.assertNotIn("update_applied", types_mid)
+
+        # Close the tool → boundary fires.
+        runner = daemon.get_runner(agent_id, create=False)
+        assert runner is not None
+        runner.observe_tool_event(
+            turn_id,
+            "tool_call_update",
+            "done",
+            {
+                "params": {
+                    "update": {
+                        "toolCallId": "bound1",
+                        "status": "completed",
+                        "_meta": {"x.ai/tool": {"name": "read_file"}},
+                    }
+                }
+            },
+        )
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        self.assertTrue(final["done"], final)
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
+        applied = [e for e in self._events(agent_id) if e["type"] == "update_applied"]
+        self.assertTrue(applied)
+        self.assertEqual(applied[0]["payload"].get("mode_used"), "interrupt_and_resume")
+        self.assertEqual(applied[0]["payload"].get("trigger"), "tool_boundary")
+
+    def test_tool_boundary_timeout_falls_back_to_immediate(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "4"
+        agent_id = self._create("slow tools")["agent_id"]
+        self._wait_running(agent_id)
+        self._inject_open_tool(agent_id, call_id="hang1")
+
+        updated = daemon.action(
+            "update_agent",
+            {
+                "agent_id": agent_id,
+                "prompt": "timeout path",
+                "mode": "tool_boundary",
+                "timeout_seconds": 1,
+            },
+            {},
+        )
+        self.assertEqual(updated["mode"], "waiting_tool_boundary")
+
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        self.assertTrue(final["done"], final)
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
+        applied = [e for e in self._events(agent_id) if e["type"] == "update_applied"]
+        self.assertTrue(any(e["payload"].get("mode_used") == "immediate_timeout" for e in applied))
+
+    def test_auto_uses_boundary_when_tools_inflight(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "3"
+        agent_id = self._create("auto boundary")["agent_id"]
+        self._wait_running(agent_id)
+        turn_id = self._inject_open_tool(agent_id, call_id="auto1")
+
+        updated = daemon.action(
+            "update_agent",
+            {"agent_id": agent_id, "prompt": "auto steer", "mode": "auto", "timeout_seconds": 20},
+            {},
+        )
+        self.assertEqual(updated["requested_mode"], "auto")
+        self.assertEqual(updated["mode"], "waiting_tool_boundary")
+
+        runner = daemon.get_runner(agent_id, create=False)
+        assert runner is not None
+        runner.observe_tool_event(
+            turn_id,
+            "tool_completed",
+            "done",
+            {"params": {"update": {"toolCallId": "auto1", "status": "completed"}}},
+        )
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        self.assertTrue(final["done"], final)
+
+    def test_multiple_boundary_updates_process_in_order(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "3"
+        agent_id = self._create("multi")["agent_id"]
+        self._wait_running(agent_id)
+        turn_id = self._inject_open_tool(agent_id, call_id="m1")
+
+        u1 = daemon.action(
+            "update_agent",
+            {"agent_id": agent_id, "prompt": "first", "mode": "tool_boundary", "timeout_seconds": 20},
+            {},
+        )
+        u2 = daemon.action(
+            "update_agent",
+            {"agent_id": agent_id, "prompt": "second", "mode": "tool_boundary", "timeout_seconds": 20},
+            {},
+        )
+        self.assertEqual(u1["mode"], "waiting_tool_boundary")
+        self.assertEqual(u2["mode"], "waiting_tool_boundary")
+
+        runner = daemon.get_runner(agent_id, create=False)
+        assert runner is not None
+        runner.observe_tool_event(
+            turn_id,
+            "tool_call_update",
+            "done",
+            {"params": {"update": {"toolCallId": "m1", "status": "completed"}}},
+        )
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 20}, {})
+        self.assertTrue(final["done"], final)
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        prompts = [t["prompt"] for t in result["turn_results"]]
+        self.assertEqual(prompts[0], "multi")
+        self.assertIn("first", prompts)
+        self.assertIn("second", prompts)
+        # Independent replacement turns, order preserved after the interrupted base turn.
+        idx_first = prompts.index("first")
+        idx_second = prompts.index("second")
+        self.assertLess(idx_first, idx_second)
+        # No ghost queued turns left.
+        self.assertTrue(all(t["status"] != "queued" for t in result["turn_results"]))
+
+    def test_cancel_releases_pending_boundary_timer(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "5"
+        agent_id = self._create("cancel pending")["agent_id"]
+        self._wait_running(agent_id)
+        self._inject_open_tool(agent_id, call_id="cxl1")
+
+        updated = daemon.action(
+            "update_agent",
+            {
+                "agent_id": agent_id,
+                "prompt": "will cancel",
+                "mode": "tool_boundary",
+                "timeout_seconds": 60,
+            },
+            {},
+        )
+        self.assertEqual(updated["mode"], "waiting_tool_boundary")
+        runner = daemon.get_runner(agent_id, create=False)
+        assert runner is not None
+        self.assertTrue(runner._pending_boundary)
+
+        daemon.action("cancel", {"agent_id": agent_id}, {})
+        self.assertFalse(runner._pending_boundary)
+        self.assertFalse(runner.has_inflight_tools())
+        # Timer must not resurrect work after cancel.
+        time.sleep(0.2)
+        st = daemon.action("status", {"agent_id": agent_id}, {})
+        self.assertEqual(st["status"], "cancelled")
+
+    def test_shutdown_releases_pending_boundary_timer(self):
+        os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
+        os.environ["GROK_FAKE_DURATION"] = "5"
+        agent_id = self._create("shutdown pending")["agent_id"]
+        self._wait_running(agent_id)
+        self._inject_open_tool(agent_id, call_id="sd1")
+        updated = daemon.action(
+            "update_agent",
+            {
+                "agent_id": agent_id,
+                "prompt": "will shutdown",
+                "mode": "tool_boundary",
+                "timeout_seconds": 60,
+            },
+            {},
+        )
+        self.assertEqual(updated["mode"], "waiting_tool_boundary")
+        runner = daemon.get_runner(agent_id, create=False)
+        assert runner is not None
+        runner.shutdown()
+        self.assertFalse(runner._pending_boundary)
+        self.assertFalse(runner.has_inflight_tools())
 
 
 if __name__ == "__main__":

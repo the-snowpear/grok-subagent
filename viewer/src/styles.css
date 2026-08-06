@@ -2,7 +2,8 @@
    System fonts only (viewer CSP blocks third-party font hosts). */
 
 :root {
-  color-scheme: dark light;
+  /* Default tokens are dark; color-scheme must match so OS scrollbars aren't inverted. */
+  color-scheme: dark;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC",
     "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -28,10 +29,15 @@
   --radius: 6px;
   --sidebar-w: 280px;
   --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  /* Firefox scrollbar-color: thumb track */
+  --scrollbar-thumb: color-mix(in srgb, var(--muted) 55%, transparent);
+  --scrollbar-track: color-mix(in srgb, var(--surface-2) 55%, transparent);
 }
 
 @media (prefers-color-scheme: light) {
+  /* system theme + OS light, or explicit non-dark */
   :root:not([data-theme="dark"]) {
+    color-scheme: light;
     --bg: #f4f5f7;
     --bg-elevated: #ffffff;
     --sidebar: #eceef2;
@@ -50,10 +56,13 @@
     --blue: #2f5fbf;
     --user-bg: #e7eef8;
     --shadow: 0 12px 32px rgba(20, 24, 40, 0.1);
+    --scrollbar-thumb: color-mix(in srgb, var(--muted) 40%, #c5cad6);
+    --scrollbar-track: color-mix(in srgb, var(--surface-2) 80%, #ffffff);
   }
 }
 
 :root[data-theme="light"] {
+  color-scheme: light;
   --bg: #f4f5f7;
   --bg-elevated: #ffffff;
   --sidebar: #eceef2;
@@ -72,10 +81,22 @@
   --blue: #2f5fbf;
   --user-bg: #e7eef8;
   --shadow: 0 12px 32px rgba(20, 24, 40, 0.1);
+  --scrollbar-thumb: color-mix(in srgb, var(--muted) 40%, #c5cad6);
+  --scrollbar-track: color-mix(in srgb, var(--surface-2) 80%, #ffffff);
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
+  --scrollbar-thumb: color-mix(in srgb, var(--muted) 55%, transparent);
+  --scrollbar-track: color-mix(in srgb, var(--surface-2) 55%, transparent);
+}
+
+/* system + OS dark: keep dark scheme even though data-theme=system */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"],
+  :root:not([data-theme]) {
+    color-scheme: dark;
+  }
 }
 
 *,
@@ -166,6 +187,174 @@ a {
   min-height: 0;
   overflow: hidden;
   background: var(--bg);
+}
+
+/* CLI-style live status (selected agent, running/queued only) — workspace bottom-left */
+.activity-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  max-height: 32px;
+  padding: 0 14px 0 12px;
+  border-top: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--bg-elevated) 88%, var(--surface-2));
+  color: var(--muted);
+  font-size: 12px;
+  font-family: var(--mono);
+  letter-spacing: 0.01em;
+  transition:
+    color 160ms ease,
+    background-color 160ms ease,
+    border-color 160ms ease;
+  min-width: 0;
+}
+
+.activity-bar-clickable {
+  cursor: pointer;
+}
+
+.activity-bar-clickable:hover {
+  filter: brightness(1.06);
+}
+
+.activity-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.activity-elapsed {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--faint);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+/* SSE disconnect strip (active agent only) */
+.stream-conn-banner {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 3px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 12%, var(--bg-elevated));
+  border-bottom: 1px solid color-mix(in srgb, var(--amber) 35%, var(--line));
+}
+
+/* Search deep-link highlight pulse */
+.stream-flash {
+  animation: stream-flash-pulse 2s ease-out 1;
+  border-radius: 6px;
+}
+
+@keyframes stream-flash-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 55%, transparent);
+    background-color: color-mix(in srgb, var(--amber) 22%, transparent);
+  }
+  40% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--amber) 18%, transparent);
+    background-color: color-mix(in srgb, var(--amber) 12%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    background-color: transparent;
+  }
+}
+
+/* Zero-size anchors for multi-event deep-links inside toolchains */
+.stream-anchor {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.stream-item {
+  position: relative;
+}
+
+.activity-spinner {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+  opacity: 0.9;
+  box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 45%, transparent);
+  animation: activity-pulse 1.35s ease-in-out infinite;
+}
+
+.activity-bar.phase-tool .activity-spinner,
+.activity-bar.phase-thinking .activity-spinner,
+.activity-bar.phase-responding .activity-spinner {
+  animation: activity-pulse 0.95s ease-in-out infinite;
+}
+
+.activity-bar.phase-queued {
+  color: var(--faint);
+  border-top-color: color-mix(in srgb, var(--faint) 28%, var(--line-soft));
+}
+
+.activity-bar.phase-thinking,
+.activity-bar.tone-thinking {
+  color: var(--amber);
+  border-top-color: color-mix(in srgb, var(--amber) 35%, var(--line-soft));
+  background: color-mix(in srgb, var(--amber) 7%, var(--bg-elevated));
+}
+
+.activity-bar.phase-tool,
+.activity-bar.tone-tool {
+  color: var(--cyan);
+  border-top-color: color-mix(in srgb, var(--cyan) 40%, var(--line-soft));
+  background: color-mix(in srgb, var(--cyan) 8%, var(--bg-elevated));
+}
+
+.activity-bar.phase-responding,
+.activity-bar.tone-responding {
+  color: var(--accent);
+  border-top-color: color-mix(in srgb, var(--accent) 35%, var(--line-soft));
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-elevated));
+}
+
+.activity-bar.phase-failed,
+.activity-bar.tone-err {
+  color: var(--red);
+  border-top-color: color-mix(in srgb, var(--red) 35%, var(--line-soft));
+}
+
+@keyframes activity-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.85);
+    box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 40%, transparent);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 12%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-spinner {
+    animation: none;
+    opacity: 1;
+    transform: none;
+    box-shadow: none;
+  }
 }
 
 /* ── brand / search ─────────────────────────────────────────────────────── */
@@ -296,7 +485,38 @@ a {
   padding: 0 2px;
 }
 
-/* ── task / agent list ──────────────────────────────────────────────────── */
+/* ── project / session / agent tree ─────────────────────────────────────── */
+
+.list-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 6px;
+}
+
+.chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.chip-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-2) 70%, transparent);
+}
+
+.chip-btn.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: var(--accent-dim);
+}
 
 .task-list {
   flex: 1;
@@ -307,17 +527,18 @@ a {
   scrollbar-width: thin;
 }
 
-.task-group {
-  margin-bottom: 6px;
+/* Level 1: workspace / project */
+.project-group {
+  margin-bottom: 8px;
 }
 
-.task-toggle {
+.project-toggle,
+.session-toggle {
   display: grid;
   grid-template-columns: 12px 14px minmax(0, 1fr);
   align-items: center;
   gap: 6px;
   width: 100%;
-  padding: 6px 8px;
   border: 0;
   border-radius: 5px;
   background: transparent;
@@ -325,27 +546,58 @@ a {
   text-align: left;
 }
 
-.task-toggle:hover {
+.project-toggle {
+  padding: 7px 8px;
+}
+
+.project-toggle:hover,
+.session-toggle:hover {
   background: color-mix(in srgb, var(--surface-2) 70%, transparent);
   color: var(--text);
 }
 
-.task-chevron {
+/* Level 2: Codex session under project */
+.session-group {
+  margin: 1px 0 2px;
+  padding-left: 8px;
+}
+
+.session-row {
+  position: relative;
+}
+
+.session-toggle {
+  padding: 5px 6px 5px 4px;
+  padding-right: 72px;
+}
+
+.session-group.is-archived .tree-copy strong,
+.agent-row.is-archived .agent-copy strong {
+  color: var(--muted);
+}
+
+.session-group.is-pinned > .session-row .tree-copy strong,
+.agent-row.is-pinned .agent-copy strong {
+  color: var(--accent);
+}
+
+.tree-chevron {
   transition: transform 0.15s ease;
 }
 
-.task-group.collapsed .task-chevron {
+.project-group.collapsed > .project-toggle .tree-chevron,
+.session-group.collapsed > .session-toggle .tree-chevron {
   transform: rotate(-90deg);
 }
 
-.task-copy {
+.tree-copy {
   display: flex;
   flex-direction: column;
   min-width: 0;
   gap: 1px;
 }
 
-.task-copy strong {
+.tree-copy strong {
   font-size: 11px;
   font-weight: 600;
   color: var(--text);
@@ -354,16 +606,21 @@ a {
   text-overflow: ellipsis;
 }
 
-.task-copy span {
+.session-toggle .tree-copy strong {
+  font-weight: 500;
+}
+
+.tree-copy span {
   font-family: var(--mono);
   font-size: 9px;
   color: var(--faint);
 }
 
+/* Level 3: Grok subagents */
 .agent-list {
   list-style: none;
   margin: 0;
-  padding: 0 0 2px;
+  padding: 0 0 2px 14px;
 }
 
 .agent-row {
@@ -375,12 +632,53 @@ a {
   grid-template-columns: 8px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  padding: 6px 28px 6px 10px;
+  padding: 6px 84px 6px 10px;
   margin: 1px 0;
   border-radius: 5px;
   text-decoration: none;
   color: var(--text);
   border: 1px solid transparent;
+}
+
+.row-actions {
+  position: absolute;
+  top: 50%;
+  right: 2px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.session-row:hover .session-actions,
+.session-row:focus-within .session-actions,
+.agent-row:hover .agent-actions,
+.agent-row:focus-within .agent-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.row-action {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--faint);
+}
+
+.row-action:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+}
+
+.row-action.danger:hover {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
 }
 
 .agent-link:hover {
@@ -443,32 +741,6 @@ a {
 .status-dot.status-queued,
 .status-dot.status-cancelled {
   background: var(--muted);
-}
-
-.delete-agent {
-  position: absolute;
-  top: 50%;
-  right: 4px;
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  transform: translateY(-50%);
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--faint);
-  opacity: 0;
-}
-
-.agent-row:hover .delete-agent,
-.delete-agent:focus-visible {
-  opacity: 1;
-}
-
-.delete-agent:hover {
-  color: var(--red);
-  background: color-mix(in srgb, var(--red) 12%, transparent);
 }
 
 .sidebar-foot {
@@ -886,25 +1158,85 @@ a {
   border-left-color: color-mix(in srgb, var(--amber) 35%, var(--line));
 }
 
-.toolchain-row > .row-body,
-.tool-step > .row-body {
-  border-left-color: color-mix(in srgb, var(--cyan) 30%, var(--line));
-}
-
 .diagnostic-group > .row-body {
   border-left-color: color-mix(in srgb, var(--faint) 35%, var(--line));
 }
 
-.toolchain-body {
-  max-height: min(70vh, 560px);
-  overflow: auto;
-  overscroll-behavior: contain;
-  padding-right: 4px;
+/* ── Toolchain group (Grok Build-like: whole chain folds, default closed) ── */
+
+.toolchain-group {
+  position: relative;
+  margin: 4px 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
 }
 
-.toolchain-list {
+.toolchain-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 28px;
+  padding: 4px 8px;
+  list-style: none;
+  cursor: pointer;
+  border-radius: 6px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.toolchain-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.toolchain-group > summary:hover {
+  background: color-mix(in srgb, var(--surface-2) 55%, transparent);
+  color: var(--text);
+}
+
+.toolchain-group[open] > summary {
+  color: var(--text);
+}
+
+.toolchain-group[open] > summary .row-chevron {
+  transform: rotate(90deg);
+}
+
+.toolchain-summary-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: inherit;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Grok Build aggregate line: "Read 3 files · Searched 4 patterns" */
+.toolchain-summary-aggregate {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+.toolchain-body {
+  margin: 2px 0 4px 10px;
+  padding: 4px 4px 6px 10px;
+  border-left: 2px solid color-mix(in srgb, var(--cyan) 32%, var(--line));
+  max-height: min(62vh, 520px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  min-width: 0;
   display: grid;
   gap: 1px;
+}
+
+/* Single-tool chain: detail sits directly under group summary */
+.toolchain-body-single {
+  padding-top: 6px;
+  gap: 0;
 }
 
 .diagnostic-body {
@@ -914,16 +1246,333 @@ a {
   padding-right: 4px;
 }
 
+/* Inner tool rows (multi-step chain only) */
+.tool-step {
+  margin: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  min-width: 0;
+}
+
 .tool-step > summary {
-  min-height: 26px;
-  padding-block: 2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 6px;
+  list-style: none;
+  cursor: pointer;
+  border-radius: 5px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.tool-step > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-step > summary:hover {
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
+  color: var(--text);
+}
+
+.tool-step[open] > summary {
+  color: var(--text);
+}
+
+.tool-step[open] > summary .row-chevron {
+  transform: rotate(90deg);
+}
+
+.tool-step-title {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  font-size: 12px;
+  font-weight: 450;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Codex-style +N −M (from old_string/new_string line diff, not git) */
+.diff-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  margin-left: 2px;
+}
+
+.diff-add {
+  color: var(--accent);
+}
+
+.diff-del {
+  color: var(--red);
+}
+
+/* Expanded edit tool: unified line diff (not raw JSON) */
+.tool-section-diff .tool-section-label-path,
+.tool-section-read .tool-section-label-path {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-section-diff .tool-section-head {
+  gap: 6px;
+}
+
+.diff-view {
+  margin: 0;
+  padding: 4px 0 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  tab-size: 2;
+}
+
+.diff-line {
+  display: flex;
+  gap: 0;
+  min-width: 0;
+  padding: 0 10px 0 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.diff-mark {
+  flex: 0 0 1.1em;
+  width: 1.1em;
+  text-align: center;
+  user-select: none;
+  opacity: 0.85;
+}
+
+.diff-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.diff-line.diff-add {
+  color: color-mix(in srgb, var(--accent) 92%, var(--text));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.diff-line.diff-add .diff-mark {
+  color: var(--accent);
+}
+
+.diff-line.diff-del {
+  color: color-mix(in srgb, var(--red) 88%, var(--text));
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+.diff-line.diff-del .diff-mark {
+  color: var(--red);
+}
+
+.diff-line.diff-ctx {
+  color: var(--muted);
+}
+
+.diff-line.diff-ctx .diff-mark {
+  color: var(--faint);
+}
+
+.tool-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--faint);
+  opacity: 0.85;
+}
+
+.tool-status-dot.tone-ok {
+  background: var(--accent);
+}
+
+.tool-status-dot.tone-err {
+  background: var(--red);
+}
+
+.tool-status-dot.tone-run {
+  background: var(--amber);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--amber) 25%, transparent);
+}
+
+.tool-status-dot.tone-info {
+  background: var(--faint);
 }
 
 .tool-step-body {
-  display: grid;
-  gap: 8px;
+  margin: 0 0 6px 4px;
+  padding: 4px 0 2px 4px;
+  min-width: 0;
+  max-width: 100%;
 }
 
+/* Expanded I/O — header row fixed; scroll only in body (copy btn never collides) */
+.tool-detail {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.tool-section {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-elevated) 88%, var(--surface));
+  overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Fixed 横行: label left, copy right — never shares space with scrollbar */
+.tool-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: 0 0 auto;
+  height: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  padding: 0 4px 0 10px;
+  border-bottom: 1px solid var(--line-soft);
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--surface-2) 35%, transparent);
+  /* Keep header out of scroll container so copy stays put */
+  position: relative;
+  z-index: 1;
+}
+
+.tool-section-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex: 1;
+  min-width: 0;
+  line-height: 1;
+  user-select: none;
+}
+
+/* Compact copy that fits the 28px header without stretching it */
+.tool-copy-btn.icon-btn,
+.tool-section-head .tool-copy-btn {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: 4px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--faint);
+  flex-shrink: 0;
+}
+
+.tool-copy-btn.icon-btn:hover,
+.tool-section-head .tool-copy-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-2) 70%, transparent);
+  border-color: transparent;
+}
+
+/* Scroll lives here only — vertical/horizontal bars don't invade the header */
+.tool-pre-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-height: min(30vh, 240px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-gutter: stable;
+}
+
+.tool-pre {
+  margin: 0;
+  padding: 8px 10px 10px;
+  max-height: none;
+  overflow: visible;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  tab-size: 2;
+}
+
+.tool-raw-wrap {
+  padding: 6px;
+  max-height: min(28vh, 220px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  min-width: 0;
+}
+
+.tool-raw-wrap .raw-block,
+.tool-raw-wrap .code-block {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.tool-raw-events {
+  margin: 0;
+  border: 0;
+}
+
+.tool-raw-events > summary {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+  cursor: pointer;
+  padding: 2px 4px;
+  list-style: none;
+  border-radius: 4px;
+}
+
+.tool-raw-events > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-raw-events > summary:hover {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--surface-2) 40%, transparent);
+}
+
+.tool-raw-events-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+  max-height: min(32vh, 260px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 2px 0 4px;
+}
+
+/* Shared code panes (artifacts / markdown / raw) */
 .tool-pane,
 .raw-block,
 .code-block {
@@ -960,9 +1609,9 @@ a {
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.55;
-  white-space: pre;
-  word-break: normal;
-  overflow-wrap: normal;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   color: var(--text);
 }
 
@@ -985,26 +1634,6 @@ a {
 
 .status-row.tone-err .row-icon {
   color: var(--red);
-}
-
-.raw-events {
-  margin-top: 4px;
-}
-
-.raw-events > summary {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--faint);
-  cursor: pointer;
-  padding: 4px 0;
-}
-
-.raw-events-list {
-  display: grid;
-  gap: 6px;
-  max-height: min(40vh, 320px);
-  overflow: auto;
-  overscroll-behavior: contain;
 }
 
 .new-content {
@@ -1189,12 +1818,199 @@ a {
   color: var(--muted);
 }
 
+.change-ledger-hint {
+  margin: 0 0 0.75rem;
+  padding: 0 0.15rem;
+  max-width: 52rem;
+  line-height: 1.45;
+}
+
+.change-src-claimed {
+  color: var(--accent, #5b9fd4);
+  border-color: color-mix(in srgb, var(--accent, #5b9fd4) 40%, transparent);
+}
+
+.change-src-both {
+  color: var(--ok, #3d9a6a);
+  border-color: color-mix(in srgb, var(--ok, #3d9a6a) 40%, transparent);
+}
+
+.change-src-observed {
+  color: var(--muted, #888);
+}
+
+.change-shared {
+  color: var(--warn, #c4922a);
+  border-color: color-mix(in srgb, var(--warn, #c4922a) 45%, transparent);
+  font-weight: 600;
+}
+
 .change-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
   gap: 2px;
+}
+
+/* Project-path tree on Changes tab */
+.change-tree {
+  --tree-indent: 14px;
+  --tree-guide: color-mix(in srgb, var(--line) 90%, var(--muted));
+  --tree-row-mid: 14px; /* vertical stop / horizontal tick at row center */
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.change-tree-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0;
+}
+
+/* Nested levels: indent + room for L-shaped guides */
+.change-tree-list .change-tree-list {
+  margin: 0 0 0 6px;
+  padding: 0 0 0 var(--tree-indent);
+}
+
+.change-tree-item {
+  position: relative;
+  min-width: 0;
+}
+
+/*
+ * Tree guides (nested lists only):
+ * ::before = vertical stem; ::after = horizontal tick into the row.
+ * Last sibling stops the stem at mid-row (L corner).
+ */
+.change-tree-list .change-tree-list > .change-tree-item::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--tree-indent) * -1);
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px solid var(--tree-guide);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.change-tree-list .change-tree-list > .change-tree-item:last-child::before {
+  bottom: auto;
+  height: var(--tree-row-mid);
+}
+
+.change-tree-list .change-tree-list > .change-tree-item::after {
+  content: "";
+  position: absolute;
+  left: calc(var(--tree-indent) * -1);
+  top: var(--tree-row-mid);
+  width: calc(var(--tree-indent) - 4px);
+  height: 0;
+  border-top: 1px solid var(--tree-guide);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.change-dir-row {
+  margin: 0;
+  border: 0;
+  background: transparent;
+  position: relative;
+  z-index: 1;
+}
+
+.change-dir-row > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 6px 2px 4px;
+  border-radius: 5px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--muted);
+  user-select: none;
+}
+
+.change-dir-row > summary::-webkit-details-marker {
+  display: none;
+}
+
+.change-dir-row > summary:hover {
+  background: color-mix(in srgb, var(--surface-2) 55%, transparent);
+  color: var(--text);
+}
+
+.change-dir-row[open] > summary .row-chevron {
+  transform: rotate(90deg);
+}
+
+.change-dir-name {
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text);
+  min-width: 0;
+}
+
+.change-dir-row > summary .change-dir-icon.open-only {
+  display: none;
+}
+
+.change-dir-row[open] > summary .change-dir-icon.open-only {
+  display: block;
+}
+
+.change-dir-row[open] > summary .change-dir-icon.closed-only {
+  display: none;
+}
+
+.change-file-row {
+  position: relative;
+  z-index: 1;
+}
+
+.change-file-row > summary {
+  padding-left: 4px;
+}
+
+.change-file-name {
+  min-width: 0;
+}
+
+.change-file-body {
+  margin: 2px 0 8px 8px;
+  padding-left: 10px;
+  border-left: 1px solid var(--tree-guide);
+}
+
+.change-diff-status {
+  margin: 6px 0;
+  padding: 0 2px;
+}
+
+.change-diff-wrap {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.change-diff-block {
+  margin: 0;
+}
+
+.diff-line.diff-meta {
+  color: var(--faint);
+  background: transparent;
+  font-size: 10.5px;
+}
+
+.diff-line.diff-meta .diff-text {
+  opacity: 0.9;
 }
 
 .details-grid {
@@ -1550,24 +2366,77 @@ a {
   }
 
   .row-chevron,
-  .task-chevron {
+  .tree-chevron {
     transition: none;
   }
 }
 
-/* Thin scrollbars (WebKit) */
+/* Theme-aware scrollbars (Firefox + WebKit/Chromium/Edge) */
+html,
+body,
+.timeline,
+.task-list,
+.scroll-body,
+.panel-scroll,
+.toolchain-body,
+.tool-pre-scroll,
+.tool-raw-wrap,
+.tool-raw-events-list,
+.diagnostic-body {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
 .timeline::-webkit-scrollbar,
 .task-list::-webkit-scrollbar,
 .scroll-body::-webkit-scrollbar,
-.panel-scroll::-webkit-scrollbar {
+.panel-scroll::-webkit-scrollbar,
+.toolchain-body::-webkit-scrollbar,
+.tool-pre-scroll::-webkit-scrollbar,
+.tool-raw-wrap::-webkit-scrollbar,
+.tool-raw-events-list::-webkit-scrollbar,
+.diagnostic-body::-webkit-scrollbar {
   width: 8px;
   height: 8px;
+}
+
+.timeline::-webkit-scrollbar-track,
+.task-list::-webkit-scrollbar-track,
+.scroll-body::-webkit-scrollbar-track,
+.panel-scroll::-webkit-scrollbar-track,
+.toolchain-body::-webkit-scrollbar-track,
+.tool-pre-scroll::-webkit-scrollbar-track,
+.tool-raw-wrap::-webkit-scrollbar-track,
+.tool-raw-events-list::-webkit-scrollbar-track,
+.diagnostic-body::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
 }
 
 .timeline::-webkit-scrollbar-thumb,
 .task-list::-webkit-scrollbar-thumb,
 .scroll-body::-webkit-scrollbar-thumb,
-.panel-scroll::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--muted) 35%, transparent);
+.panel-scroll::-webkit-scrollbar-thumb,
+.toolchain-body::-webkit-scrollbar-thumb,
+.tool-pre-scroll::-webkit-scrollbar-thumb,
+.tool-raw-wrap::-webkit-scrollbar-thumb,
+.tool-raw-events-list::-webkit-scrollbar-thumb,
+.diagnostic-body::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
   border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.timeline::-webkit-scrollbar-thumb:hover,
+.task-list::-webkit-scrollbar-thumb:hover,
+.scroll-body::-webkit-scrollbar-thumb:hover,
+.panel-scroll::-webkit-scrollbar-thumb:hover,
+.toolchain-body::-webkit-scrollbar-thumb:hover,
+.tool-pre-scroll::-webkit-scrollbar-thumb:hover,
+.tool-raw-wrap::-webkit-scrollbar-thumb:hover,
+.tool-raw-events-list::-webkit-scrollbar-thumb:hover,
+.diagnostic-body::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }

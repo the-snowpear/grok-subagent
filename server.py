@@ -22,11 +22,28 @@ ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "data" / "daemon-state.json"
 DAEMON = ROOT / "daemon.py"
 
+SERVER_INSTRUCTIONS = (
+    "Use create_agent for delegated Grok work. Immediately after it succeeds, tell the user once the "
+    "agent_name, agent_id, status, and a clickable Markdown link using viewer_url. Do not leave the "
+    "observer link hidden only inside the MCP tool call. Do not repeat the observer link on later "
+    "send, update_agent, result, or signoff turns, and do not include it again in the final answer "
+    "unless the user explicitly asks for the link. Use update_agent to steer work "
+    "(mode=auto|immediate|tool_boundary; running turns may wait for a tool boundary or interrupt-and-resume). "
+    "This is not lossless Interject. Use send only to queue a later turn. Continue with "
+    "the same agent_id. Call wait once for completion, inspect result, verify locally, then call "
+    "signoff with the verdict."
+)
+
 
 TOOLS = [
     {
         "name": "create_agent",
-        "description": "Create an asynchronous observable Grok subagent and return immediately.",
+        "description": (
+            "Create an asynchronous observable Grok subagent and return immediately. After this tool "
+            "succeeds, tell the user once: agent_name, agent_id, status, and a clickable Markdown "
+            "link using viewer_url. Do not hide viewer_url only inside the tool call. Do not repeat "
+            "the observer link on later turns unless the user asks."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -41,10 +58,49 @@ TOOLS = [
     },
     {
         "name": "send",
-        "description": "Queue a follow-up prompt in an existing Grok subagent conversation.",
+        "description": (
+            "Queue a follow-up prompt in an existing observable Grok subagent conversation. Reuse the "
+            "same agent_id. Do not re-send the observer link unless the user asks."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"agent_id": {"type": "string"}, "prompt": {"type": "string"}},
+            "required": ["agent_id", "prompt"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "update_agent",
+        "description": (
+            "Update an existing Grok subagent like Codex steering. Modes: auto (default: tool_boundary "
+            "when tools are in-flight, else immediate), immediate (interrupt-and-resume now), "
+            "tool_boundary (wait for tool completion, then interrupt; timeout falls back to immediate). "
+            "Each call enqueues an independent replacement turn processed in order. This is not Grok "
+            "TUI's lossless Interject (lossless_interject is always false). If idle, starts a normal "
+            "follow-up. Reuse the same agent_id and observer page."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string"},
+                "prompt": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "immediate", "tool_boundary"],
+                    "default": "auto",
+                    "description": (
+                        "auto: boundary if tools in-flight else immediate. "
+                        "immediate: interrupt now. tool_boundary: wait for tool completion."
+                    ),
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "default": 30,
+                    "description": "tool_boundary wait cap; on expiry apply immediate_timeout.",
+                },
+            },
             "required": ["agent_id", "prompt"],
             "additionalProperties": False,
         },
@@ -74,7 +130,10 @@ TOOLS = [
     },
     {
         "name": "result",
-        "description": "Return only the final Grok result and compact change/test metadata for Codex review.",
+        "description": (
+            "Return only the final Grok result and compact change/test metadata for Codex review. Verify "
+            "the work locally, then call signoff. Do not re-send the observer link unless the user asks."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"agent_id": {"type": "string"}},
@@ -94,7 +153,10 @@ TOOLS = [
     },
     {
         "name": "signoff",
-        "description": "Record Codex review after verification: accepted, partial, or rejected.",
+        "description": (
+            "Record Codex review after verification: accepted, partial, or rejected. After recording it, "
+            "tell the user the verdict. Do not re-send the observer link unless the user asks."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -141,19 +203,29 @@ def _ensure_daemon() -> None:
     except Exception:
         pass
 
-    ROOT.joinpath("data").mkdir(parents=True, exist_ok=True)
+    data_dir = ROOT / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    stderr_path = data_dir / "daemon.stderr.log"
+    # Keep the handle open long enough for the child to inherit the fd.
+    stderr_file = open(stderr_path, "a", encoding="utf-8", errors="replace")
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-    subprocess.Popen(
-        [sys.executable, str(DAEMON)],
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-        close_fds=True,
-    )
+    try:
+        subprocess.Popen(
+            [sys.executable, str(DAEMON)],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    finally:
+        try:
+            stderr_file.close()
+        except OSError:
+            pass
     deadline = time.time() + 12
     while time.time() < deadline:
         time.sleep(0.15)
@@ -162,7 +234,15 @@ def _ensure_daemon() -> None:
             return
         except Exception:
             continue
-    raise RuntimeError("Grok Observer daemon did not start")
+    # Surface recent daemon stderr for diagnosis when startup times out.
+    tail = ""
+    try:
+        raw = stderr_path.read_bytes()
+        tail = raw[-2048:].decode("utf-8", errors="replace").strip()
+    except OSError:
+        pass
+    detail = f"\n--- daemon.stderr.log (tail) ---\n{tail}" if tail else f"\n(no stderr at {stderr_path})"
+    raise RuntimeError("Grok Observer daemon did not start" + detail)
 
 
 def call_tool(name: str, args: dict) -> dict:
@@ -176,7 +256,39 @@ def call_tool(name: str, args: dict) -> dict:
         }
     timeout = min(max(int(args.get("timeout_seconds", 300)), 1), 300) + 5 if name == "wait" else 15
     data = _request(payload, timeout=timeout)
-    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}
+    # Keep the original JSON text first for compatibility with existing model/client behavior.
+    result = {
+        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
+        "structuredContent": data,
+    }
+    # Link promotion experiment: only create_agent gets one Markdown observer link.
+    # Never emit MCP resource_link — Codex sidebars collect those as "Outputs".
+    # send / update_agent / result / signoff keep structured JSON only (no extra link text).
+    if name == "create_agent":
+        agent_id = data.get("agent_id") or data.get("id") or args.get("agent_id")
+        viewer_url = data.get("viewer_url")
+        if not viewer_url and agent_id:
+            state = _state() or {}
+            port = state.get("viewer_port")
+            if port:
+                viewer_url = f"http://127.0.0.1:{int(port)}/#/agents/{agent_id}"
+        if viewer_url:
+            agent_name = data.get("name") or args.get("agent_name") or "Grok subagent"
+            status = data.get("status") or "queued"
+            result["content"].append(
+                {
+                    "type": "text",
+                    "text": (
+                        "ASSISTANT DISPLAY ACTION: Immediately show this link to the user in your commentary.\n\n"
+                        f"Grok subagent: {agent_name}\n"
+                        f"agent_id: {agent_id}\n"
+                        f"status: {status}\n"
+                        f"[View Grok execution]({viewer_url})"
+                    ),
+                    "annotations": {"audience": ["user", "assistant"], "priority": 1.0},
+                }
+            )
+    return result
 
 
 def send(payload: dict) -> None:
@@ -199,6 +311,7 @@ def main() -> None:
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "grok-agent-observer", "version": "2.0.0"},
+                    "instructions": SERVER_INSTRUCTIONS,
                 }
             elif method == "ping":
                 value = {}
