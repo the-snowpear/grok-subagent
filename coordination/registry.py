@@ -97,3 +97,43 @@ class AgentRegistry:
             status=str(row["status"] or ""),
             updated_at=str(row["updated_at"] or ""),
         )
+
+    def worker_peer(self, worker_id: str) -> Peer | None:
+        """SELF-IDENTITY lookup by id only.
+
+        This is the ONLY id-only lookup in the registry. It is used solely
+        for an authenticated worker to resolve its own identity; it must
+        never be used for cross-thread discovery of other workers.
+        """
+        worker_id = str(worker_id or "").strip()
+        if not worker_id:
+            return None
+
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT
+                    id,
+                    thread_id,
+                    name,
+                    COALESCE(display_title, '') AS display_title,
+                    status,
+                    updated_at
+                FROM agents
+                WHERE id=?
+                """,
+                (worker_id,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        return Peer(
+            id=str(row["id"]),
+            thread_id=str(row["thread_id"]),
+            name=str(row["name"] or ""),
+            display_title=str(row["display_title"] or ""),
+            kind="worker",
+            status=str(row["status"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+        )

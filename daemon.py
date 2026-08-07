@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import socket
 import socketserver
@@ -329,6 +330,7 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN child_pid INTEGER",
             "ALTER TABLE agents ADD COLUMN child_started_at TEXT",
             "ALTER TABLE agents ADD COLUMN display_title TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN hub_token TEXT",
             "ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
@@ -2247,6 +2249,7 @@ class AgentRunner:
                 raise RuntimeError("cancelled before start")
             child_env, proxy_source = system_proxy_environment(os.environ.copy())
             child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            child_env.update(worker_bridge_env(self.agent_id))
             if proxy_source:
                 add_event(self.agent_id, turn_id, "network", f"Grok 已使用代理：{proxy_source}", {"source": proxy_source})
             with self._proc_lock:
@@ -2420,6 +2423,8 @@ class AgentRunner:
         }.get(turn_status, "Grok 执行失败")
         add_event(self.agent_id, turn_id, turn_status, terminal_summary, {"returncode": returncode, "stop_reason": stop_reason})
         notify_agent(self.agent_id)
+        if agent_status == "completed":
+            deliver_pending_messages(self.agent_id)
 
 
 def get_runner(agent_id: str, *, create: bool = True) -> AgentRunner | None:
@@ -2429,6 +2434,85 @@ def get_runner(agent_id: str, *, create: bool = True) -> AgentRunner | None:
             runner = AgentRunner(agent_id)
             RUNNERS[agent_id] = runner
         return runner
+
+
+def worker_bridge_env(agent_id: str) -> dict:
+    """Return the worker-bridge env vars for a spawned agent, backfilling a hub token."""
+    with connect() as db:
+        row = db.execute("SELECT hub_token FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if row is None:
+            raise ValueError("worker not found")
+        token = row["hub_token"]
+        if not token:
+            token = secrets.token_urlsafe(32)
+            db.execute(
+                "UPDATE agents SET hub_token=?,updated_at=? WHERE id=?",
+                (token, now(), agent_id),
+            )
+    return {
+        "GROK_OBSERVER_AGENT_ID": agent_id,
+        "GROK_OBSERVER_AGENT_TOKEN": token,
+        "GROK_OBSERVER_CONTROL_PORT": str(ACTUAL_CONTROL_PORT),
+    }
+
+
+def deliver_pending_messages(agent_id: str) -> int:
+    """Coalesce pending worker-addressed messages into one follow-up turn.
+
+    Only completed workers receive deliveries; queued, running, failed, and
+    cancelled agents are skipped. All DB writes happen in a single transaction
+    so the turn insert, agent status update, and message state update commit
+    together.
+    """
+    with connect() as db:
+        agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if agent is None or agent["status"] in ("queued", "running", "cancelled", "failed"):
+            return 0
+        messages = db.execute(
+            "SELECT id,from_peer,body FROM agent_messages "
+            "WHERE to_peer=? AND state='pending' ORDER BY created_at ASC, id ASC",
+            (agent_id,),
+        ).fetchall()
+        if not messages:
+            return 0
+        n = len(messages)
+        header = f"你在 Grok Agent Fabric 中收到 {n} 条协作消息，请统一处理："
+        blocks = []
+        for i, message in enumerate(messages, start=1):
+            body = message["body"] or ""
+            if len(body) > 4000:
+                body = body[:4000] + "…[截断]"
+            blocks.append(f"[{i}] (from {message['from_peer']}, id {message['id']})\n{body}")
+        prompt = header + "\n" + "\n---\n".join(blocks)
+        if len(prompt.encode("utf-8")) > 60 * 1024:
+            prompt = prompt.encode("utf-8")[: 60 * 1024].decode("utf-8", errors="ignore") + "\n[消息过多，已截断]"
+        turn_no = db.execute(
+            "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?", (agent_id,)
+        ).fetchone()["n"]
+        cursor = db.execute(
+            "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)",
+            (agent_id, turn_no, prompt, now()),
+        )
+        turn_id = cursor.lastrowid
+        db.execute(
+            "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=?",
+            (now(), agent_id),
+        )
+        db.execute(
+            "UPDATE agent_messages SET state='delivered',delivered_at=?,target_turn_id=? "
+            "WHERE id IN (%s) AND state='pending'" % ",".join("?" * n),
+            (now(), turn_id, *[message["id"] for message in messages]),
+        )
+    with CREATE_LOCK:
+        runner = get_runner(agent_id)
+        if runner is None or runner.queue.qsize() >= MAX_QUEUE_DEPTH:
+            with connect() as db:
+                db.execute("UPDATE turns SET status='cancelled',completed_at=? WHERE id=?", (now(), turn_id))
+            return 0
+        runner.enqueue(turn_id, prompt)
+    notify_agent(agent_id)
+    add_event(agent_id, turn_id, "hub_delivery", f"投递 {n} 条协作消息", {"messages": n, "turn_id": turn_id, "prompt_preview": prompt[:200]})
+    return n
 
 
 def reclaim_agent_resources(agent_id: str) -> None:
@@ -2622,9 +2706,9 @@ def action(name: str, args: dict, context: dict) -> dict:
                 (task_title, cwd, stamp, thread_id),
             )
             db.execute(
-                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?,?)",
-                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, stamp, stamp),
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?,?)",
+                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), stamp, stamp),
             )
             cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt, stamp))
             turn_id = cursor.lastrowid
@@ -2945,6 +3029,17 @@ def action(name: str, args: dict, context: dict) -> dict:
             db.execute("UPDATE agents SET signoff_verdict=?,signoff_summary=?,verification=?,updated_at=?,revision=revision+1 WHERE id=?", (verdict, args.get("summary", ""), args.get("verification", ""), now(), args.get("agent_id")))
         add_event(args["agent_id"], None, "signoff", f"Codex 签收：{verdict}", args)
         return {"agent_id": args["agent_id"], "verdict": verdict, "recorded": True}
+    if name == "worker_hub":
+        worker_id = str(args.get("worker_id") or "")
+        token = str(args.get("worker_token") or "")
+        with connect() as db:
+            row = db.execute("SELECT hub_token FROM agents WHERE id=?", (worker_id,)).fetchone()
+        if row is None or not row["hub_token"] or not secrets.compare_digest(str(row["hub_token"]), token):
+            raise ValueError("worker authentication failed")
+        return HUB.handle_worker(
+            worker_id=worker_id,
+            args={k: v for k, v in args.items() if k not in ("worker_id", "worker_token")},
+        )
     raise ValueError(f"unknown action: {name}")
 
 
