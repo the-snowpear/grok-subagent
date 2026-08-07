@@ -169,6 +169,36 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "hub",
+        "description": (
+            "Coordinate agents in the current Codex conversation. "
+            "Ops: list peers, send a durable message, inspect Main inbox, "
+            "or wait for a Main-directed message."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["list", "send", "inbox", "wait"],
+                },
+                "to": {"type": "string"},
+                "message": {"type": "string"},
+                "reply_to": {"type": "string"},
+                "from": {"type": "string"},
+                "peek": {"type": "boolean", "default": False},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 300,
+                    "default": 120,
+                },
+            },
+            "required": ["op"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -248,7 +278,7 @@ def _ensure_daemon() -> None:
 def call_tool(name: str, args: dict) -> dict:
     _ensure_daemon()
     payload = {"action": name, "args": args}
-    if name == "create_agent":
+    if name in {"create_agent", "hub"}:
         payload["context"] = {
             "codex_thread_id": os.environ.get("CODEX_THREAD_ID", "unknown"),
             "codex_origin": os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "Codex"),

@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from coordination import AgentRegistry, CoordinationHub, Mailbox
+
 if os.name == "nt":
     import msvcrt
     import winreg
@@ -309,6 +311,17 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_agents_thread ON agents(thread_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_turns_agent ON turns(agent_id);
             CREATE INDEX IF NOT EXISTS idx_changes_agent ON changes(agent_id);
+            CREATE TABLE IF NOT EXISTS agent_messages(
+              id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES tasks(thread_id),
+              from_peer TEXT NOT NULL, to_peer TEXT NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'message', body TEXT NOT NULL, reply_to TEXT,
+              delivery_mode TEXT NOT NULL DEFAULT 'queue', state TEXT NOT NULL DEFAULT 'pending',
+              target_turn_id INTEGER, error TEXT, created_at TEXT NOT NULL,
+              delivered_at TEXT, consumed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_target_state_created ON agent_messages(to_peer, state, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_thread_created ON agent_messages(thread_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_reply ON agent_messages(reply_to);
             """
         )
         # Best-effort migrations for older local DBs.
@@ -337,6 +350,35 @@ def init_db() -> None:
             )
         except sqlite3.OperationalError:
             pass
+
+
+@contextmanager
+def coordination_connect(immediate: bool = False):
+    """Open the observer DB for the coordination kernel.
+
+    With immediate=True, runs a BEGIN IMMEDIATE write transaction that commits
+    on clean exit and rolls back on exception; otherwise behaves like connect().
+    """
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA foreign_keys=ON")
+        if immediate:
+            db.isolation_level = None
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+            except Exception:
+                db.rollback()
+                raise
+            else:
+                db.commit()
+        else:
+            with db:
+                yield db
+    finally:
+        db.close()
 
 
 def artifact(agent_id: str, label: str, content: str) -> str:
@@ -1693,6 +1735,11 @@ RUNNERS_LOCK = threading.Lock()
 CONDITIONS: dict[str, threading.Condition] = {}
 CONDITIONS_LOCK = threading.Lock()
 
+# Coordination kernel singletons (thread-scoped peer registry, durable mailbox).
+REGISTRY = AgentRegistry(coordination_connect)
+MAILBOX = Mailbox(coordination_connect, now)
+HUB = CoordinationHub(REGISTRY, MAILBOX)
+
 # Streaming / session events that can open or close in-flight tools.
 TOOL_ACTIVITY_TYPES = frozenset({
     "tool_call",
@@ -2525,6 +2572,9 @@ def action(name: str, args: dict, context: dict) -> dict:
     if name == "start_viewer":
         opened = ensure_viewer(args.get("agent_id"))
         return {"viewer_url": viewer_url(), "browser_opened": opened}
+    if name == "hub":
+        thread_id = str(context.get("codex_thread_id") or "unknown")
+        return HUB.handle_main(thread_id=thread_id, args=args)
     if name == "create_agent":
         prompt = str(args.get("prompt", "")).strip()
         agent_name = str(args.get("agent_name", "")).strip()

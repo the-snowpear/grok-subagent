@@ -195,7 +195,7 @@ class ObserverSmokeTest(unittest.TestCase):
         )
         responses = [json.loads(line) for line in completed.stdout.splitlines()]
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        self.assertEqual(names, {"create_agent", "send", "update_agent", "status", "wait", "result", "cancel", "signoff"})
+        self.assertEqual(names, {"create_agent", "send", "update_agent", "status", "wait", "result", "cancel", "signoff", "hub"})
         instructions = responses[0]["result"]["instructions"]
         self.assertIn("viewer_url", instructions)
         create_description = next(
