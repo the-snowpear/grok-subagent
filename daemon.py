@@ -43,6 +43,7 @@ STATE_PATH = DATA / "daemon-state.json"
 LOCK_PATH = DATA / "daemon.lock"
 CONTROL_PORT = 47830
 VIEWER_PORT = 47831
+WORKER_CONTROL_PORT = 47832
 RETENTION_DAYS = 7
 TERMINAL = {"completed", "failed", "cancelled"}
 ACTIVE_TURN = {"queued", "running"}
@@ -1748,9 +1749,109 @@ RUNNERS_LOCK = threading.Lock()
 CONDITIONS: dict[str, threading.Condition] = {}
 CONDITIONS_LOCK = threading.Lock()
 
+# Delivery scheduler: durable, DB-backed follow-up turns for completed workers.
+# The per-agent lock serializes in-process schedulers; the conditional message
+# claim (state='pending' AND target_turn_id IS NULL) is the cross-process net.
+_DELIVERY_LOCKS_GUARD = threading.Lock()
+_DELIVERY_LOCKS: dict[str, threading.Lock] = {}
+
+
+def delivery_lock(agent_id: str) -> threading.Lock:
+    """Return the per-agent lock serializing delivery scheduling."""
+    with _DELIVERY_LOCKS_GUARD:
+        lock = _DELIVERY_LOCKS.get(agent_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DELIVERY_LOCKS[agent_id] = lock
+        return lock
+
+
+def on_hub_message_committed(message) -> None:
+    """Post-commit mailbox hook: schedule delivery for worker-bound messages."""
+    if str(message.to_peer).startswith("main:"):
+        return
+    maybe_schedule_delivery(str(message.to_peer))
+
+
+def maybe_schedule_delivery(agent_id: str) -> int:
+    """Render pending worker messages into one durable queued turn; 0 if none.
+
+    Only completed workers receive deliveries. Renders only messages that fit
+    the 60 KiB prompt envelope (overflow stays pending for the next sweep).
+    The turn insert, agent status update, and conditional message claims commit
+    in ONE transaction, so a crash mid-delivery leaves the turn durable and the
+    messages claimed — the runner's DB poll picks the turn up on restart.
+    """
+    with delivery_lock(agent_id):
+        with connect() as db:
+            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if agent is None or agent["status"] != "completed":
+                return 0
+            messages = MAILBOX.pending_for_delivery(to_peer=agent_id)
+            if not messages:
+                return 0
+            blocks: list[str] = []
+            claimed: list = []
+            for message in messages:
+                body = str(message.body or "")
+                if len(body) > 4000:
+                    body = body[:4000] + "…[截断]"
+                block = f"[{len(blocks) + 1}] (from {message.from_peer}, id {message.id})\n{body}"
+                header = f"你在 Grok Agent Fabric 中收到 {len(blocks) + 1} 条协作消息，请统一处理："
+                candidate = header + "\n" + "\n---\n".join([*blocks, block])
+                if len(candidate.encode("utf-8")) > 60 * 1024:
+                    # Envelope full: drop this and all later messages (no partial tail).
+                    break
+                blocks.append(block)
+                claimed.append(message)
+            if not claimed:
+                return 0
+            prompt = (
+                f"你在 Grok Agent Fabric 中收到 {len(claimed)} 条协作消息，请统一处理："
+                + "\n"
+                + "\n---\n".join(blocks)
+            )
+            turn_no = db.execute(
+                "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?", (agent_id,)
+            ).fetchone()["n"]
+            cursor = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)",
+                (agent_id, turn_no, prompt, now()),
+            )
+            turn_id = cursor.lastrowid
+            db.execute(
+                "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=?",
+                (now(), agent_id),
+            )
+            # Conditional claim: concurrent schedulers cannot double-claim.
+            placeholders = ",".join("?" * len(claimed))
+            claimed_count = db.execute(
+                "UPDATE agent_messages SET target_turn_id=? WHERE id IN (%s) "
+                "AND state='pending' AND target_turn_id IS NULL" % placeholders,
+                (turn_id, *[message.id for message in claimed]),
+            ).rowcount
+        # Committed (turn + claims durable); the wake is only a hint.
+        notify_agent(agent_id)
+        add_event(
+            agent_id,
+            turn_id,
+            "hub_delivery",
+            f"投递 {claimed_count} 条协作消息",
+            {"messages": claimed_count, "turn_id": turn_id, "prompt_preview": prompt[:200]},
+        )
+        runner = get_runner(agent_id)
+        if runner is not None:
+            try:
+                runner.enqueue(turn_id, prompt)
+            except ValueError:
+                # Runner shutting down/cancelled: turn stays durable in the DB;
+                # the runner's poll (and recover()) will pick it up.
+                pass
+        return claimed_count
+
 # Coordination kernel singletons (thread-scoped peer registry, durable mailbox).
 REGISTRY = AgentRegistry(coordination_connect)
-MAILBOX = Mailbox(coordination_connect, now)
+MAILBOX = Mailbox(coordination_connect, now, on_message_committed=on_hub_message_committed)
 HUB = CoordinationHub(REGISTRY, MAILBOX)
 
 # Streaming / session events that can open or close in-flight tools.
@@ -2206,6 +2307,19 @@ class AgentRunner:
             try:
                 item = self.queue.get(timeout=0.5)
             except queue.Empty:
+                # The queue is only a wake hint: durable queued turns live in the
+                # DB, so poll for them whenever no in-memory item is waiting.
+                with connect() as db:
+                    row = db.execute(
+                        "SELECT id,prompt FROM turns WHERE agent_id=? AND status='queued' ORDER BY id LIMIT 1",
+                        (self.agent_id,),
+                    ).fetchone()
+                if row:
+                    turn_id, prompt = row["id"], row["prompt"]
+                    if self.cancelled.is_set() or self._shutdown.is_set():
+                        self._mark_turn_cancelled(turn_id)
+                        continue
+                    self._run(turn_id, prompt)
                 continue
             if item is None:
                 return
@@ -2237,11 +2351,21 @@ class AgentRunner:
             if agent["status"] == "cancelled" or turn["status"] == "cancelled":
                 self._mark_turn_cancelled(turn_id)
                 return
+            # Conditional claim: only a durable 'queued' turn may start. If a
+            # concurrent runner (or recovery) already claimed/cancelled it, abort
+            # silently — the turn stays durable for the DB poll to pick up.
+            cur = db.execute(
+                "UPDATE turns SET status='running',started_at=? WHERE id=? AND status='queued'",
+                (now(), turn_id),
+            )
+            if cur.rowcount == 0:
+                return
             db.execute(
                 "UPDATE agents SET status='running',current_turn=?,updated_at=?,revision=revision+1 WHERE id=?",
                 (turn_id, now(), self.agent_id),
             )
-            db.execute("UPDATE turns SET status='running',started_at=? WHERE id=?", (now(), turn_id))
+        # Claimed: hub-delivered messages linked to this turn are now delivered.
+        MAILBOX.mark_delivered_for_turn(turn_id=turn_id)
         self.begin_turn(turn_id)
         cwd = Path(agent["cwd"])
         # Capture workspace + session-log baselines BEFORE process start to avoid races
@@ -2448,7 +2572,7 @@ class AgentRunner:
         add_event(self.agent_id, turn_id, turn_status, terminal_summary, {"returncode": returncode, "stop_reason": stop_reason})
         notify_agent(self.agent_id)
         if agent_status == "completed":
-            deliver_pending_messages(self.agent_id)
+            maybe_schedule_delivery(self.agent_id)
 
 
 def get_runner(agent_id: str, *, create: bool = True) -> AgentRunner | None:
@@ -2476,67 +2600,8 @@ def worker_bridge_env(agent_id: str) -> dict:
     return {
         "GROK_OBSERVER_AGENT_ID": agent_id,
         "GROK_OBSERVER_AGENT_TOKEN": token,
-        "GROK_OBSERVER_CONTROL_PORT": str(ACTUAL_CONTROL_PORT),
+        "GROK_OBSERVER_WORKER_CONTROL_PORT": str(ACTUAL_WORKER_CONTROL_PORT),
     }
-
-
-def deliver_pending_messages(agent_id: str) -> int:
-    """Coalesce pending worker-addressed messages into one follow-up turn.
-
-    Only completed workers receive deliveries; queued, running, failed, and
-    cancelled agents are skipped. All DB writes happen in a single transaction
-    so the turn insert, agent status update, and message state update commit
-    together.
-    """
-    with connect() as db:
-        agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
-        if agent is None or agent["status"] in ("queued", "running", "cancelled", "failed"):
-            return 0
-        messages = db.execute(
-            "SELECT id,from_peer,body FROM agent_messages "
-            "WHERE to_peer=? AND state='pending' ORDER BY created_at ASC, id ASC",
-            (agent_id,),
-        ).fetchall()
-        if not messages:
-            return 0
-        n = len(messages)
-        header = f"你在 Grok Agent Fabric 中收到 {n} 条协作消息，请统一处理："
-        blocks = []
-        for i, message in enumerate(messages, start=1):
-            body = message["body"] or ""
-            if len(body) > 4000:
-                body = body[:4000] + "…[截断]"
-            blocks.append(f"[{i}] (from {message['from_peer']}, id {message['id']})\n{body}")
-        prompt = header + "\n" + "\n---\n".join(blocks)
-        if len(prompt.encode("utf-8")) > 60 * 1024:
-            prompt = prompt.encode("utf-8")[: 60 * 1024].decode("utf-8", errors="ignore") + "\n[消息过多，已截断]"
-        turn_no = db.execute(
-            "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?", (agent_id,)
-        ).fetchone()["n"]
-        cursor = db.execute(
-            "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)",
-            (agent_id, turn_no, prompt, now()),
-        )
-        turn_id = cursor.lastrowid
-        db.execute(
-            "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=?",
-            (now(), agent_id),
-        )
-        db.execute(
-            "UPDATE agent_messages SET state='delivered',delivered_at=?,target_turn_id=? "
-            "WHERE id IN (%s) AND state='pending'" % ",".join("?" * n),
-            (now(), turn_id, *[message["id"] for message in messages]),
-        )
-    with CREATE_LOCK:
-        runner = get_runner(agent_id)
-        if runner is None or runner.queue.qsize() >= MAX_QUEUE_DEPTH:
-            with connect() as db:
-                db.execute("UPDATE turns SET status='cancelled',completed_at=? WHERE id=?", (now(), turn_id))
-            return 0
-        runner.enqueue(turn_id, prompt)
-    notify_agent(agent_id)
-    add_event(agent_id, turn_id, "hub_delivery", f"投递 {n} 条协作消息", {"messages": n, "turn_id": turn_id, "prompt_preview": prompt[:200]})
-    return n
 
 
 def reclaim_agent_resources(agent_id: str) -> None:
@@ -2551,6 +2616,21 @@ def reclaim_agent_resources(agent_id: str) -> None:
 
 def rowdict(row) -> dict | None:
     return dict(row) if row else None
+
+
+# Fields safe to serialize to the viewer. Never hub_token / child_pid /
+# child_started_at (worker credentials and process internals stay server-side).
+PUBLIC_AGENT_FIELDS = (
+    "id", "thread_id", "name", "cwd", "status", "revision", "current_turn",
+    "final_text", "error", "signoff_verdict", "signoff_summary", "verification",
+    "display_title", "pinned", "archived", "max_turns", "worktree_path",
+    "created_at", "updated_at",
+)
+
+
+def public_agent_dict(row) -> dict:
+    """Project an agent row onto the public viewer shape."""
+    return {key: row[key] for key in PUBLIC_AGENT_FIELDS if key in row.keys()}
 
 
 def agent_wait_done(agent_id: str) -> tuple[bool, dict]:
@@ -2879,7 +2959,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         raw_ids = args.get("agent_ids") or []
         if not isinstance(raw_ids, list) or any(not str(x).strip() for x in raw_ids):
             raise ValueError("agent_ids must be a list of non-empty strings")
-        agent_ids = [str(x).strip() for x in raw_ids]
+        agent_ids = list(dict.fromkeys(str(x).strip() for x in raw_ids))
         raw_timeout = args.get("timeout_seconds", 120)
         if not isinstance(raw_timeout, int):
             raise ValueError("timeout_seconds must be an integer")
@@ -2887,11 +2967,13 @@ def action(name: str, args: dict, context: dict) -> dict:
         from_peer = str(args.get("from") or "").strip() or None
         thread_id = context.get("codex_thread_id") or "unknown"
         caller = main_peer_id(thread_id)
-        if agent_ids:
-            with connect() as db:
-                for aid in agent_ids:
-                    if db.execute("SELECT 1 FROM agents WHERE id=?", (aid,)).fetchone() is None:
-                        raise ValueError(f"agent not found: {aid}")
+        # Thread-scoped resolution: cross-thread and unknown ids both resolve to
+        # None, so an id from another conversation cannot be waited on or leaked.
+        for aid in agent_ids:
+            if REGISTRY.resolve_worker(thread_id, aid) is None:
+                raise ValueError(f"agent not found: {aid}")
+        if from_peer and from_peer != caller and REGISTRY.resolve_worker(thread_id, from_peer) is None:
+            raise ValueError("peer not found")
         deadline = time.monotonic() + timeout
         while True:
             msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
@@ -3208,17 +3290,6 @@ def action(name: str, args: dict, context: dict) -> dict:
             db.execute("UPDATE agents SET signoff_verdict=?,signoff_summary=?,verification=?,updated_at=?,revision=revision+1 WHERE id=?", (verdict, args.get("summary", ""), args.get("verification", ""), now(), args.get("agent_id")))
         add_event(args["agent_id"], None, "signoff", f"Codex 签收：{verdict}", args)
         return {"agent_id": args["agent_id"], "verdict": verdict, "recorded": True}
-    if name == "worker_hub":
-        worker_id = str(args.get("worker_id") or "")
-        token = str(args.get("worker_token") or "")
-        with connect() as db:
-            row = db.execute("SELECT hub_token FROM agents WHERE id=?", (worker_id,)).fetchone()
-        if row is None or not row["hub_token"] or not secrets.compare_digest(str(row["hub_token"]), token):
-            raise ValueError("worker authentication failed")
-        return HUB.handle_worker(
-            worker_id=worker_id,
-            args={k: v for k, v in args.items() if k not in ("worker_id", "worker_token")},
-        )
     raise ValueError(f"unknown action: {name}")
 
 
@@ -3227,6 +3298,37 @@ class ControlHandler(socketserver.StreamRequestHandler):
         try:
             request = json.loads(self.rfile.readline().decode("utf-8"))
             data = action(request.get("action", ""), request.get("args") or {}, request.get("context") or {})
+            response = {"ok": True, "data": data}
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+        self.wfile.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def authenticate_worker(worker_id: str, token: str) -> str:
+    """Validate a worker's hub token; returns the worker id on success."""
+    with connect() as db:
+        row = db.execute("SELECT hub_token FROM agents WHERE id=?", (worker_id,)).fetchone()
+    if row is None or not row["hub_token"] or not secrets.compare_digest(str(row["hub_token"]), token):
+        raise ValueError("worker authentication failed")
+    return worker_id
+
+
+def worker_hub_request(worker_id: str, token: str, op_args: dict) -> dict:
+    """Authenticated worker hub op; the wire protocol has no generic action field."""
+    authenticate_worker(worker_id, token)
+    return HUB.handle_worker(worker_id=worker_id, args=op_args)
+
+
+class WorkerControlHandler(socketserver.StreamRequestHandler):
+    """Worker-only control surface: one JSON request line, hub ops only."""
+
+    def handle(self):
+        try:
+            request = json.loads(self.rfile.readline().decode("utf-8"))
+            worker_id = str(request.get("worker_id") or "")
+            token = str(request.get("worker_token") or "")
+            op_args = {k: v for k, v in request.items() if k not in ("worker_id", "worker_token")}
+            data = worker_hub_request(worker_id, token, op_args)
             response = {"ok": True, "data": data}
         except Exception as exc:
             response = {"ok": False, "error": str(exc)}
@@ -3324,7 +3426,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "not found"}, 404)
                 turns = [dict(row) for row in db.execute("SELECT * FROM turns WHERE agent_id=? ORDER BY turn_no", (agent_id,))]
                 changes = [dict(row) for row in db.execute("SELECT * FROM changes WHERE agent_id=? ORDER BY id", (agent_id,))]
-            return json_response(self, {"agent": agent, "turns": turns, "changes": changes})
+            return json_response(self, {"agent": public_agent_dict(agent), "turns": turns, "changes": changes})
         if parsed.path == "/api/events":
             agent_id = query.get("agent_id", [""])[0]
             after = _safe_int(query.get("after", ["0"])[0])
@@ -3441,18 +3543,18 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if match:
             agent_id = match.group(1)
             with connect() as db:
-                agent = db.execute("SELECT id,thread_id,status FROM agents WHERE id=?", (agent_id,)).fetchone()
+                agent = db.execute("SELECT id,status FROM agents WHERE id=?", (agent_id,)).fetchone()
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 if agent["status"] in {"queued", "running"}:
                     return json_response(self, {"error": "running agents cannot be removed from the observer"}, 409)
-                thread_id = agent["thread_id"]
             # Reclaim in-memory resources before deleting durable state.
             reclaim_agent_resources(agent_id)
             with connect() as db:
                 db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                 db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
-                db.execute("DELETE FROM tasks WHERE thread_id=? AND NOT EXISTS(SELECT 1 FROM agents WHERE thread_id=?)", (thread_id, thread_id))
+                # Keep the task while its thread still has mailbox messages.
+                delete_orphan_tasks(db)
             shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
             notify_catalog(agent_id)
             return json_response(self, {"deleted": True, "agent_id": agent_id})
@@ -3723,6 +3825,7 @@ def write_state() -> None:
     payload = {
         "pid": os.getpid(),
         "control_port": ACTUAL_CONTROL_PORT,
+        "worker_control_port": ACTUAL_WORKER_CONTROL_PORT,
         "viewer_port": ACTUAL_VIEWER_PORT if VIEWER_SERVER else None,
         "updated_at": now(),
     }
@@ -3954,6 +4057,18 @@ def release_singleton_lock() -> None:
             pass
 
 
+def delete_orphan_tasks(db) -> None:
+    """Drop tasks whose conversation is gone: no agents and no mailbox messages.
+
+    agent_messages rows keep a task alive so a worker's history (and any pending
+    delivery) is not deleted out from under it.
+    """
+    db.execute(
+        "DELETE FROM tasks WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.thread_id = tasks.thread_id) "
+        "AND NOT EXISTS (SELECT 1 FROM agent_messages WHERE agent_messages.thread_id = tasks.thread_id)"
+    )
+
+
 def cleanup() -> None:
     """Delete expired terminal agents only; reclaim runners/conditions/threads first."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
@@ -3974,7 +4089,7 @@ def cleanup() -> None:
             db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
         shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
     with connect() as db:
-        db.execute("DELETE FROM tasks WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM agents)")
+        delete_orphan_tasks(db)
         if ids:
             try:
                 db.execute("PRAGMA optimize")
@@ -3985,7 +4100,10 @@ def cleanup() -> None:
 def cleanup_loop() -> None:
     while True:
         time.sleep(24 * 60 * 60)
-        cleanup()
+        try:
+            cleanup()
+        except Exception as exc:
+            print(f"cleanup failed: {exc}", file=sys.stderr, flush=True)
 
 
 def recover() -> None:
@@ -4035,14 +4153,41 @@ def recover() -> None:
                 "WHERE agent_id=? AND status IN ('queued','running')",
                 (stamp, agent_id),
             )
+    # Delivery recovery (after the fail loop so its turn updates are visible):
+    # (a) Release message claims owned by failed turns (daemon died mid-delivery).
+    with connect() as db:
+        db.execute(
+            "UPDATE agent_messages SET target_turn_id=NULL "
+            "WHERE state='pending' AND target_turn_id IN (SELECT id FROM turns WHERE status='failed')"
+        )
+    # (c) Sweep completed workers with pending unscheduled messages.
+    with connect() as db:
+        peers = [
+            row["to_peer"]
+            for row in db.execute(
+                "SELECT DISTINCT to_peer FROM agent_messages WHERE state='pending' AND target_turn_id IS NULL"
+            )
+        ]
+    for peer in peers:
+        maybe_schedule_delivery(peer)
+    # (b) Wake runners for durable queued turns: the DB is the source of truth,
+    # so a fresh runner's _work poll picks up anything enqueue() missed.
+    with connect() as db:
+        agent_ids = [
+            row["agent_id"]
+            for row in db.execute("SELECT DISTINCT agent_id FROM turns WHERE status='queued'")
+        ]
+    for agent_id in agent_ids:
+        get_runner(agent_id)
 
 
 ACTUAL_CONTROL_PORT = CONTROL_PORT
+ACTUAL_WORKER_CONTROL_PORT = WORKER_CONTROL_PORT
 _WE_OWN_STATE = False
 
 
 def main() -> None:
-    global ACTUAL_CONTROL_PORT, _WE_OWN_STATE
+    global ACTUAL_CONTROL_PORT, ACTUAL_WORKER_CONTROL_PORT, _WE_OWN_STATE
 
     # If a healthy daemon already owns this data dir, exit without overwriting state.
     existing = healthy_existing_daemon()
@@ -4080,6 +4225,22 @@ def main() -> None:
     if server is None:
         release_singleton_lock()
         raise RuntimeError("no control port available")
+
+    # Worker-only control surface on its own port range, so host credentials
+    # (and the host control protocol) are never exposed to workers. Optional:
+    # a bind failure degrades to "no worker transport" but keeps the daemon up.
+    worker_server = None
+    for port in range(WORKER_CONTROL_PORT, WORKER_CONTROL_PORT + 20):
+        try:
+            worker_server = ReusableTCPServer(("127.0.0.1", port), WorkerControlHandler)
+            ACTUAL_WORKER_CONTROL_PORT = port
+            break
+        except OSError:
+            continue
+    if worker_server is not None:
+        threading.Thread(target=worker_server.serve_forever, daemon=True).start()
+    else:
+        print("worker control server unavailable (no free port)", file=sys.stderr, flush=True)
 
     write_state()
     try:

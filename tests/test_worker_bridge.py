@@ -217,26 +217,14 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
     def test_worker_hub_rejects_bad_token(self):
         worker_id, _ = self._seed_worker("A", status="completed")
         with self.assertRaisesRegex(ValueError, "worker authentication failed"):
-            daemon.action(
-                "worker_hub",
-                {"worker_id": worker_id, "worker_token": "wrong", "op": "list"},
-                {},
-            )
+            daemon.worker_hub_request(worker_id, "wrong", {"op": "list"})
         # Unknown worker ids must fail identically, regardless of token.
         with self.assertRaisesRegex(ValueError, "worker authentication failed"):
-            daemon.action(
-                "worker_hub",
-                {"worker_id": "no-such-worker", "worker_token": "tok-anything", "op": "list"},
-                {},
-            )
+            daemon.worker_hub_request("no-such-worker", "tok-anything", {"op": "list"})
 
     def test_worker_hub_accepts_valid_token(self):
         worker_id, token = self._seed_worker("A", status="completed")
-        data = daemon.action(
-            "worker_hub",
-            {"worker_id": worker_id, "worker_token": token, "op": "list"},
-            {},
-        )
+        data = daemon.worker_hub_request(worker_id, token, {"op": "list"})
         self.assertEqual(data["caller"], worker_id)
         self.assertEqual(data["main"], "main:A")
         self.assertEqual([p["id"] for p in data["peers"]], [worker_id])
@@ -247,11 +235,7 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         a1, _ = self._seed_worker("A", name="a1", status="completed")
         a2, _ = self._seed_worker("A", name="a2", status="completed")
         b1, _ = self._seed_worker("B", name="b1", status="completed")
-        data = daemon.action(
-            "worker_hub",
-            {"worker_id": a1, "worker_token": self._hub_token(a1) or "", "op": "list"},
-            {},
-        )
+        data = daemon.worker_hub_request(a1, self._hub_token(a1) or "", {"op": "list"})
         self.assertEqual(data["main"], "main:A")
         peer_ids = {p["id"] for p in data["peers"]}
         self.assertEqual(peer_ids, {a1, a2})
@@ -374,12 +358,13 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
                 created_at=f"2000-01-01T00:00:0{i}+00:00",
             )
 
-        with mock.patch.object(daemon.AgentRunner, "enqueue") as enqueue:
-            delivered = daemon.deliver_pending_messages(agent_id)
+        runner = mock.Mock()
+        with mock.patch.object(daemon, "get_runner", return_value=runner):
+            delivered = daemon.maybe_schedule_delivery(agent_id)
 
         self.assertEqual(delivered, 3)
-        enqueue.assert_called_once()
-        (turn_id, prompt), _ = enqueue.call_args
+        runner.enqueue.assert_called_once()
+        (turn_id, prompt), _ = runner.enqueue.call_args
 
         with daemon.connect() as db:
             turns = db.execute(
@@ -403,7 +388,9 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         self.assertEqual(agent["status"], "queued")
         self.assertEqual(len(messages), 3)
         for row in messages:
-            self.assertEqual(row["state"], "delivered")
+            # Durable delivery: messages stay pending until the turn actually
+            # starts; the claim is the target_turn_id link.
+            self.assertEqual(row["state"], "pending")
             self.assertEqual(row["target_turn_id"], turn_id)
 
     def test_delivery_running_agent_skipped(self):
@@ -411,7 +398,7 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         self._seed_turn(agent_id, turn_no=1, status="running")
         self._seed_message("A", to_peer=agent_id, body="ping")
 
-        delivered = daemon.deliver_pending_messages(agent_id)
+        delivered = daemon.maybe_schedule_delivery(agent_id)
 
         self.assertEqual(delivered, 0)
         self.assertEqual(self._turn_count(agent_id), 1)
@@ -427,7 +414,7 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         agent_id, _ = self._seed_worker("A", status="completed")
         self._seed_turn(agent_id, turn_no=1, status="completed")
 
-        delivered = daemon.deliver_pending_messages(agent_id)
+        delivered = daemon.maybe_schedule_delivery(agent_id)
 
         self.assertEqual(delivered, 0)
         self.assertEqual(self._turn_count(agent_id), 1)
@@ -440,7 +427,7 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         self._seed_turn(agent_id, turn_no=1, status="failed")
         self._seed_message("A", to_peer=agent_id, body="ping")
 
-        delivered = daemon.deliver_pending_messages(agent_id)
+        delivered = daemon.maybe_schedule_delivery(agent_id)
 
         self.assertEqual(delivered, 0)
         self.assertEqual(self._turn_count(agent_id), 1)
@@ -460,9 +447,11 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
             {
                 "GROK_OBSERVER_AGENT_ID": worker_id,
                 "GROK_OBSERVER_AGENT_TOKEN": token,
-                "GROK_OBSERVER_CONTROL_PORT": str(daemon.ACTUAL_CONTROL_PORT),
+                # Workers must get the worker control port, never the host port.
+                "GROK_OBSERVER_WORKER_CONTROL_PORT": str(daemon.ACTUAL_WORKER_CONTROL_PORT),
             },
         )
+        self.assertNotIn("GROK_OBSERVER_CONTROL_PORT", env)
 
         # A worker with a NULL hub_token gets one backfilled and persisted.
         worker_id, _ = self._seed_worker("A", name="notoken", status="completed")
@@ -473,34 +462,33 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         env = daemon.worker_bridge_env(worker_id)
         self.assertEqual(env["GROK_OBSERVER_AGENT_ID"], worker_id)
         self.assertTrue(env["GROK_OBSERVER_AGENT_TOKEN"])
-        self.assertEqual(env["GROK_OBSERVER_CONTROL_PORT"], str(daemon.ACTUAL_CONTROL_PORT))
+        self.assertEqual(env["GROK_OBSERVER_WORKER_CONTROL_PORT"], str(daemon.ACTUAL_WORKER_CONTROL_PORT))
         stored = self._hub_token(worker_id)
         self.assertTrue(stored)
         self.assertEqual(stored, env["GROK_OBSERVER_AGENT_TOKEN"])
 
     def test_cli_build_request(self):
+        # The worker control protocol has no generic action field: identity
+        # and op args sit at the top level of the request line.
         self.assertEqual(
             build_request("w", "t", {"op": "list"}),
-            {"action": "worker_hub", "args": {"worker_id": "w", "worker_token": "t", "op": "list"}},
+            {"worker_id": "w", "worker_token": "t", "op": "list"},
         )
         self.assertEqual(
             build_request("w", "t", {"op": "send", "to": "main:A", "message": "hi"}),
             {
-                "action": "worker_hub",
-                "args": {
-                    "worker_id": "w",
-                    "worker_token": "t",
-                    "op": "send",
-                    "to": "main:A",
-                    "message": "hi",
-                },
+                "worker_id": "w",
+                "worker_token": "t",
+                "op": "send",
+                "to": "main:A",
+                "message": "hi",
             },
         )
         self.assertEqual(
-            build_request("w", "t", {"op": "inbox", "peek": True})["args"]["op"], "inbox"
+            build_request("w", "t", {"op": "inbox", "peek": True})["op"], "inbox"
         )
         self.assertEqual(
-            build_request("w", "t", {"op": "wait", "timeout_seconds": 5})["args"]["op"], "wait"
+            build_request("w", "t", {"op": "wait", "timeout_seconds": 5})["op"], "wait"
         )
 
     def test_worker_wait_wakes_on_main_send(self):
@@ -541,20 +529,21 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         self._seed_message("A", to_peer=agent_id, body="b1")
         self._seed_message("A", to_peer=agent_id, body="b2")
 
-        with mock.patch.object(daemon.AgentRunner, "enqueue") as enqueue:
-            first = daemon.deliver_pending_messages(agent_id)
-            second = daemon.deliver_pending_messages(agent_id)
+        runner = mock.Mock()
+        with mock.patch.object(daemon, "get_runner", return_value=runner):
+            first = daemon.maybe_schedule_delivery(agent_id)
+            second = daemon.maybe_schedule_delivery(agent_id)
 
         self.assertEqual(first, 2)
         self.assertEqual(second, 0)
-        enqueue.assert_called_once()
+        runner.enqueue.assert_called_once()
         self.assertEqual(self._turn_count(agent_id), 2)
         with daemon.connect() as db:
             states = db.execute(
                 "SELECT state FROM agent_messages WHERE to_peer=?", (agent_id,)
             ).fetchall()
             agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
-        self.assertEqual([row["state"] for row in states], ["delivered", "delivered"])
+        self.assertEqual([row["state"] for row in states], ["pending", "pending"])
         self.assertEqual(agent["status"], "queued")
 
 

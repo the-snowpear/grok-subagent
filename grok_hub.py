@@ -3,11 +3,12 @@
 A Grok worker spawned by the daemon receives three environment variables:
 
 - GROK_OBSERVER_AGENT_ID: the worker's own agent id.
-- GROK_OBSERVER_AGENT_TOKEN: the worker's hub token (authenticates worker_hub actions).
-- GROK_OBSERVER_CONTROL_PORT: the daemon control port (default 47830, --port overrides).
+- GROK_OBSERVER_AGENT_TOKEN: the worker's hub token (authenticates worker actions).
+- GROK_OBSERVER_WORKER_CONTROL_PORT: the worker control port (default 47832;
+  falls back to GROK_OBSERVER_CONTROL_PORT for older daemons).
 
-The CLI speaks the daemon's JSON-line control protocol: one request line
-{"action": "worker_hub", "args": {...}} in, one response line
+The CLI speaks the daemon's JSON-line worker control protocol: one request
+line {"worker_id": ..., "worker_token": ..., **op args} in, one response line
 {"ok": true, "data": ...} / {"ok": false, "error": ...} out.
 
 Subcommands mirror the worker hub ops:
@@ -28,28 +29,31 @@ import os
 import socket
 import sys
 
-DEFAULT_PORT = 47830
+DEFAULT_PORT = 47832
 DEFAULT_TIMEOUT = 120
-REQUEST_TIMEOUT = 65.0
+REQUEST_TIMEOUT = 15.0
 
 
 def build_request(worker_id: str, worker_token: str, op_args: dict) -> dict:
-    """Build the worker_hub request payload for the given op arguments."""
+    """Build the worker control request payload for the given op arguments."""
     return {
-        "action": "worker_hub",
-        "args": {
-            "worker_id": worker_id,
-            "worker_token": worker_token,
-            **op_args,
-        },
+        "worker_id": worker_id,
+        "worker_token": worker_token,
+        **op_args,
     }
 
 
 def request(port: int, payload: dict, timeout: float = REQUEST_TIMEOUT) -> dict:
-    """Send one JSON-line request to the daemon control port and read the response.
+    """Send one JSON-line request to the daemon worker control port and read the response.
+
+    Wait ops get a socket timeout that covers the requested wait duration;
+    all other ops use the fixed REQUEST_TIMEOUT.
 
     Raises RuntimeError on connection failure or an empty reply.
     """
+    if str(payload.get("op") or "").lower() == "wait":
+        requested = int(payload.get("timeout_seconds", 120))
+        timeout = max(10, requested + 5)
     data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
@@ -75,7 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--port",
         type=int,
         default=None,
-        help=f"daemon control port (default: $GROK_OBSERVER_CONTROL_PORT or {DEFAULT_PORT})",
+        help=(
+            "daemon worker control port (default: $GROK_OBSERVER_WORKER_CONTROL_PORT, "
+            f"else $GROK_OBSERVER_CONTROL_PORT, or {DEFAULT_PORT})"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -125,7 +132,11 @@ def main() -> None:
     else:  # pragma: no cover - argparse enforces the subcommand
         sys.exit(f"unknown command: {args.command}")
 
-    port = args.port if args.port is not None else int(os.environ.get("GROK_OBSERVER_CONTROL_PORT", DEFAULT_PORT))
+    port = args.port if args.port is not None else int(
+        os.environ.get("GROK_OBSERVER_WORKER_CONTROL_PORT")
+        or os.environ.get("GROK_OBSERVER_CONTROL_PORT")
+        or DEFAULT_PORT
+    )
 
     try:
         response = request(port, build_request(worker_id, worker_token, op_args))

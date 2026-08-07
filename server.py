@@ -342,6 +342,22 @@ def _ensure_daemon() -> None:
     raise RuntimeError("Grok Observer daemon did not start" + detail)
 
 
+def request_timeout_for(name: str, args: dict) -> float:
+    """Socket timeout for a daemon request.
+
+    Wait-like ops honor the requested duration (bounded 1..300s) plus a 5s
+    margin so the daemon can answer within the client's wait window; all
+    other ops get a short fixed timeout.
+    """
+    if name == "wait":
+        requested = int(args.get("timeout_seconds", 300))
+        return min(max(requested, 1), 300) + 5
+    if name == "wait_any" or (name == "hub" and str(args.get("op") or "").lower() == "wait"):
+        requested = int(args.get("timeout_seconds", 120))
+        return min(max(requested, 1), 300) + 5
+    return 15
+
+
 def call_tool(name: str, args: dict) -> dict:
     _ensure_daemon()
     payload = {"action": name, "args": args}
@@ -351,7 +367,7 @@ def call_tool(name: str, args: dict) -> dict:
             "codex_origin": os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "Codex"),
             "cwd": os.getcwd(),
         }
-    timeout = min(max(int(args.get("timeout_seconds", 300)), 1), 300) + 5 if name == "wait" else 15
+    timeout = request_timeout_for(name, args)
     data = _request(payload, timeout=timeout)
     # Keep the original JSON text first for compatibility with existing model/client behavior.
     result = {

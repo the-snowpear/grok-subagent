@@ -30,6 +30,7 @@ _IDENTITY_ENV_VARS = (
     "GROK_OBSERVER_AGENT_ID",
     "GROK_OBSERVER_AGENT_TOKEN",
     "GROK_OBSERVER_CONTROL_PORT",
+    "GROK_OBSERVER_WORKER_CONTROL_PORT",
 )
 
 CANNED_PEERS_DATA = {"caller": "w1", "main": "main:T", "peers": [{"id": "w1"}]}
@@ -205,10 +206,16 @@ class NativeBridgePureTest(unittest.TestCase):
                 os.environ.pop(key, None)
             os.environ["GROK_OBSERVER_AGENT_ID"] = "w1"
             os.environ["GROK_OBSERVER_AGENT_TOKEN"] = "tok"
-            os.environ["GROK_OBSERVER_CONTROL_PORT"] = "47831"
+            # GROK_OBSERVER_WORKER_CONTROL_PORT is the primary worker port var.
+            os.environ["GROK_OBSERVER_WORKER_CONTROL_PORT"] = "47831"
             self.assertEqual(native_bridge.identity(), ("w1", "tok", 47831))
-            os.environ.pop("GROK_OBSERVER_CONTROL_PORT", None)
+            os.environ.pop("GROK_OBSERVER_WORKER_CONTROL_PORT", None)
+            # Older daemons only set GROK_OBSERVER_CONTROL_PORT: fall back to it.
+            os.environ["GROK_OBSERVER_CONTROL_PORT"] = "47830"
             self.assertEqual(native_bridge.identity(), ("w1", "tok", 47830))
+            os.environ.pop("GROK_OBSERVER_CONTROL_PORT", None)
+            # Neither set: the worker control default applies.
+            self.assertEqual(native_bridge.identity(), ("w1", "tok", 47832))
         finally:
             _restore_env(saved)
 
@@ -280,7 +287,7 @@ class NativeBridgeE2ETest(_BridgeProcTestCase):
             {
                 "GROK_OBSERVER_AGENT_ID": "w1",
                 "GROK_OBSERVER_AGENT_TOKEN": "tok",
-                "GROK_OBSERVER_CONTROL_PORT": str(self.server.server_address[1]),
+                "GROK_OBSERVER_WORKER_CONTROL_PORT": str(self.server.server_address[1]),
             }
         )
         self._request_id = 0
@@ -316,10 +323,12 @@ class NativeBridgeE2ETest(_BridgeProcTestCase):
         with _RECORD_LOCK:
             self.assertEqual(len(_RECORDED_PAYLOADS), 1)
             payload = _RECORDED_PAYLOADS[0]
-        self.assertEqual(payload["action"], "worker_hub")
-        self.assertEqual(payload["args"]["worker_id"], "w1")
-        self.assertEqual(payload["args"]["worker_token"], "tok")
-        self.assertEqual(payload["args"]["op"], "list")
+        # The worker control protocol has no generic action field: worker
+        # identity and the hub op sit at the top level of the request.
+        self.assertNotIn("action", payload)
+        self.assertEqual(payload["worker_id"], "w1")
+        self.assertEqual(payload["worker_token"], "tok")
+        self.assertEqual(payload["op"], "list")
 
         # 4. tools/call send -> recorded payload carries op/to/message.
         response = self._rpc(
@@ -327,7 +336,8 @@ class NativeBridgeE2ETest(_BridgeProcTestCase):
         )
         with _RECORD_LOCK:
             self.assertEqual(len(_RECORDED_PAYLOADS), 2)
-            send_args = _RECORDED_PAYLOADS[1]["args"]
+            send_args = _RECORDED_PAYLOADS[1]
+        self.assertNotIn("action", send_args)
         self.assertEqual(send_args["op"], "send")
         self.assertEqual(send_args["to"], "main:T")
         self.assertEqual(send_args["message"], "hi")

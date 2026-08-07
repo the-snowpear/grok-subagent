@@ -35,9 +35,15 @@ class _WaitState:
 
 
 class Mailbox:
-    def __init__(self, connect_factory: ConnectFactory, now_factory: NowFactory):
+    def __init__(
+        self,
+        connect_factory: ConnectFactory,
+        now_factory: NowFactory,
+        on_message_committed: Callable[[Message], None] | None = None,
+    ):
         self._connect = connect_factory
         self._now = now_factory
+        self._on_message_committed = on_message_committed
         self._states_lock = threading.Lock()
         self._states: dict[str, _WaitState] = {}
 
@@ -132,7 +138,7 @@ class Mailbox:
 
         self.notify(to_peer)
 
-        return Message(
+        message = Message(
             id=message_id,
             thread_id=thread_id,
             from_peer=from_peer,
@@ -148,6 +154,76 @@ class Mailbox:
             delivered_at=None,
             consumed_at=None,
         )
+
+        # Post-commit hook (outside any DB transaction): lets the daemon
+        # schedule delivery without racing the insert.
+        if self._on_message_committed is not None:
+            self._on_message_committed(message)
+
+        return message
+
+    def pending_for_delivery(
+        self,
+        *,
+        to_peer: str,
+        limit: int = MAX_INBOX_MESSAGES,
+    ) -> list[Message]:
+        """Oldest-first pending messages not yet claimed by a delivery turn."""
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM agent_messages
+                WHERE to_peer=? AND state='pending' AND target_turn_id IS NULL
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (to_peer, max(1, min(limit, MAX_INBOX_MESSAGES))),
+            ).fetchall()
+        return [self._row_to_message(row) for row in rows]
+
+    def schedule_messages(
+        self,
+        *,
+        thread_id: str,
+        message_ids: list[str],
+        turn_id: int,
+    ) -> int:
+        """Claim pending messages for a delivery turn.
+
+        The conditional UPDATE means concurrent schedulers cannot double-claim:
+        only messages still pending with no target turn are assigned, and the
+        rowcount reflects exactly the claimed set.
+        """
+        if not message_ids:
+            return 0
+        placeholders = ",".join("?" for _ in message_ids)
+        with self._connect(immediate=True) as db:
+            cursor = db.execute(
+                f"""
+                UPDATE agent_messages
+                SET target_turn_id=?
+                WHERE id IN ({placeholders})
+                  AND state='pending'
+                  AND target_turn_id IS NULL
+                """,
+                (turn_id, *message_ids),
+            )
+            return cursor.rowcount
+
+    def mark_delivered_for_turn(self, *, turn_id: int) -> int:
+        """Mark all pending messages linked to a delivery turn as delivered."""
+        delivered_at = self._now()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE agent_messages
+                SET state='delivered', delivered_at=?
+                WHERE target_turn_id=? AND state='pending'
+                """,
+                (delivered_at, turn_id),
+            )
+            return cursor.rowcount
 
     def _select_unconsumed(
         self,

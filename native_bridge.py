@@ -8,8 +8,9 @@ fallback for non-MCP runtimes.
 Worker identity comes from the environment:
 
 - GROK_OBSERVER_AGENT_ID: the worker's own agent id.
-- GROK_OBSERVER_AGENT_TOKEN: the worker's hub token (authenticates worker_hub actions).
-- GROK_OBSERVER_CONTROL_PORT: the daemon control port (default 47830).
+- GROK_OBSERVER_AGENT_TOKEN: the worker's hub token (authenticates worker actions).
+- GROK_OBSERVER_WORKER_CONTROL_PORT: the worker control port (default 47832;
+  falls back to GROK_OBSERVER_CONTROL_PORT for older daemons).
 
 The daemon injects these variables when it spawns the worker.
 """
@@ -21,7 +22,7 @@ import os
 import socket
 import sys
 
-DEFAULT_PORT = 47830
+DEFAULT_PORT = 47832
 
 SERVER_NAME = "grok-agent-observer-native"
 VERSION = "1.0.0"
@@ -111,20 +112,21 @@ def identity() -> tuple[str, str, int]:
     worker_token = os.environ.get("GROK_OBSERVER_AGENT_TOKEN", "")
     if not worker_id or not worker_token:
         raise RuntimeError("worker identity is not set (GROK_OBSERVER_AGENT_ID/TOKEN required)")
-    port = int(os.environ.get("GROK_OBSERVER_CONTROL_PORT", DEFAULT_PORT))
+    port = int(
+        os.environ.get("GROK_OBSERVER_WORKER_CONTROL_PORT")
+        or os.environ.get("GROK_OBSERVER_CONTROL_PORT")
+        or DEFAULT_PORT
+    )
     return worker_id, worker_token, port
 
 
 def call_tool(name: str, args: dict) -> dict:
-    """Call a worker hub tool over the daemon control socket."""
+    """Call a worker hub tool over the daemon worker control socket."""
     worker_id, worker_token, port = identity()
     payload = {
-        "action": "worker_hub",
-        "args": {
-            "worker_id": worker_id,
-            "worker_token": worker_token,
-            **op_args_for(name, args),
-        },
+        "worker_id": worker_id,
+        "worker_token": worker_token,
+        **op_args_for(name, args),
     }
     if name == "wait":
         timeout_seconds = int(args.get("timeout_seconds", 120))
