@@ -205,7 +205,7 @@ class ObserverSmokeTest(unittest.TestCase):
         )
         self.assertIn("clickable Markdown link", create_description)
 
-    def test_create_agent_result_promotes_observer_link(self):
+    def test_create_agent_result_promotes_observer_link_without_annotations(self):
         data = {
             "agent_id": "agent-123",
             "status": "queued",
@@ -225,7 +225,7 @@ class ObserverSmokeTest(unittest.TestCase):
         self.assertEqual(len(result["content"]), 2)
         display = result["content"][1]
         self.assertEqual(display["type"], "text")
-        self.assertEqual(display["annotations"]["audience"], ["user", "assistant"])
+        self.assertNotIn("annotations", display)
         self.assertIn("[View Grok execution]", display["text"])
         self.assertIn(f"({data['viewer_url']})", display["text"])
         self.assertFalse(any(item.get("type") == "resource_link" for item in result["content"]))
