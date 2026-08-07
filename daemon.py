@@ -1789,7 +1789,7 @@ def maybe_schedule_delivery(agent_id: str) -> int:
     """
     with delivery_lock(agent_id):
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
             if agent is None or agent["status"] != "completed":
                 return 0
             messages = MAILBOX.pending_for_delivery(to_peer=agent_id)
@@ -2349,7 +2349,9 @@ class AgentRunner:
             self._mark_turn_cancelled(turn_id)
             return
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (self.agent_id,)).fetchone()
+            agent = db.execute(
+                "SELECT status,cwd,grok_session_id,max_turns FROM agents WHERE id=?", (self.agent_id,)
+            ).fetchone()
             turn = db.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
             if not agent or not turn:
                 return
@@ -2641,7 +2643,13 @@ def public_agent_dict(row) -> dict:
 def agent_wait_done(agent_id: str) -> tuple[bool, dict]:
     """done only when no process, no active turns, queue empty, and agent terminal."""
     with connect() as db:
-        agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+        agent = rowdict(
+            db.execute(
+                "SELECT id,name,status,revision,updated_at,signoff_verdict,final_text,error,"
+                "signoff_summary,verification FROM agents WHERE id=?",
+                (agent_id,),
+            ).fetchone()
+        )
         if not agent:
             raise ValueError("agent not found")
         pending = db.execute(
@@ -3125,7 +3133,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         if not prompt:
             raise ValueError("prompt is required")
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
             if not agent:
                 raise ValueError("agent not found")
             if agent["status"] == "cancelled":
@@ -3172,7 +3180,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         timeout_seconds = min(max(timeout_seconds, 1), 300)
 
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute("SELECT status,current_turn FROM agents WHERE id=?", (agent_id,)).fetchone()
             if not agent:
                 raise ValueError("agent not found")
             if agent["status"] == "cancelled":
@@ -3305,7 +3313,14 @@ def action(name: str, args: dict, context: dict) -> dict:
         }
     if name in {"status", "result"}:
         with connect() as db:
-            agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (args.get("agent_id"),)).fetchone())
+            agent = rowdict(
+                db.execute(
+                    "SELECT id,name,status,revision,updated_at,signoff_verdict,final_text,error,"
+                    "signoff_summary,verification,worktree_path,worktree_base_sha,repo_root,"
+                    "original_cwd FROM agents WHERE id=?",
+                    (args.get("agent_id"),),
+                ).fetchone()
+            )
             if not agent:
                 raise ValueError("agent not found")
             turns = db.execute("SELECT COUNT(*) AS count FROM turns WHERE agent_id=?", (agent["id"],)).fetchone()["count"]
@@ -3556,7 +3571,14 @@ class ViewerHandler(BaseHTTPRequestHandler):
             if agent_id in {"meta", "delete"} or not re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or ""):
                 return json_response(self, {"error": "not found"}, 404)
             with connect() as db:
-                agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+                agent = rowdict(
+                    db.execute(
+                        "SELECT id,thread_id,name,cwd,status,revision,current_turn,final_text,error,"
+                        "signoff_verdict,signoff_summary,verification,display_title,pinned,archived,"
+                        "max_turns,worktree_path,created_at,updated_at FROM agents WHERE id=?",
+                        (agent_id,),
+                    ).fetchone()
+                )
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 turns = [dict(row) for row in db.execute("SELECT * FROM turns WHERE agent_id=? ORDER BY turn_no", (agent_id,))]
@@ -3703,7 +3725,12 @@ class ViewerHandler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 return json_response(self, {"error": str(exc)}, 400)
             with connect() as db:
-                agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+                agent = rowdict(
+                    db.execute(
+                        "SELECT thread_id,name,display_title,pinned,archived FROM agents WHERE id=?",
+                        (agent_id,),
+                    ).fetchone()
+                )
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 pinned = agent.get("pinned") or 0
