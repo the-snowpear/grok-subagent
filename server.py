@@ -285,7 +285,6 @@ def call_tool(name: str, args: dict) -> dict:
                         f"status: {status}\n"
                         f"[View Grok execution]({viewer_url})"
                     ),
-                    "annotations": {"audience": ["user", "assistant"], "priority": 1.0},
                 }
             )
     return result
