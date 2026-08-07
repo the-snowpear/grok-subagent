@@ -113,6 +113,15 @@ FS_EXCLUDE_REL_EXACT = frozenset({
     "data/observer.sqlite",
 })
 
+# Named agent profiles: worktree isolation + max_turns + prompt steering suffix.
+# resolve_agent_settings() merges these with explicit per-call overrides.
+PROFILES = {
+    "default": {"worktree": False, "max_turns": 50, "prompt_suffix": ""},
+    "fast": {"worktree": False, "max_turns": 20, "prompt_suffix": "\n\n(快速模式：优先小步验证，尽快返回结果。)"},
+    "deep": {"worktree": True, "max_turns": 100, "prompt_suffix": "\n\n(深度模式：在独立 worktree 中工作，可进行多轮探索。)"},
+    "isolated": {"worktree": True, "max_turns": 50, "prompt_suffix": ""},
+}
+
 # Held for the lifetime of the daemon process so the OS releases it on crash.
 _LOCK_HANDLE = None
 
@@ -333,6 +342,8 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN hub_token TEXT",
             "ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE agents ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 50",
+            "ALTER TABLE agents ADD COLUMN worktree_path TEXT",
             "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE changes ADD COLUMN source TEXT DEFAULT 'observed'",
@@ -1833,6 +1844,22 @@ def unique_changed_files(agent_id: str) -> int:
         return int(row["c"])
 
 
+def grok_command(agent_row: dict, prompt: str, first_turn: bool, cwd: Path) -> list[str]:
+    """Build the grok CLI invocation for one turn (fake-grok aware, honors max_turns)."""
+    fake_grok = os.environ.get("GROK_OBSERVER_FAKE_GROK")
+    executable = [sys.executable, fake_grok] if fake_grok else ["grok"]
+    stored_max = agent_row["max_turns"] if "max_turns" in agent_row.keys() else None
+    command = executable + [
+        "-p", prompt,
+        "--cwd", str(cwd),
+        "--output-format", "streaming-json",
+        "--always-approve", "--no-subagents",
+        "--max-turns", str(int(stored_max or 50)),
+    ]
+    command += ["--session-id", agent_row["grok_session_id"]] if first_turn else ["--resume", agent_row["grok_session_id"]]
+    return command
+
+
 class AgentRunner:
     def __init__(self, agent_id: str):
         self.agent_id = agent_id
@@ -2225,10 +2252,7 @@ class AgentRunner:
         add_event(self.agent_id, turn_id, "user", prompt, {"prompt": prompt, "turn": turn["turn_no"]})
 
         first_turn = int(turn["turn_no"]) == 1
-        fake_grok = os.environ.get("GROK_OBSERVER_FAKE_GROK")
-        executable = [sys.executable, fake_grok] if fake_grok else ["grok"]
-        command = executable + ["-p", prompt, "--cwd", str(cwd), "--output-format", "streaming-json", "--always-approve", "--no-subagents", "--max-turns", "50"]
-        command += ["--session-id", agent["grok_session_id"]] if first_turn else ["--resume", agent["grok_session_id"]]
+        command = grok_command(agent, prompt, first_turn, cwd)
         add_event(self.agent_id, turn_id, "process", "启动 Grok Build", {"command": command[:1] + ["<prompt>"] + command[3:]})
 
         stopped = threading.Event()
@@ -2650,13 +2674,78 @@ def build_search_snippet(content: str, term: str, radius: int = 40) -> dict:
     return {"text": snippet, "matches": []}
 
 
-def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict) -> dict:
+def resolve_agent_settings(profile: str, worktree, max_turns) -> tuple[dict, bool, int]:
+    """Merge a named profile with explicit create_agent overrides.
+
+    Returns (defaults, effective_worktree, effective_max_turns). Raises
+    ValueError on unknown profile or out-of-range max_turns.
+    """
+    profile = str(profile or "default")
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile: {profile}")
+    defaults = PROFILES[profile]
+    effective_worktree = defaults["worktree"] if worktree is None else bool(worktree)
+    if max_turns is None:
+        effective_max_turns = defaults["max_turns"]
+    else:
+        try:
+            effective_max_turns = int(max_turns)
+        except (TypeError, ValueError):
+            raise ValueError("max_turns must be an integer") from None
+        if not 1 <= effective_max_turns <= 500:
+            raise ValueError("max_turns must be between 1 and 500")
+    return (defaults, effective_worktree, effective_max_turns)
+
+
+def create_agent_worktree(cwd: Path, agent_id: str) -> str:
+    """Create a detached git worktree for an agent; returns the worktree path.
+
+    Raises ValueError when cwd is not inside a git repository or when the
+    worktree cannot be created (a failed attempt is cleaned up).
+    """
+    check = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if check.returncode != 0:
+        raise ValueError("worktree isolation requires a git repository")
+    target = DATA / "worktrees" / agent_id
+    target.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "-C", str(cwd), "worktree", "add", "--detach", str(target), "HEAD"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(target, ignore_errors=True)
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ValueError("failed to create worktree: " + detail[-200:])
+    return str(target)
+
+
+def remove_agent_worktree(worktree_path: str) -> None:
+    """Best-effort removal of an agent worktree; never raises."""
+    try:
+        subprocess.run(
+            ["git", "-C", worktree_path, "worktree", "remove", "--force", worktree_path],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(worktree_path, ignore_errors=True)
+
+
+def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None) -> dict:
     """Create a single agent: limits, task/agent/turn/search_index rows, enqueue, viewer.
 
     Shared by create_agent and create_agents. Callers are responsible for
     validating agent_name/prompt and resolving cwd.
     """
     agent_id = str(uuid.uuid4())
+    defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns)
+    prompt_effective = prompt + defaults["prompt_suffix"]
+    if eff_worktree:
+        cwd = create_agent_worktree(Path(cwd), agent_id)
     thread_id = context.get("codex_thread_id") or "unknown"
     stamp = now()
     with CREATE_LOCK, connect() as db:
@@ -2697,15 +2786,15 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
             (task_title, cwd, stamp, thread_id),
         )
         db.execute(
-            "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,'queued',?,?,?,?)",
-            (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), stamp, stamp),
+            "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,worktree_path,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)",
+            (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), eff_max_turns, str(cwd) if eff_worktree else None, stamp, stamp),
         )
-        cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt, stamp))
+        cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt_effective, stamp))
         turn_id = cursor.lastrowid
         db.execute(
             "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
-            (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt}\n{thread_id}\n{task_title}"),
+            (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt_effective}\n{thread_id}\n{task_title}"),
         )
     with CONDITIONS_LOCK:
         CONDITIONS[agent_id] = threading.Condition()
@@ -2735,7 +2824,7 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                 f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
                 f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
             )
-        runner.enqueue(turn_id, prompt)
+        runner.enqueue(turn_id, prompt_effective)
     opened = ensure_viewer(agent_id)
     return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
 
@@ -2755,7 +2844,10 @@ def action(name: str, args: dict, context: dict) -> dict:
         if not prompt or not agent_name:
             raise ValueError("agent_name and prompt are required")
         cwd = str(Path(args.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
-        return _create_agent_one(agent_name, prompt, cwd, args.get("codex_thread_title"), context)
+        return _create_agent_one(
+            agent_name, prompt, cwd, args.get("codex_thread_title"), context,
+            profile=args.get("profile"), worktree=args.get("worktree"), max_turns=args.get("max_turns"),
+        )
     if name == "create_agents":
         agents = args.get("agents")
         if not isinstance(agents, list) or not agents:
@@ -2775,7 +2867,10 @@ def action(name: str, args: dict, context: dict) -> dict:
                 continue
             cwd = str(Path(item.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
             try:
-                created = _create_agent_one(agent_name, prompt, cwd, item.get("codex_thread_title"), context)
+                created = _create_agent_one(
+                    agent_name, prompt, cwd, item.get("codex_thread_title"), context,
+                    profile=item.get("profile"), worktree=item.get("worktree"), max_turns=item.get("max_turns"),
+                )
                 results.append({"index": i, **created})
             except ValueError as exc:
                 errors.append({"index": i, "error": str(exc)})
@@ -3028,17 +3123,26 @@ def action(name: str, args: dict, context: dict) -> dict:
                 ).fetchone()
                 if last_done and last_done["result"]:
                     last_completed_result = str(last_done["result"])
+                changes = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT path,kind,preexisting,added,deleted,source,shared,tool_name FROM changes WHERE agent_id=? ORDER BY id",
+                        (agent["id"],),
+                    )
+                ]
         base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "signoff_verdict")}
         base.update({"turns": turns, "changed_files": unique_changed_files(agent["id"])})
         if name == "result":
             # Prefer agent.final_text; fall back to last completed turn.result when empty.
             final_text = (agent["final_text"] or "").strip() or last_completed_result
             base.update({
+                "kind": "agent_result",
                 "final_text": final_text,
                 "error": agent["error"],
                 "signoff_summary": agent["signoff_summary"],
                 "verification": agent["verification"],
                 "turn_results": turn_rows,
+                "changes": changes,
             })
         return base
     if name == "wait":
@@ -3855,14 +3959,16 @@ def cleanup() -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
     with connect() as db:
         ids = [
-            row["id"]
+            (row["id"], row["worktree_path"])
             for row in db.execute(
-                "SELECT id FROM agents WHERE updated_at<? AND status NOT IN ('running','queued')",
+                "SELECT id, worktree_path FROM agents WHERE updated_at<? AND status NOT IN ('running','queued')",
                 (cutoff,),
             )
         ]
-    for agent_id in ids:
+    for agent_id, worktree_path in ids:
         reclaim_agent_resources(agent_id)
+        if worktree_path:
+            remove_agent_worktree(worktree_path)
         with connect() as db:
             db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
             db.execute("DELETE FROM agents WHERE id=?", (agent_id,))

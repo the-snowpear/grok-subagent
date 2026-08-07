@@ -42,7 +42,9 @@ TOOLS = [
             "Create an asynchronous observable Grok subagent and return immediately. After this tool "
             "succeeds, tell the user once: agent_name, agent_id, status, and a clickable Markdown "
             "link using viewer_url. Do not hide viewer_url only inside the tool call. Do not repeat "
-            "the observer link on later turns unless the user asks."
+            "the observer link on later turns unless the user asks. Optional profile: default, fast, "
+            "deep, or isolated (deep/isolated run the agent in a dedicated git worktree); worktree and "
+            "max_turns override profile defaults."
         ),
         "inputSchema": {
             "type": "object",
@@ -51,6 +53,9 @@ TOOLS = [
                 "prompt": {"type": "string"},
                 "cwd": {"type": "string"},
                 "codex_thread_title": {"type": "string"},
+                "profile": {"type": "string"},
+                "worktree": {"type": "boolean"},
+                "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
             },
             "required": ["agent_name", "prompt"],
             "additionalProperties": False,
@@ -218,6 +223,9 @@ TOOLS = [
                             "prompt": {"type": "string"},
                             "cwd": {"type": "string"},
                             "codex_thread_title": {"type": "string"},
+                            "profile": {"type": "string"},
+                            "worktree": {"type": "boolean"},
+                            "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
                         },
                         "required": ["agent_name", "prompt"],
                         "additionalProperties": False,
