@@ -3,7 +3,7 @@
     "grok": {
       "command": "python",
       "args": [
-        "server.py"
+        "server_live.py"
       ],
       "cwd": "."
     }
