@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from coordination import AgentRegistry, CoordinationHub, Mailbox
+from coordination import AgentRegistry, CoordinationHub, Mailbox, main_peer_id
 
 if os.name == "nt":
     import msvcrt
@@ -2650,6 +2650,96 @@ def build_search_snippet(content: str, term: str, radius: int = 40) -> dict:
     return {"text": snippet, "matches": []}
 
 
+def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict) -> dict:
+    """Create a single agent: limits, task/agent/turn/search_index rows, enqueue, viewer.
+
+    Shared by create_agent and create_agents. Callers are responsible for
+    validating agent_name/prompt and resolving cwd.
+    """
+    agent_id = str(uuid.uuid4())
+    thread_id = context.get("codex_thread_id") or "unknown"
+    stamp = now()
+    with CREATE_LOCK, connect() as db:
+        # 1) Per-conversation (thread) cap — primary product limit.
+        thread_active = db.execute(
+            "SELECT COUNT(*) AS c FROM agents "
+            "WHERE thread_id=? AND status IN ('queued','running')",
+            (thread_id,),
+        ).fetchone()["c"]
+        if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
+            raise ValueError(
+                f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
+                f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
+            )
+        # 2) Global safety net across all conversations.
+        active_count = db.execute(
+            "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
+        ).fetchone()["c"]
+        if int(active_count) >= MAX_ACTIVE_AGENTS:
+            raise ValueError(
+                f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
+                f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
+            )
+        # Same cwd is allowed (parallel subagents); used only for soft warning.
+        same_cwd = db.execute(
+            "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
+            (cwd,),
+        ).fetchall()
+        task_title = str(codex_thread_title or "").strip() or thread_id
+        display_title = derive_display_title(agent_name, prompt)
+        db.execute(
+            "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
+        )
+        # Refresh path/title for known threads; keep user pin/archive flags.
+        db.execute(
+            "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
+            (task_title, cwd, stamp, thread_id),
+        )
+        db.execute(
+            "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'queued',?,?,?,?)",
+            (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), stamp, stamp),
+        )
+        cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt, stamp))
+        turn_id = cursor.lastrowid
+        db.execute(
+            "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
+            (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt}\n{thread_id}\n{task_title}"),
+        )
+    with CONDITIONS_LOCK:
+        CONDITIONS[agent_id] = threading.Condition()
+    rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
+    add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
+    if same_cwd:
+        add_event(
+            agent_id,
+            turn_id,
+            "concurrency_warning",
+            "同一工作目录已有其他 Grok 代理运行，Changes 页文件变更归因可能交叉、不够精确",
+            {
+                "other_agents": [dict(row) for row in same_cwd],
+                "hint": "parallel same-cwd agents share the workspace; diffs are recorded per agent/turn but overlapping edits may be attributed to more than one",
+            },
+        )
+    runner = get_runner(agent_id)
+    assert runner is not None
+    with CREATE_LOCK:
+        if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
+            # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
+            with connect() as db:
+                db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
+                db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+            reclaim_agent_resources(agent_id)
+            raise ValueError(
+                f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
+                f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
+            )
+        runner.enqueue(turn_id, prompt)
+    opened = ensure_viewer(agent_id)
+    return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
+
+
 def action(name: str, args: dict, context: dict) -> dict:
     if name == "ping":
         return {"status": "ok", "viewer_url": viewer_url()}
@@ -2664,89 +2754,74 @@ def action(name: str, args: dict, context: dict) -> dict:
         agent_name = str(args.get("agent_name", "")).strip()
         if not prompt or not agent_name:
             raise ValueError("agent_name and prompt are required")
-        agent_id = str(uuid.uuid4())
-        thread_id = context.get("codex_thread_id") or "unknown"
         cwd = str(Path(args.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
-        stamp = now()
-        with CREATE_LOCK, connect() as db:
-            # 1) Per-conversation (thread) cap — primary product limit.
-            thread_active = db.execute(
-                "SELECT COUNT(*) AS c FROM agents "
-                "WHERE thread_id=? AND status IN ('queued','running')",
-                (thread_id,),
-            ).fetchone()["c"]
-            if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
-                raise ValueError(
-                    f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
-                    f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
-                )
-            # 2) Global safety net across all conversations.
-            active_count = db.execute(
-                "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
-            ).fetchone()["c"]
-            if int(active_count) >= MAX_ACTIVE_AGENTS:
-                raise ValueError(
-                    f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
-                    f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
-                )
-            # Same cwd is allowed (parallel subagents); used only for soft warning.
-            same_cwd = db.execute(
-                "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
-                (cwd,),
-            ).fetchall()
-            task_title = str(args.get("codex_thread_title") or "").strip() or thread_id
-            display_title = derive_display_title(agent_name, prompt)
-            db.execute(
-                "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
-            )
-            # Refresh path/title for known threads; keep user pin/archive flags.
-            db.execute(
-                "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
-                (task_title, cwd, stamp, thread_id),
-            )
-            db.execute(
-                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?,?,?)",
-                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), stamp, stamp),
-            )
-            cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt, stamp))
-            turn_id = cursor.lastrowid
-            db.execute(
-                "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
-                (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt}\n{thread_id}\n{task_title}"),
-            )
-        with CONDITIONS_LOCK:
-            CONDITIONS[agent_id] = threading.Condition()
-        rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
-        add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
-        if same_cwd:
-            add_event(
-                agent_id,
-                turn_id,
-                "concurrency_warning",
-                "同一工作目录已有其他 Grok 代理运行，Changes 页文件变更归因可能交叉、不够精确",
-                {
-                    "other_agents": [dict(row) for row in same_cwd],
-                    "hint": "parallel same-cwd agents share the workspace; diffs are recorded per agent/turn but overlapping edits may be attributed to more than one",
-                },
-            )
-        runner = get_runner(agent_id)
-        assert runner is not None
-        with CREATE_LOCK:
-            if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
-                # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
-                with connect() as db:
-                    db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
-                    db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
-                reclaim_agent_resources(agent_id)
-                raise ValueError(
-                    f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
-                    f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
-                )
-            runner.enqueue(turn_id, prompt)
-        opened = ensure_viewer(agent_id)
-        return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
+        return _create_agent_one(agent_name, prompt, cwd, args.get("codex_thread_title"), context)
+    if name == "create_agents":
+        agents = args.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise ValueError("agents must be a non-empty list")
+        if len(agents) > 20:
+            raise ValueError("at most 20 agents per batch")
+        results = []
+        errors = []
+        for i, item in enumerate(agents):
+            if not isinstance(item, dict):
+                errors.append({"index": i, "error": "agent entry must be an object"})
+                continue
+            prompt = str(item.get("prompt", "")).strip()
+            agent_name = str(item.get("agent_name", "")).strip()
+            if not prompt or not agent_name:
+                errors.append({"index": i, "error": "agent_name and prompt are required"})
+                continue
+            cwd = str(Path(item.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
+            try:
+                created = _create_agent_one(agent_name, prompt, cwd, item.get("codex_thread_title"), context)
+                results.append({"index": i, **created})
+            except ValueError as exc:
+                errors.append({"index": i, "error": str(exc)})
+        return {"agents": results, "created": len(results), "errors": errors}
+    if name == "wait_any":
+        raw_ids = args.get("agent_ids") or []
+        if not isinstance(raw_ids, list) or any(not str(x).strip() for x in raw_ids):
+            raise ValueError("agent_ids must be a list of non-empty strings")
+        agent_ids = [str(x).strip() for x in raw_ids]
+        raw_timeout = args.get("timeout_seconds", 120)
+        if not isinstance(raw_timeout, int):
+            raise ValueError("timeout_seconds must be an integer")
+        timeout = max(1, min(300, raw_timeout))
+        from_peer = str(args.get("from") or "").strip() or None
+        thread_id = context.get("codex_thread_id") or "unknown"
+        caller = main_peer_id(thread_id)
+        if agent_ids:
+            with connect() as db:
+                for aid in agent_ids:
+                    if db.execute("SELECT 1 FROM agents WHERE id=?", (aid,)).fetchone() is None:
+                        raise ValueError(f"agent not found: {aid}")
+        deadline = time.monotonic() + timeout
+        while True:
+            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
+            if msg is not None:
+                return {"kind": "message", "message": msg.to_dict()}
+            for aid in agent_ids:
+                done, data = agent_wait_done(aid)
+                if done:
+                    return {"kind": "agent", "agent_id": aid, "status": data["status"], "revision": data["revision"], "turns": data["turns"]}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"kind": "timeout"}
+            condition, revision = MAILBOX.wait_surface(caller)
+            # Second DB check closes the send-between-check-and-sleep race.
+            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
+            if msg is not None:
+                return {"kind": "message", "message": msg.to_dict()}
+            for aid in agent_ids:
+                done, data = agent_wait_done(aid)
+                if done:
+                    return {"kind": "agent", "agent_id": aid, "status": data["status"], "revision": data["revision"], "turns": data["turns"]}
+            with condition:
+                if MAILBOX.revision(caller) != revision:
+                    continue
+                condition.wait(min(remaining, 0.25))
     if name == "send":
         agent_id, prompt = args.get("agent_id"), str(args.get("prompt", "")).strip()
         if not prompt:

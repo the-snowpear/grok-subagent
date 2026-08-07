@@ -379,7 +379,7 @@ class CoordinationKernelTest(_IsolatedDbMixin, unittest.TestCase):
         names = {tool["name"] for tool in mcp_server.TOOLS}
         self.assertEqual(
             names,
-            {"create_agent", "send", "update_agent", "status", "wait", "result", "cancel", "signoff", "hub"},
+            {"create_agent", "send", "update_agent", "status", "wait", "result", "cancel", "signoff", "hub", "create_agents", "wait_any"},
         )
         hub = next(tool for tool in mcp_server.TOOLS if tool["name"] == "hub")
         properties = hub["inputSchema"]["properties"]

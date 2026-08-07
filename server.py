@@ -199,6 +199,65 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "create_agents",
+        "description": (
+            "Batch-spawn 1-20 Grok subagents that share the caller's conversation "
+            "context (thread, origin, cwd) and can coordinate with each other and "
+            "Main through the hub tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent_name": {"type": "string"},
+                            "prompt": {"type": "string"},
+                            "cwd": {"type": "string"},
+                            "codex_thread_title": {"type": "string"},
+                        },
+                        "required": ["agent_name", "prompt"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                    "maxItems": 20,
+                },
+            },
+            "required": ["agents"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wait_any",
+        "description": (
+            "Unified wait returning the first of: a new hub mailbox message addressed "
+            "to Main, any listed agent reaching a terminal state "
+            "(completed/failed/cancelled), or the timeout. Agent-terminal latency is "
+            "at most ~0.25s."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "from": {"type": "string"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "default": 120,
+                },
+            },
+            "required": ["agent_ids"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -278,7 +337,7 @@ def _ensure_daemon() -> None:
 def call_tool(name: str, args: dict) -> dict:
     _ensure_daemon()
     payload = {"action": name, "args": args}
-    if name in {"create_agent", "hub"}:
+    if name in {"create_agent", "hub", "create_agents", "wait_any"}:
         payload["context"] = {
             "codex_thread_id": os.environ.get("CODEX_THREAD_ID", "unknown"),
             "codex_origin": os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "Codex"),

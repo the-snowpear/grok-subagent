@@ -269,3 +269,29 @@ class Mailbox:
                 if remaining <= 0:
                     return None
                 state.condition.wait(timeout=remaining)
+
+    def peek_one(
+        self,
+        *,
+        peer_id: str,
+        from_peer: str | None = None,
+    ) -> Message | None:
+        """Non-consuming peek at the oldest unconsumed message; used by unified wait."""
+        messages = self._select_unconsumed(
+            peer_id=peer_id,
+            from_peer=from_peer,
+            limit=1,
+        )
+        return messages[0] if messages else None
+
+    def wait_surface(self, peer_id: str) -> tuple[threading.Condition, int]:
+        """Expose the per-peer condition and current revision for external waiters (unified wait)."""
+        state = self._wait_state(peer_id)
+        with state.condition:
+            return state.condition, state.revision
+
+    def revision(self, peer_id: str) -> int:
+        """Current mailbox revision for the peer."""
+        state = self._wait_state(peer_id)
+        with state.condition:
+            return state.revision
