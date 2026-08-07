@@ -1,11 +1,12 @@
 """Read semantic context telemetry from an existing Grok session over ACP.
 
-The observer still executes delegated work through Grok headless mode.  After a
-turn finishes, this module starts a short-lived `grok agent stdio` process,
-loads the same persisted session, calls `x.ai/session/info`, and exits.  This
-keeps the execution path unchanged while exposing Grok's own ContextInfo
-breakdown (system prompt, messages, tool definitions, skills/MCP estimates,
-free tokens, and compaction counters).
+The observer executes delegated work through Grok headless mode. After a turn
+finishes, this module can start a short-lived ``grok agent stdio`` process,
+load the same persisted session, call ``x.ai/session/info``, and exit.
+
+This keeps execution unchanged while exposing Grok's own ContextInfo breakdown:
+system prompt, messages, tool definitions, skills/MCP estimates, free tokens,
+turn/tool/compaction counters, and the resolved auto-compact threshold.
 """
 
 from __future__ import annotations
@@ -28,18 +29,18 @@ _EOF = object()
 
 
 def unwrap_session_info(value: Any) -> dict[str, Any]:
-    """Unwrap Grok's ExtMethodResult envelope for x.ai/session/info.
+    """Unwrap Grok's extension-method envelope for ``x.ai/session/info``.
 
-    JSON-RPC contributes the outer `result`; Grok's extension method then
-    returns `{result: SessionInfoResponse, error?: ...}` inside it.
+    The JSON-RPC response contributes the outer ``result``. Grok's extension
+    method currently returns ``{result: SessionInfoResponse, error?: ...}``
+    inside that value. Future builds may return the raw response, so this is
+    deliberately liberal.
     """
     if not isinstance(value, dict):
         return {}
     if "result" in value:
         nested = value.get("result")
         return nested if isinstance(nested, dict) else {}
-    # Be liberal for future Grok versions that may switch this method to a raw
-    # response like x.ai/session/usage.
     return value
 
 
@@ -56,30 +57,37 @@ def context_summary(info: dict[str, Any]) -> str:
 class _JsonRpcStdio:
     """Tiny newline-delimited JSON-RPC client with bounded waits.
 
-    ACP sends notifications while session/load replays the conversation.  A
-    dedicated reader thread lets requests ignore those notifications without
-    ever blocking past their deadline on `readline()`.
+    ACP sends notifications while ``session/load`` replays the conversation.
+    A dedicated reader thread lets requests ignore those notifications without
+    ever blocking past their deadline on ``readline()``.
     """
 
-    def __init__(self, cwd: Path, env: dict[str, str], timeout: float = 12.0):
+    def __init__(self, cwd: Path, env: dict[str, str], timeout: float = 8.0):
         self.timeout = max(2.0, float(timeout))
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self.proc = subprocess.Popen(
-            ["grok", "agent", "--always-approve", "stdio"],
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=creationflags,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                ["grok", "agent", "--always-approve", "stdio"],
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise AcpProbeError(f"failed to start grok ACP: {exc}") from exc
         self._messages: queue.Queue[object] = queue.Queue()
         self._request_id = 0
-        self._reader = threading.Thread(target=self._read_stdout, name="grok-acp-context", daemon=True)
+        self._reader = threading.Thread(
+            target=self._read_stdout,
+            name="grok-acp-context",
+            daemon=True,
+        )
         self._reader.start()
 
     def _read_stdout(self) -> None:
@@ -92,6 +100,8 @@ class _JsonRpcStdio:
                 try:
                     self._messages.put(json.loads(line))
                 except json.JSONDecodeError:
+                    # ACP stdout should be JSON-RPC only. Ignore a noisy line rather
+                    # than turning observability into a failure of the delegated turn.
                     continue
         finally:
             self._messages.put(_EOF)
@@ -101,7 +111,12 @@ class _JsonRpcStdio:
             raise AcpProbeError(f"grok ACP exited with {self.proc.returncode}")
         self._request_id += 1
         request_id = self._request_id
-        message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        message = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
         try:
             assert self.proc.stdin is not None
             self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
@@ -122,7 +137,7 @@ class _JsonRpcStdio:
                 raise AcpProbeError(f"grok ACP closed during {method}")
             if not isinstance(item, dict):
                 continue
-            # session/update and x.ai/* notifications intentionally have no id.
+            # session/update and x.ai/* notifications have no matching request id.
             if item.get("id") != request_id:
                 continue
             if item.get("error") is not None:
@@ -143,11 +158,11 @@ class _JsonRpcStdio:
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
-                self.proc.wait(timeout=1.5)
+                self.proc.wait(timeout=1.25)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 try:
-                    self.proc.wait(timeout=1.0)
+                    self.proc.wait(timeout=0.75)
                 except subprocess.TimeoutExpired:
                     pass
         self._reader.join(timeout=0.5)
@@ -159,18 +174,30 @@ class _JsonRpcStdio:
         self.close()
 
 
+def _pick_auth_method(init: dict[str, Any]) -> str | None:
+    meta = init.get("_meta") if isinstance(init.get("_meta"), dict) else {}
+    method_id = meta.get("defaultAuthMethodId")
+    if isinstance(method_id, str) and method_id:
+        return method_id
+    methods = init.get("authMethods") if isinstance(init.get("authMethods"), list) else []
+    for method in methods:
+        if isinstance(method, dict) and isinstance(method.get("id"), str) and method["id"]:
+            return method["id"]
+    return None
+
+
 def probe_session_context(
     session_id: str,
     cwd: str | Path,
     *,
     env: dict[str, str] | None = None,
-    timeout: float = 12.0,
+    timeout: float = 8.0,
 ) -> dict[str, Any]:
-    """Return Grok SessionInfoResponse for a persisted session.
+    """Return Grok's ``SessionInfoResponse`` for a persisted session.
 
     The probe is read-oriented: it loads the session into a disposable ACP
-    process, asks for session info, and terminates the process.  `mcpServers` is
-    empty so no observer-side MCP integrations are injected into the session.
+    process, asks for session info, and terminates the process. ``mcpServers``
+    is empty so the observer does not inject any extra MCP integrations.
     Grok's own configured/managed tools and skill baseline still participate in
     the loaded session's ContextInfo.
     """
@@ -182,13 +209,12 @@ def probe_session_context(
         raise AcpProbeError(f"session cwd does not exist: {workdir}")
 
     child_env = dict(os.environ if env is None else env)
-    # Keep the probe deterministic and non-interactive. Authentication still
-    # uses the same auth store/environment as the headless Grok invocation.
     child_env.setdefault("NO_COLOR", "1")
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
 
     started = time.monotonic()
     with _JsonRpcStdio(workdir, child_env, timeout=timeout) as rpc:
-        init = rpc.request(
+        init_raw = rpc.request(
             "initialize",
             {
                 "protocolVersion": 1,
@@ -205,20 +231,15 @@ def probe_session_context(
                 },
             },
         )
-        init = init if isinstance(init, dict) else {}
-        meta = init.get("_meta") if isinstance(init.get("_meta"), dict) else {}
-        method_id = meta.get("defaultAuthMethodId")
-        if not isinstance(method_id, str) or not method_id:
-            methods = init.get("authMethods") if isinstance(init.get("authMethods"), list) else []
-            for method in methods:
-                if isinstance(method, dict) and isinstance(method.get("id"), str):
-                    method_id = method["id"]
-                    break
-        if isinstance(method_id, str) and method_id:
-            rpc.request("authenticate", {"methodId": method_id, "_meta": {"headless": True}})
+        init = init_raw if isinstance(init_raw, dict) else {}
+        method_id = _pick_auth_method(init)
+        if method_id:
+            rpc.request(
+                "authenticate",
+                {"methodId": method_id, "_meta": {"headless": True}},
+            )
 
         elapsed = time.monotonic() - started
-        remaining = max(2.0, timeout - elapsed)
         rpc.request(
             "session/load",
             {
@@ -227,14 +248,13 @@ def probe_session_context(
                 "mcpServers": [],
                 "_meta": {"yoloMode": True},
             },
-            timeout=remaining,
+            timeout=max(1.5, timeout - elapsed),
         )
         elapsed = time.monotonic() - started
-        remaining = max(1.0, timeout - elapsed)
         raw_info = rpc.request(
             "x.ai/session/info",
             {"sessionId": sid},
-            timeout=remaining,
+            timeout=max(1.0, timeout - elapsed),
         )
         info = unwrap_session_info(raw_info)
         context = info.get("context") if isinstance(info.get("context"), dict) else None
