@@ -1,0 +1,340 @@
+.observer-telemetry {
+  --context-input: #82aaff;
+  --context-cache-read: #6ee7a8;
+  --context-cache-write: #e0b45c;
+  --context-free: color-mix(in srgb, var(--line) 86%, transparent);
+  position: fixed;
+  top: 9px;
+  right: 54px;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 34px;
+  padding: 3px 5px;
+  border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(12px);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.observer-telemetry[hidden] {
+  display: none;
+}
+
+.telemetry-metric {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.telemetry-metric:hover,
+.telemetry-metric:focus-visible {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.telemetry-metric strong {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.telemetry-arrow {
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.telemetry-label {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.telemetry-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+}
+
+.telemetry-ring {
+  --telemetry-pct: 0;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: conic-gradient(var(--accent) calc(var(--telemetry-pct) * 1%), var(--line) 0);
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.telemetry-ring::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+}
+
+.telemetry-popover {
+  position: fixed;
+  z-index: 80;
+  max-height: min(76vh, 720px);
+  overflow: auto;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-elevated) 97%, transparent);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  font-family: var(--font);
+  overscroll-behavior: contain;
+}
+
+.telemetry-popover-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.telemetry-popover-head h2 {
+  margin: 2px 0 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.telemetry-kicker,
+.telemetry-section-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  color: var(--faint);
+}
+
+.telemetry-pill {
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font: 10px/1.4 var(--mono);
+}
+
+.telemetry-pill-context {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+  background: var(--accent-dim);
+}
+
+.telemetry-total,
+.telemetry-context-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.telemetry-total > span,
+.telemetry-context-total > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.telemetry-total strong,
+.telemetry-context-total strong {
+  font-family: var(--mono);
+  font-size: 15px;
+  letter-spacing: -0.02em;
+}
+
+.telemetry-context-total small {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.telemetry-grid {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.telemetry-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.telemetry-card {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.telemetry-card > span,
+.telemetry-card > small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.telemetry-card > strong {
+  display: block;
+  margin: 3px 0 1px;
+  font: 650 18px/1.15 var(--mono);
+}
+
+.telemetry-section-title {
+  margin: 14px 0 6px;
+}
+
+.telemetry-rows {
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.telemetry-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.telemetry-row:last-child {
+  border-bottom: 0;
+}
+
+.telemetry-row > span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.telemetry-row small {
+  display: block;
+  margin-top: 1px;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.telemetry-row strong {
+  flex: 0 0 auto;
+  font: 600 11px/1.4 var(--mono);
+}
+
+.telemetry-context-bar {
+  height: 10px;
+  margin: 8px 0 12px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.telemetry-context-legend {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 14px;
+  margin-bottom: 14px;
+}
+
+.telemetry-legend-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.telemetry-legend-item strong {
+  color: var(--text);
+  font: 600 10px/1.4 var(--mono);
+}
+
+.telemetry-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.telemetry-context-note {
+  display: grid;
+  gap: 4px;
+  padding: 10px 11px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 30%, var(--line));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--cyan) 7%, var(--surface));
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.telemetry-context-note strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.telemetry-context-note code,
+.telemetry-foot code {
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.telemetry-foot {
+  margin-top: 13px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+@media (max-width: 860px) {
+  .observer-telemetry {
+    right: 48px;
+    max-width: calc(100vw - 104px);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .observer-telemetry::-webkit-scrollbar {
+    display: none;
+  }
+
+  .telemetry-label {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .observer-telemetry {
+    top: 8px;
+    right: 46px;
+    max-width: calc(100vw - 96px);
+  }
+
+  .telemetry-metric {
+    padding-inline: 4px;
+  }
+
+  .telemetry-grid-2,
+  .telemetry-context-legend {
+    grid-template-columns: 1fr;
+  }
+}
