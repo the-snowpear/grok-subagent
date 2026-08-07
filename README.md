@@ -89,6 +89,40 @@ Read-mostly observer for Grok subagents. Live event timeline, FTS search, Change
 
 A 60s bootstrap poll remains as a fallback if the catalog SSE drops. Prefer keeping one browser tab open so EventSource can reconnect automatically.
 
+### Live streaming telemetry
+
+The MCP plugin now launches `server_live.py`, which points the existing MCP bridge at
+`live_streaming.py`. The live launcher reuses the existing daemon implementation but
+promotes Grok session-log `agent_message_chunk` and `agent_thought_chunk` updates into
+observer `text` / `thought` SSE events. The legacy coalesced stdout events remain as a
+race-safe fallback and are only emitted when matching live chunks were not observed.
+
+The viewer exposes a compact top-right telemetry panel:
+
+- cumulative input/output/cache/reasoning usage from Grok headless `streaming-json`
+- cache-hit rate and trusted server cost when present
+- semantic current-context usage from Grok ACP `x.ai/session/info`
+- system prompt, messages, reasoning/overhead, free space, tool definitions,
+  Skills/MCP informational rows, auto-compact threshold, turn/tool/compaction counts
+
+Token and context accounting deliberately use different sources. Headless per-response
+`usage` events are the cumulative token source; `end.usage` is only a per-turn fallback
+when no response usage was seen. The disposable ACP probe does **not** use
+`x.ai/session/usage` for lifetime totals because Grok documents that its in-memory usage
+ledger resets when a persisted session is resumed in a new agent process.
+
+Environment variables:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `GROK_OBSERVER_CONTEXT_TELEMETRY` | `1` | Set `0`/`false`/`no`/`off` to disable the post-turn ACP ContextInfo probe. |
+| `GROK_OBSERVER_CONTEXT_PROBE_TIMEOUT` | `8` | ACP probe timeout in seconds (clamped to 2-20). |
+| `GROK_OBSERVER_CONTEXT_DEBUG` | unset | When non-empty, write skipped/failed context-probe diagnostics to stderr. |
+
+Operational note: `server.py` reuses an already-running observer daemon. After installing
+or switching to this version, restart the Grok Subagent MCP/observer once so the new
+`server_live.py` launcher is used.
+
 ### Sidebar: pin, archive, titles
 
 | Action | Scope | Notes |
@@ -108,7 +142,7 @@ Virtual orphan sessions (`_orphan:…`) cannot be edited. Running agents still c
 
 ### Steering note (headless Grok)
 
-Headless `grok -p --output-format streaming-json` is **one-way NDJSON** (no stdin control protocol). `update_agent` still interrupts by terminating the child process and starting a replacement turn on the same session (`--resume`); `lossless_interject` is always `false`. Bidirectional ACP (`grok agent stdio`) is a separate integration path and is not used by this observer today.
+Headless `grok -p --output-format streaming-json` is **one-way NDJSON** (no stdin control protocol). `update_agent` still interrupts by terminating the child process and starting a replacement turn on the same session (`--resume`); `lossless_interject` is always `false`. Bidirectional ACP (`grok agent stdio`) is a separate integration path, used only by the read-only context telemetry probe described above; it is not used to drive delegated work.
 
 ## Trust model
 

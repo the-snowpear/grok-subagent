@@ -58,6 +58,8 @@ export const HIDDEN_TYPES = new Set([
   "turn_started",
   "turn_ended",
   "turn_completed",
+  "usage",
+  "context_usage",
 ]);
 
 export const TOOL_TYPES = new Set([
