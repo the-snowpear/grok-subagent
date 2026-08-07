@@ -8,14 +8,19 @@ max_turns validation.
 
 from __future__ import annotations
 
+import gzip
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -115,10 +120,27 @@ class _IsolatedDbMixin:
             ["git", "config", "user.name", "t"],
             cwd=folder, check=True, capture_output=True,
         )
+        # Deterministic LF checkouts so worktree diff/apply round-trips exactly.
+        subprocess.run(
+            ["git", "config", "core.autocrlf", "false"],
+            cwd=folder, check=True, capture_output=True,
+        )
         (folder / "tracked.txt").write_text("base\n", encoding="utf-8")
         subprocess.run(["git", "add", "tracked.txt"], cwd=folder, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=folder, check=True, capture_output=True)
         return folder
+
+    @staticmethod
+    def _normpath(value: str) -> str:
+        """Normalize path separators so git output compares with pathlib strings."""
+        return str(value).replace("\\", "/")
+
+    def _repo_head(self, repo: Path) -> str:
+        """Return the current HEAD sha of a repository."""
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
 
     def _seed_agent(
         self,
@@ -318,6 +340,144 @@ class ProfilesWorktreeTest(_IsolatedDbMixin, unittest.TestCase):
         self.assertTrue(os.path.isdir(row["worktree_path"]))
         self.assertEqual(row["cwd"], row["worktree_path"])
         self.assertEqual(row["max_turns"], 50)
+
+    def test_worktree_metadata_persisted(self):
+        repo = self._make_git_repo(self.folder / "repo")
+        head = self._repo_head(repo)
+        created = self._create("p", cwd=str(repo), profile="deep")
+        row = self._agent_row(created["agent_id"])
+        self.assertEqual(self._normpath(row["original_cwd"]), self._normpath(repo.resolve()))
+        self.assertEqual(self._normpath(row["repo_root"]), self._normpath(repo.resolve()))
+        self.assertEqual(row["repo_rel_cwd"], ".")
+        self.assertEqual(row["worktree_base_sha"], head)
+        self.assertEqual(row["isolation_mode"], "worktree")
+        expected = daemon.DATA / "worktrees" / created["agent_id"]
+        self.assertEqual(self._normpath(row["worktree_path"]), self._normpath(expected))
+        self.assertTrue(os.path.isdir(row["worktree_path"]))
+
+    def test_subdir_worker_cwd(self):
+        repo = self._make_git_repo(self.folder / "repo")
+        subdir = repo / "subdir"
+        subdir.mkdir(parents=True, exist_ok=True)
+        (subdir / "inner.txt").write_text("inner\n", encoding="utf-8")
+        subprocess.run(["git", "add", "subdir/inner.txt"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "subdir"], cwd=repo, check=True, capture_output=True)
+        created = self._create("p", cwd=str(subdir), profile="deep")
+        row = self._agent_row(created["agent_id"])
+        self.assertEqual(row["repo_rel_cwd"], "subdir")
+        self.assertTrue(self._normpath(row["worktree_path"]).endswith("/subdir"))
+        self.assertTrue(os.path.isdir(row["worktree_path"]))
+        self.assertEqual(row["cwd"], row["worktree_path"])
+
+    def test_create_failure_cleans_up_worktree(self):
+        repo = self._make_git_repo(self.folder / "repo")
+        with mock.patch.object(daemon, "MAX_QUEUE_DEPTH", 0):
+            with self.assertRaisesRegex(ValueError, "队列已满"):
+                self._create("p", cwd=str(repo), profile="deep")
+        with daemon.connect() as db:
+            count = db.execute("SELECT COUNT(*) AS c FROM agents").fetchone()["c"]
+        self.assertEqual(count, 0)
+        self.assertEqual(list((daemon.DATA / "worktrees").glob("*")), [])
+
+    def test_manual_delete_removes_worktree(self):
+        repo = self._make_git_repo(self.folder / "repo")
+        created = self._create("p", cwd=str(repo), profile="isolated")
+        agent_id = created["agent_id"]
+        self._wait_terminal(agent_id)
+        worktree_path = self._agent_row(agent_id)["worktree_path"]
+        self.assertTrue(os.path.isdir(worktree_path))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), daemon.ViewerHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/agents/{agent_id}/delete",
+                method="POST",
+                data=b"",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode())
+            self.assertTrue(payload["deleted"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertFalse(os.path.isdir(worktree_path))
+        with daemon.connect() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone())
+        listed = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertNotIn(self._normpath(worktree_path), self._normpath(listed))
+
+    def test_result_isolation_contract_and_patch(self):
+        repo = self._make_git_repo(self.folder / "repo")
+        head = self._repo_head(repo)
+        created = self._create("p", cwd=str(repo), profile="isolated")
+        agent_id = created["agent_id"]
+        self._wait_terminal(agent_id)
+        worktree_path = Path(self._agent_row(agent_id)["worktree_path"])
+        (worktree_path / "tracked.txt").write_text("base\nappended\n", encoding="utf-8", newline="\n")
+        (worktree_path / "new.txt").write_text("fresh content\n", encoding="utf-8", newline="\n")
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO changes(agent_id,turn_id,path,kind,added,deleted,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (agent_id, 1, "tracked.txt", "modified", 2, 1, stamp),
+            )
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        isolation = result["isolation"]
+        self.assertEqual(isolation["mode"], "worktree")
+        self.assertEqual(isolation["base_sha"], head)
+        self.assertEqual(self._normpath(isolation["repo_root"]), self._normpath(repo.resolve()))
+        self.assertEqual(self._normpath(isolation["original_cwd"]), self._normpath(repo.resolve()))
+        self.assertEqual(self._normpath(isolation["worktree_path"]), self._normpath(worktree_path))
+        self.assertIsNotNone(isolation["patch_artifact"])
+        self.assertEqual(
+            isolation["untracked_artifacts"],
+            [{"path": "new.txt", "artifact": isolation["untracked_artifacts"][0]["artifact"]}],
+        )
+        self.assertIn("tracked.txt", isolation["changed_files"])
+        # The patch artifact must replay cleanly onto a fresh clone at base_sha.
+        patch_rel = isolation["patch_artifact"]
+        with gzip.open(daemon.ROOT / patch_rel, "rt", encoding="utf-8") as handle:
+            patch_text = handle.read()
+        self.assertIn("appended", patch_text)
+        untracked_rel = isolation["untracked_artifacts"][0]["artifact"]
+        with gzip.open(daemon.ROOT / untracked_rel, "rt", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "fresh content\n")
+        clone_dir = self.folder / "clone"
+        subprocess.run(["git", "clone", str(repo), str(clone_dir)], check=True, capture_output=True)
+        subprocess.run(["git", "checkout", head], cwd=clone_dir, check=True, capture_output=True)
+        patch_file = self.folder / "worktree.patch"
+        patch_file.write_text(patch_text, encoding="utf-8")
+        subprocess.run(["git", "apply", str(patch_file)], cwd=clone_dir, check=True, capture_output=True)
+        self.assertEqual(
+            (clone_dir / "tracked.txt").read_text(encoding="utf-8"),
+            "base\nappended\n",
+        )
+
+    def test_dirty_parent_warning(self):
+        repo = self._make_git_repo(self.folder / "repo")
+        (repo / "tracked.txt").write_text("base\ndirty\n", encoding="utf-8")
+        created = self._create("p", cwd=str(repo), profile="deep")
+        with daemon.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM events WHERE agent_id=? AND type='worktree_warning'",
+                (created["agent_id"],),
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0]["payload"] or "{}")
+        self.assertTrue(payload.get("dirty_parent"))
+        self.assertEqual(payload.get("base_sha"), self._repo_head(repo))
+
+    def test_shared_isolation_contract(self):
+        agent_id = self._seed_agent()
+        result = daemon.action("result", {"agent_id": agent_id}, {})
+        self.assertEqual(result["isolation"], {"mode": "shared"})
 
 
 if __name__ == "__main__":

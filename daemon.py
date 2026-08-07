@@ -345,6 +345,11 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agents ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 50",
             "ALTER TABLE agents ADD COLUMN worktree_path TEXT",
+            "ALTER TABLE agents ADD COLUMN original_cwd TEXT",
+            "ALTER TABLE agents ADD COLUMN repo_root TEXT",
+            "ALTER TABLE agents ADD COLUMN repo_rel_cwd TEXT",
+            "ALTER TABLE agents ADD COLUMN worktree_base_sha TEXT",
+            "ALTER TABLE agents ADD COLUMN isolation_mode TEXT DEFAULT 'shared'",
             "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE changes ADD COLUMN source TEXT DEFAULT 'observed'",
@@ -2777,42 +2782,121 @@ def resolve_agent_settings(profile: str, worktree, max_turns) -> tuple[dict, boo
     return (defaults, effective_worktree, effective_max_turns)
 
 
-def create_agent_worktree(cwd: Path, agent_id: str) -> str:
-    """Create a detached git worktree for an agent; returns the worktree path.
+def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple[str, dict]:
+    """Create a detached git worktree for an agent; returns (worker_cwd, meta).
 
-    Raises ValueError when cwd is not inside a git repository or when the
-    worktree cannot be created (a failed attempt is cleaned up).
+    Meta carries repo_root, repo_rel_cwd, worktree_base_sha, original_cwd and
+    dirty_parent. Raises ValueError when cwd is not inside a git repository or
+    when the worktree cannot be created (a failed attempt is cleaned up).
     """
-    check = subprocess.run(
-        ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
+    repo = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, timeout=20,
     )
-    if check.returncode != 0:
+    if repo.returncode != 0:
         raise ValueError("worktree isolation requires a git repository")
+    repo_root = repo.stdout.strip()
+    repo_rel_cwd = str(Path(cwd).resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/") or "."
+    base = subprocess.run(
+        ["git", "-C", repo_root, "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if base.returncode != 0 or not base.stdout.strip():
+        raise ValueError("failed to resolve worktree base")
+    base_sha = base.stdout.strip()
     target = DATA / "worktrees" / agent_id
     target.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        ["git", "-C", str(cwd), "worktree", "add", "--detach", str(target), "HEAD"],
+        ["git", "-C", repo_root, "worktree", "add", "--detach", str(target), "HEAD"],
         capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
         shutil.rmtree(target, ignore_errors=True)
         detail = (result.stderr or result.stdout or "").strip()
         raise ValueError("failed to create worktree: " + detail[-200:])
-    return str(target)
+    worker_cwd = target / repo_rel_cwd
+    worker_cwd.mkdir(parents=True, exist_ok=True)
+    status = subprocess.run(
+        ["git", "-C", repo_root, "status", "--porcelain"],
+        capture_output=True, text=True, timeout=20,
+    )
+    dirty_parent = bool(status.stdout.strip())
+    return (str(worker_cwd), {
+        "repo_root": repo_root,
+        "repo_rel_cwd": repo_rel_cwd,
+        "worktree_base_sha": base_sha,
+        "original_cwd": str(original_cwd),
+        "dirty_parent": dirty_parent,
+    })
 
 
-def remove_agent_worktree(worktree_path: str) -> None:
-    """Best-effort removal of an agent worktree; never raises."""
-    try:
-        subprocess.run(
-            ["git", "-C", worktree_path, "worktree", "remove", "--force", worktree_path],
+def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
+    """Best-effort removal of an agent worktree; never raises.
+
+    Uses repo_root as the git control point so a half-created worktree can
+    still be removed; the directory is force-deleted as a fallback.
+    """
+    if repo_root:
+        try:
+            subprocess.run(
+                ["git", "-C", repo_root, "worktree", "remove", "--force", worktree_path],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["git", "-C", repo_root, "worktree", "prune"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception:
+            pass
+    shutil.rmtree(worktree_path, ignore_errors=True)
+
+
+def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
+    """Snapshot a completed agent's worktree into durable patch artifacts.
+
+    Returns (patch_artifact, untracked): patch_artifact is the repo-relative
+    path of the gzip artifact holding ``git diff --binary`` against the base
+    sha (None when no diff is available), untracked is a list of
+    {"path": rel, "artifact": repo-relative path} for untracked files.
+    """
+    with connect() as db:
+        row = db.execute(
+            "SELECT worktree_path, worktree_base_sha FROM agents WHERE id=?", (agent_id,)
+        ).fetchone()
+    if not row or not row["worktree_path"] or not os.path.isdir(row["worktree_path"]):
+        return None, []
+    worktree_path = row["worktree_path"]
+    base_sha = row["worktree_base_sha"]
+    patch_path = None
+    if base_sha:
+        diff = subprocess.run(
+            ["git", "-C", worktree_path, "diff", "--binary", base_sha],
             capture_output=True, text=True, timeout=60,
         )
-    except Exception:
-        pass
-    finally:
-        shutil.rmtree(worktree_path, ignore_errors=True)
+        if diff.returncode == 0 and diff.stdout.strip():
+            patch_path = artifact(agent_id, "worktree_patch", diff.stdout)
+    untracked = []
+    listed = subprocess.run(
+        ["git", "-C", worktree_path, "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True, timeout=60,
+    )
+    if listed.returncode == 0:
+        for raw in listed.stdout.split(b"\0"):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", errors="replace")
+            try:
+                with (Path(worktree_path) / rel).open("rb") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            text = content.decode("utf-8", errors="replace")
+            artifact_path = artifact(agent_id, "untracked_" + rel.replace("/", "_").replace("\\", "_"), text)
+            untracked.append({"path": rel, "artifact": artifact_path})
+    return patch_path, untracked
 
 
 def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None) -> dict:
@@ -2824,88 +2908,125 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
     agent_id = str(uuid.uuid4())
     defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns)
     prompt_effective = prompt + defaults["prompt_suffix"]
-    if eff_worktree:
-        cwd = create_agent_worktree(Path(cwd), agent_id)
     thread_id = context.get("codex_thread_id") or "unknown"
     stamp = now()
-    with CREATE_LOCK, connect() as db:
-        # 1) Per-conversation (thread) cap — primary product limit.
-        thread_active = db.execute(
-            "SELECT COUNT(*) AS c FROM agents "
-            "WHERE thread_id=? AND status IN ('queued','running')",
-            (thread_id,),
-        ).fetchone()["c"]
-        if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
-            raise ValueError(
-                f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
-                f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
+    original_cwd_value = str(Path(cwd).resolve())
+    worktree_path = None
+    worktree_meta = {}
+    try:
+        if eff_worktree:
+            # Cheap limit pre-check BEFORE the worktree exists on disk.
+            with CREATE_LOCK, connect() as db:
+                thread_active = db.execute(
+                    "SELECT COUNT(*) AS c FROM agents "
+                    "WHERE thread_id=? AND status IN ('queued','running')",
+                    (thread_id,),
+                ).fetchone()["c"]
+                if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
+                    raise ValueError(
+                        f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
+                        f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
+                    )
+                active_count = db.execute(
+                    "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
+                ).fetchone()["c"]
+                if int(active_count) >= MAX_ACTIVE_AGENTS:
+                    raise ValueError(
+                        f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
+                        f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
+                    )
+            worktree_path, worktree_meta = create_agent_worktree(Path(original_cwd_value), agent_id, Path(original_cwd_value))
+            cwd = worktree_path
+        with CREATE_LOCK, connect() as db:
+            # 1) Per-conversation (thread) cap — primary product limit.
+            thread_active = db.execute(
+                "SELECT COUNT(*) AS c FROM agents "
+                "WHERE thread_id=? AND status IN ('queued','running')",
+                (thread_id,),
+            ).fetchone()["c"]
+            if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
+                raise ValueError(
+                    f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
+                    f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
+                )
+            # 2) Global safety net across all conversations.
+            active_count = db.execute(
+                "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
+            ).fetchone()["c"]
+            if int(active_count) >= MAX_ACTIVE_AGENTS:
+                raise ValueError(
+                    f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
+                    f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
+                )
+            # Same cwd is allowed (parallel subagents); used only for soft warning.
+            same_cwd = db.execute(
+                "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
+                (cwd,),
+            ).fetchall()
+            task_title = str(codex_thread_title or "").strip() or thread_id
+            display_title = derive_display_title(agent_name, prompt)
+            db.execute(
+                "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
             )
-        # 2) Global safety net across all conversations.
-        active_count = db.execute(
-            "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
-        ).fetchone()["c"]
-        if int(active_count) >= MAX_ACTIVE_AGENTS:
-            raise ValueError(
-                f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
-                f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
+            # Refresh path/title for known threads; keep user pin/archive flags.
+            db.execute(
+                "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
+                (task_title, cwd, stamp, thread_id),
             )
-        # Same cwd is allowed (parallel subagents); used only for soft warning.
-        same_cwd = db.execute(
-            "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
-            (cwd,),
-        ).fetchall()
-        task_title = str(codex_thread_title or "").strip() or thread_id
-        display_title = derive_display_title(agent_name, prompt)
-        db.execute(
-            "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
-        )
-        # Refresh path/title for known threads; keep user pin/archive flags.
-        db.execute(
-            "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
-            (task_title, cwd, stamp, thread_id),
-        )
-        db.execute(
-            "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,worktree_path,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)",
-            (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), eff_max_turns, str(cwd) if eff_worktree else None, stamp, stamp),
-        )
-        cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt_effective, stamp))
-        turn_id = cursor.lastrowid
-        db.execute(
-            "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
-            (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt_effective}\n{thread_id}\n{task_title}"),
-        )
-    with CONDITIONS_LOCK:
-        CONDITIONS[agent_id] = threading.Condition()
-    rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
-    add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
-    if same_cwd:
-        add_event(
-            agent_id,
-            turn_id,
-            "concurrency_warning",
-            "同一工作目录已有其他 Grok 代理运行，Changes 页文件变更归因可能交叉、不够精确",
-            {
-                "other_agents": [dict(row) for row in same_cwd],
-                "hint": "parallel same-cwd agents share the workspace; diffs are recorded per agent/turn but overlapping edits may be attributed to more than one",
-            },
-        )
-    runner = get_runner(agent_id)
-    assert runner is not None
-    with CREATE_LOCK:
-        if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
-            # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
-            with connect() as db:
-                db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
-                db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
-            reclaim_agent_resources(agent_id)
-            raise ValueError(
-                f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
-                f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
+            db.execute(
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,worktree_path,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?)",
+                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), eff_max_turns, str(cwd) if eff_worktree else None, worktree_meta.get("original_cwd"), worktree_meta.get("repo_root"), worktree_meta.get("repo_rel_cwd"), worktree_meta.get("worktree_base_sha"), "worktree" if eff_worktree else "shared", stamp, stamp),
             )
-        runner.enqueue(turn_id, prompt_effective)
-    opened = ensure_viewer(agent_id)
+            cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt_effective, stamp))
+            turn_id = cursor.lastrowid
+            db.execute(
+                "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
+                (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt_effective}\n{thread_id}\n{task_title}"),
+            )
+        if worktree_meta.get("dirty_parent"):
+            add_event(
+                agent_id,
+                turn_id,
+                "worktree_warning",
+                "隔离代理从已提交的 HEAD 开始；父工作区未提交更改未包含",
+                {"dirty_parent": True, "base_sha": worktree_meta["worktree_base_sha"]},
+            )
+        with CONDITIONS_LOCK:
+            CONDITIONS[agent_id] = threading.Condition()
+        rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
+        add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
+        if same_cwd:
+            add_event(
+                agent_id,
+                turn_id,
+                "concurrency_warning",
+                "同一工作目录已有其他 Grok 代理运行，Changes 页文件变更归因可能交叉、不够精确",
+                {
+                    "other_agents": [dict(row) for row in same_cwd],
+                    "hint": "parallel same-cwd agents share the workspace; diffs are recorded per agent/turn but overlapping edits may be attributed to more than one",
+                },
+            )
+        runner = get_runner(agent_id)
+        assert runner is not None
+        with CREATE_LOCK:
+            if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
+                # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
+                with connect() as db:
+                    db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
+                    db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+                reclaim_agent_resources(agent_id)
+                raise ValueError(
+                    f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
+                    f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
+                )
+            runner.enqueue(turn_id, prompt_effective)
+        opened = ensure_viewer(agent_id)
+    except Exception:
+        if worktree_path:
+            remove_agent_worktree(worktree_meta.get("repo_root"), worktree_path)
+        raise
     return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
 
 
@@ -3226,6 +3347,20 @@ def action(name: str, args: dict, context: dict) -> dict:
                 "turn_results": turn_rows,
                 "changes": changes,
             })
+            isolation = {"mode": "shared"}
+            if agent.get("worktree_path"):
+                patch_path, untracked = build_worktree_result(agent["id"])
+                isolation = {
+                    "mode": "worktree",
+                    "base_sha": agent.get("worktree_base_sha"),
+                    "repo_root": agent.get("repo_root"),
+                    "original_cwd": agent.get("original_cwd"),
+                    "worktree_path": agent.get("worktree_path"),
+                    "patch_artifact": patch_path,
+                    "untracked_artifacts": untracked,
+                    "changed_files": [c["path"] for c in changes],
+                }
+            base["isolation"] = isolation
         return base
     if name == "wait":
         agent_id = args.get("agent_id")
@@ -3543,13 +3678,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if match:
             agent_id = match.group(1)
             with connect() as db:
-                agent = db.execute("SELECT id,status FROM agents WHERE id=?", (agent_id,)).fetchone()
+                agent = db.execute("SELECT id,status,worktree_path,repo_root FROM agents WHERE id=?", (agent_id,)).fetchone()
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 if agent["status"] in {"queued", "running"}:
                     return json_response(self, {"error": "running agents cannot be removed from the observer"}, 409)
             # Reclaim in-memory resources before deleting durable state.
             reclaim_agent_resources(agent_id)
+            if agent["worktree_path"]:
+                remove_agent_worktree(agent["repo_root"], agent["worktree_path"])
             with connect() as db:
                 db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                 db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
@@ -4074,16 +4211,16 @@ def cleanup() -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
     with connect() as db:
         ids = [
-            (row["id"], row["worktree_path"])
+            (row["id"], row["worktree_path"], row["repo_root"])
             for row in db.execute(
-                "SELECT id, worktree_path FROM agents WHERE updated_at<? AND status NOT IN ('running','queued')",
+                "SELECT id, worktree_path, repo_root FROM agents WHERE updated_at<? AND status NOT IN ('running','queued')",
                 (cutoff,),
             )
         ]
-    for agent_id, worktree_path in ids:
+    for agent_id, worktree_path, repo_root in ids:
         reclaim_agent_resources(agent_id)
         if worktree_path:
-            remove_agent_worktree(worktree_path)
+            remove_agent_worktree(repo_root, worktree_path)
         with connect() as db:
             db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
             db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
