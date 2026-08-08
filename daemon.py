@@ -126,6 +126,30 @@ PROFILES = {
     "isolated": {"worktree": True, "max_turns": 50, "prompt_suffix": ""},
 }
 
+# Create-time worker roles: role -> worktree default + prompt steering suffix.
+# Roles resolve at create time only (no persistence): follow-ups reuse the
+# same agent row whose settings are already fixed.
+# NOTE: read-only roles are enforced by PROMPT POLICY only, not by
+# OS/tool-level sandbox enforcement (documented limitation).
+ROLE_POLICIES = {
+    "explore": {"prompt_suffix": "\n\n[role: explore] 只读调查角色：收集证据、回答问题，禁止修改任何文件，禁止提交。", "worktree_default": False},
+    "implement": {"prompt_suffix": "\n\n[role: implement] 实现角色：按已定契约修改文件并自测；不得扩大需求或更改跨单元接口。", "worktree_default": True},
+    "review": {"prompt_suffix": "\n\n[role: review] 独立审查角色：只读审查 work order 与 patch/result 证据，禁止修改文件，只输出 findings。", "worktree_default": False},
+}
+
+
+def validate_role(value) -> str:
+    """Validate a create-time role name; None means no role.
+
+    Returns the value unchanged on success. Raises ValueError for non-str,
+    empty, or unknown roles.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in ROLE_POLICIES:
+        raise ValueError("role must be one of: explore, implement, review")
+    return value
+
 # Canonical control-plane field for per-agent reasoning effort. The installed
 # grok CLI accepts arbitrary --reasoning-effort values (no enum is documented
 # or enforced client-side; "max" is the verified runtime default), so we
@@ -3154,17 +3178,24 @@ def build_search_snippet(content: str, term: str, radius: int = 40) -> dict:
     return {"text": snippet, "matches": []}
 
 
-def resolve_agent_settings(profile: str, worktree, max_turns) -> tuple[dict, bool, int]:
+def resolve_agent_settings(profile: str, worktree, max_turns, *, role=None) -> tuple[dict, bool, int]:
     """Merge a named profile with explicit create_agent overrides.
 
     Returns (defaults, effective_worktree, effective_max_turns). Raises
-    ValueError on unknown profile or out-of-range max_turns.
+    ValueError on unknown profile, out-of-range max_turns, or invalid role.
     """
+    role = validate_role(role)
     profile = str(profile or "default")
     if profile not in PROFILES:
         raise ValueError(f"unknown profile: {profile}")
     defaults = PROFILES[profile]
-    effective_worktree = defaults["worktree"] if worktree is None else bool(worktree)
+    # Explicit worktree always wins; otherwise role default; otherwise profile.
+    if worktree is not None:
+        effective_worktree = bool(worktree)
+    elif role is not None:
+        effective_worktree = ROLE_POLICIES[role]["worktree_default"]
+    else:
+        effective_worktree = defaults["worktree"]
     if max_turns is None:
         effective_max_turns = defaults["max_turns"]
     else:
@@ -3417,14 +3448,14 @@ def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
 
 
 
-def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None, reasoning_effort=None) -> dict:
+def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None, reasoning_effort=None, role=None) -> dict:
     """Create a single agent with optional isolated worktree."""
     agent_id = str(uuid.uuid4())
-    defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns)
+    defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns, role=role)
     # Resolve + validate BEFORE any worktree creation or DB insert so an
     # invalid effort can never leave durable or disk ghost state behind.
     eff_reasoning_effort = resolve_reasoning_effort(None, reasoning_effort)
-    prompt_effective = prompt + defaults["prompt_suffix"] + worker_coordination_instructions()
+    prompt_effective = prompt + defaults["prompt_suffix"] + (ROLE_POLICIES[role]["prompt_suffix"] if role else "") + worker_coordination_instructions()
     thread_id = context.get("codex_thread_id") or "unknown"
     stamp = now()
     original_cwd_value = str(Path(cwd).resolve())
@@ -3589,6 +3620,7 @@ def action(name: str, args: dict, context: dict) -> dict:
             agent_name, prompt, cwd, args.get("codex_thread_title"), context,
             profile=args.get("profile"), worktree=args.get("worktree"), max_turns=args.get("max_turns"),
             reasoning_effort=args.get("reasoning_effort"),
+            role=args.get("role"),
         )
     if name == "create_agents":
         agents = args.get("agents")
@@ -3603,6 +3635,9 @@ def action(name: str, args: dict, context: dict) -> dict:
         batch_effort = args.get("reasoning_effort")
         if batch_effort is not None:
             validate_reasoning_effort(batch_effort)
+        batch_role = args.get("role")
+        if batch_role is not None:
+            validate_role(batch_role)
         for i, item in enumerate(agents):
             if not isinstance(item, dict):
                 errors.append({"index": i, "error": "agent entry must be an object"})
@@ -3618,6 +3653,7 @@ def action(name: str, args: dict, context: dict) -> dict:
                     agent_name, prompt, cwd, item.get("codex_thread_title"), context,
                     profile=item.get("profile"), worktree=item.get("worktree"), max_turns=item.get("max_turns"),
                     reasoning_effort=item.get("reasoning_effort", batch_effort),
+                    role=item.get("role", batch_role),
                 )
                 results.append({"index": i, **created})
             except ValueError as exc:

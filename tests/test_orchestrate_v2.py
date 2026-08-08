@@ -308,5 +308,130 @@ class EffortControlPlaneTests(OrchestrateV2Mixin, unittest.TestCase):
         self._assert_effort_command(self._command(aid), "max")
 
 
+class RoleResolutionTests(OrchestrateV2Mixin, unittest.TestCase):
+    """B1-B6: create-time role resolution over the profile machinery.
+
+    A role is a create-time overlay: it fills the worktree default when the
+    caller omitted ``worktree`` and appends a role-specific policy suffix to
+    the effective prompt. An explicit ``worktree`` argument always wins over
+    the role default, roles do not override an explicit profile, invalid
+    roles raise ValueError before any durable state, and the batch-level
+    role default is validated once up front. Read-only enforcement is prompt
+    policy only (no OS/tool-level sandbox). All assertions are behavioral
+    (DB rows, action responses, stored turn prompts, command builder).
+    """
+
+    def _turn_prompt(self, agent_id: str) -> str:
+        with daemon.connect() as db:
+            row = db.execute(
+                "SELECT prompt FROM turns WHERE agent_id=? AND turn_no=1", (agent_id,)
+            ).fetchone()
+        self.assertIsNotNone(row, "first turn must exist with the effective prompt")
+        return row["prompt"]
+
+    def test_implement_role_defaults_to_worktree(self):
+        """B1: role='implement' without worktree -> isolated worktree + policy suffix."""
+        repo = self._make_git_repo(self.root / "repo")
+        created = self._create("t-role-implement", name="impl", prompt="build it", cwd=str(repo), role="implement")
+        aid = created["agent_id"]
+        row = self._agent_row(aid)
+        self.assertIsNotNone(row["worktree_root"], "implement role must default to an isolated worktree")
+        self.assertIsNotNone(row["worktree_path"])
+        self.assertEqual(row["isolation_mode"], "worktree")
+        self.assertIn("[role: implement]", self._turn_prompt(aid))
+
+        # An explicit worktree=False overrides the role default: shared cwd, no worktree dir.
+        before = self._worktree_count()
+        created2 = self._create(
+            "t-role-implement-explicit", name="impl2", prompt="build it", cwd=str(repo),
+            role="implement", worktree=False,
+        )
+        aid2 = created2["agent_id"]
+        row2 = self._agent_row(aid2)
+        self.assertIsNone(row2["worktree_root"], "explicit worktree=False must win over the implement default")
+        self.assertIsNone(row2["worktree_path"])
+        self.assertEqual(row2["isolation_mode"], "shared")
+        self.assertEqual(Path(row2["cwd"]), repo)
+        self.assertEqual(self._worktree_count(), before, "no worktree dir may be created for worktree=False")
+
+    def test_explore_role_readonly_policy_and_shared_cwd(self):
+        """B2: explore/review default to the shared cwd and carry the read-only policy."""
+        for role in ("explore", "review"):
+            created = self._create(f"t-role-{role}", name=role, prompt="investigate", role=role)
+            aid = created["agent_id"]
+            row = self._agent_row(aid)
+            self.assertIsNone(row["worktree_root"], f"{role} role must default to the shared cwd")
+            self.assertIsNone(row["worktree_path"])
+            self.assertEqual(row["isolation_mode"], "shared")
+            self.assertEqual(Path(row["cwd"]), self.root)
+            prompt = self._turn_prompt(aid)
+            self.assertIn(f"[role: {role}]", prompt)
+            self.assertIn("只读", prompt, "read-only policy marker must be present")
+            self.assertIn("禁止修改", prompt, "read-only policy marker must be present")
+
+    def test_role_invalid_rejected(self):
+        """B3: invalid roles raise ValueError before any durable or disk side effect."""
+        thread_id = "t-role-invalid"
+        repo = self._make_git_repo(self.root / "repo")
+        before = self._worktree_count()
+        for index, bad in enumerate(["hacker", "", 123]):
+            with self.assertRaises(ValueError):
+                daemon.action(
+                    "create_agent",
+                    {"agent_name": f"bad{index}", "prompt": "p", "cwd": str(repo), "role": bad},
+                    {"codex_thread_id": thread_id, "codex_origin": "test"},
+                )
+        with daemon.connect() as db:
+            count = db.execute("SELECT COUNT(*) AS c FROM agents").fetchone()["c"]
+        self.assertEqual(count, 0, "no agent row may survive an invalid role")
+        self.assertEqual(self._worktree_count(), before, "no worktree may be created for an invalid role")
+
+    def test_role_batch_default_and_override(self):
+        """B4: batch role default flows down; a per-item role wins over it."""
+        thread_id = "t-role-batch"
+        repo = self._make_git_repo(self.root / "repo")
+        items = [
+            {"agent_name": "a1", "prompt": "p1", "cwd": str(repo)},
+            {"agent_name": "a2", "prompt": "p2", "cwd": str(repo), "role": "implement"},
+        ]
+        result = daemon.action(
+            "create_agents",
+            {"agents": items, "role": "explore"},
+            {"codex_thread_id": thread_id, "codex_origin": "test"},
+        )
+        self.assertEqual(result["created"], 2)
+        by_name = {item["index"]: item["agent_id"] for item in result["agents"]}
+        row_a = self._agent_row(by_name[0])
+        row_b = self._agent_row(by_name[1])
+        self.assertIsNone(row_a["worktree_root"], "batch default explore -> shared cwd")
+        self.assertIsNone(row_a["worktree_path"])
+        self.assertEqual(row_a["isolation_mode"], "shared")
+        self.assertIn("[role: explore]", self._turn_prompt(by_name[0]))
+        self.assertIsNotNone(row_b["worktree_root"], "per-item implement must override the batch default")
+        self.assertEqual(row_b["isolation_mode"], "worktree")
+        self.assertIn("[role: implement]", self._turn_prompt(by_name[1]))
+
+    def test_role_does_not_override_explicit_worktree(self):
+        """B5: an explicit worktree=True wins over the explore role default."""
+        repo = self._make_git_repo(self.root / "repo")
+        created = self._create(
+            "t-role-explicit", name="expl", prompt="inspect", cwd=str(repo),
+            role="explore", worktree=True,
+        )
+        aid = created["agent_id"]
+        row = self._agent_row(aid)
+        self.assertIsNotNone(row["worktree_root"], "explicit worktree=True must win over the explore default")
+        self.assertEqual(row["isolation_mode"], "worktree")
+        self.assertIn("[role: explore]", self._turn_prompt(aid))
+
+    def test_flat_topology_unchanged(self):
+        """B6: role plumbing must not change the flat grok_command topology."""
+        created = self._create("t-role-flat", name="flat", prompt="p", role="review")
+        aid = created["agent_id"]
+        command = self._command(aid)
+        self.assertIn("--no-subagents", command)
+        self.assertIn("--always-approve", command)
+
+
 if __name__ == "__main__":
     unittest.main()
