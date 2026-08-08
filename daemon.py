@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import json
@@ -345,6 +346,7 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agents ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 50",
             "ALTER TABLE agents ADD COLUMN worktree_path TEXT",
+            "ALTER TABLE agents ADD COLUMN worktree_root TEXT",
             "ALTER TABLE agents ADD COLUMN original_cwd TEXT",
             "ALTER TABLE agents ADD COLUMN repo_root TEXT",
             "ALTER TABLE agents ADD COLUMN repo_rel_cwd TEXT",
@@ -400,6 +402,7 @@ def coordination_connect(immediate: bool = False):
         db.close()
 
 
+
 def artifact(agent_id: str, label: str, content: str) -> str:
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
     folder = ARTIFACTS / agent_id
@@ -409,6 +412,12 @@ def artifact(agent_id: str, label: str, content: str) -> str:
         with gzip.open(path, "wt", encoding="utf-8") as handle:
             handle.write(content)
     return str(path.relative_to(ROOT))
+
+
+def artifact_bytes(agent_id: str, label: str, content: bytes) -> str:
+    """Persist arbitrary bytes losslessly as base64 text in the existing artifact store."""
+    encoded = base64.b64encode(content).decode("ascii")
+    return artifact(agent_id, label, encoded)
 
 
 # Catalog (sidebar) waiters: one global condition; bumped on any agent/task meta change.
@@ -1778,79 +1787,126 @@ def on_hub_message_committed(message) -> None:
     maybe_schedule_delivery(str(message.to_peer))
 
 
-def maybe_schedule_delivery(agent_id: str) -> int:
-    """Render pending worker messages into one durable queued turn; 0 if none.
 
-    Only completed workers receive deliveries. Renders only messages that fit
-    the 60 KiB prompt envelope (overflow stays pending for the next sweep).
-    The turn insert, agent status update, and conditional message claims commit
-    in ONE transaction, so a crash mid-delivery leaves the turn durable and the
-    messages claimed — the runner's DB poll picks the turn up on restart.
+def maybe_schedule_delivery(agent_id: str) -> int:
+    """Render pending worker messages into one durable queued follow-up turn.
+
+    The DB is the execution source of truth. Messages stay state='pending' and
+    are only claimed through target_turn_id here; they become delivered/consumed
+    only after subprocess.Popen succeeds in AgentRunner._run().
     """
-    with delivery_lock(agent_id):
-        with connect() as db:
+    max_prompt_bytes = 60 * 1024
+    with delivery_lock(agent_id), CREATE_LOCK:
+        # BEGIN IMMEDIATE serializes the select/claim with inbox drains and other
+        # write-side schedulers. This prevents a turn prompt from containing rows
+        # that were concurrently consumed or claimed elsewhere.
+        with coordination_connect(immediate=True) as db:
             agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
             if agent is None or agent["status"] != "completed":
                 return 0
-            messages = MAILBOX.pending_for_delivery(to_peer=agent_id)
-            if not messages:
+            active = int(
+                db.execute(
+                    "SELECT COUNT(*) AS c FROM turns WHERE agent_id=? AND status IN ('queued','running')",
+                    (agent_id,),
+                ).fetchone()["c"]
+            )
+            if active:
                 return 0
+            rows = db.execute(
+                "SELECT id,from_peer,body FROM agent_messages "
+                "WHERE to_peer=? AND state='pending' AND consumed_at IS NULL AND target_turn_id IS NULL "
+                "ORDER BY created_at ASC,id ASC LIMIT 100",
+                (agent_id,),
+            ).fetchall()
+            if not rows:
+                return 0
+
             blocks: list[str] = []
-            claimed: list = []
-            for message in messages:
-                body = str(message.body or "")
-                if len(body) > 4000:
-                    body = body[:4000] + "…[截断]"
-                block = f"[{len(blocks) + 1}] (from {message.from_peer}, id {message.id})\n{body}"
-                header = f"你在 Grok Agent Fabric 中收到 {len(blocks) + 1} 条协作消息，请统一处理："
+            message_ids: list[str] = []
+            for row in rows:
+                message_id = str(row["id"])
+                body = str(row["body"] or "")
+                index = len(blocks) + 1
+                block = f"[{index}] (from {row['from_peer']}, id {message_id})\n{body}"
+                header = f"你在 Grok Agent Fabric 中收到 {index} 条协作消息，请统一处理："
                 candidate = header + "\n" + "\n---\n".join([*blocks, block])
-                if len(candidate.encode("utf-8")) > 60 * 1024:
-                    # Envelope full: drop this and all later messages (no partial tail).
-                    break
+
+                if len(candidate.encode("utf-8")) > max_prompt_bytes:
+                    if blocks:
+                        # Preserve this and all later rows for the next follow-up.
+                        break
+                    # A single legal mailbox message can be up to 64 KiB, slightly
+                    # larger than the delivery envelope. Spill the *full* body to
+                    # a durable artifact instead of truncating it and claiming it.
+                    rel = artifact(agent_id, f"hub-message-{message_id[:12]}", body)
+                    full_path = str((ROOT / rel).resolve())
+                    block = (
+                        f"[1] (from {row['from_peer']}, id {message_id})\n"
+                        "消息正文较大，完整 UTF-8 内容已保存到本地 artifact：\n"
+                        f"{full_path}\n"
+                        "请使用文件读取/终端工具读取完整内容后处理；不要只依据此摘要。"
+                    )
+                    candidate = "你在 Grok Agent Fabric 中收到 1 条协作消息，请统一处理：\n" + block
+                    if len(candidate.encode("utf-8")) > max_prompt_bytes:
+                        raise RuntimeError("hub delivery artifact envelope unexpectedly exceeds cap")
+
                 blocks.append(block)
-                claimed.append(message)
-            if not claimed:
+                message_ids.append(message_id)
+
+            if not message_ids:
                 return 0
+
             prompt = (
-                f"你在 Grok Agent Fabric 中收到 {len(claimed)} 条协作消息，请统一处理："
-                + "\n"
+                f"你在 Grok Agent Fabric 中收到 {len(message_ids)} 条协作消息，请统一处理：\n"
                 + "\n---\n".join(blocks)
             )
-            turn_no = db.execute(
-                "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?", (agent_id,)
-            ).fetchone()["n"]
+            turn_no = int(
+                db.execute(
+                    "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?",
+                    (agent_id,),
+                ).fetchone()["n"]
+            )
             cursor = db.execute(
                 "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)",
                 (agent_id, turn_no, prompt, now()),
             )
-            turn_id = cursor.lastrowid
+            turn_id = int(cursor.lastrowid)
+            placeholders = ",".join("?" for _ in message_ids)
+            claimed_count = db.execute(
+                "UPDATE agent_messages SET target_turn_id=? "
+                f"WHERE id IN ({placeholders}) AND state='pending' "
+                "AND consumed_at IS NULL AND target_turn_id IS NULL",
+                (turn_id, *message_ids),
+            ).rowcount
+            if claimed_count != len(message_ids):
+                raise RuntimeError("mailbox delivery claim race; transaction rolled back")
             db.execute(
-                "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=?",
+                "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=? AND status='completed'",
                 (now(), agent_id),
             )
-            # Conditional claim: concurrent schedulers cannot double-claim.
-            placeholders = ",".join("?" * len(claimed))
-            claimed_count = db.execute(
-                "UPDATE agent_messages SET target_turn_id=? WHERE id IN (%s) "
-                "AND state='pending' AND target_turn_id IS NULL" % placeholders,
-                (turn_id, *[message.id for message in claimed]),
-            ).rowcount
-        # Committed (turn + claims durable); the wake is only a hint.
-        notify_agent(agent_id)
-        add_event(
-            agent_id,
-            turn_id,
-            "hub_delivery",
-            f"投递 {claimed_count} 条协作消息",
-            {"messages": claimed_count, "turn_id": turn_id, "prompt_preview": prompt[:200]},
-        )
+
+        # Everything above is committed. Notifications/events/queue puts are
+        # wake hints only and must not invalidate durable scheduling.
+        try:
+            notify_agent(agent_id)
+        except Exception:
+            pass
+        try:
+            add_event(
+                agent_id,
+                turn_id,
+                "hub_delivery",
+                f"投递 {claimed_count} 条协作消息",
+                {"messages": claimed_count, "turn_id": turn_id, "prompt_preview": prompt[:200]},
+            )
+        except Exception:
+            pass
         runner = get_runner(agent_id)
         if runner is not None:
             try:
                 runner.enqueue(turn_id, prompt)
             except ValueError:
-                # Runner shutting down/cancelled: turn stays durable in the DB;
-                # the runner's poll (and recover()) will pick it up.
+                # Durable queued turn remains recoverable from SQLite.
                 pass
         return claimed_count
 
@@ -2371,8 +2427,8 @@ class AgentRunner:
                 "UPDATE agents SET status='running',current_turn=?,updated_at=?,revision=revision+1 WHERE id=?",
                 (turn_id, now(), self.agent_id),
             )
-        # Claimed: hub-delivered messages linked to this turn are now delivered.
-        MAILBOX.mark_delivered_for_turn(turn_id=turn_id)
+        # A queued turn is only a durable schedule. Hub messages become
+        # delivered/consumed after subprocess.Popen succeeds below.
         self.begin_turn(turn_id)
         cwd = Path(agent["cwd"])
         # Capture workspace + session-log baselines BEFORE process start to avoid races
@@ -2399,6 +2455,7 @@ class AgentRunner:
         errors: list[str] = []
         stop_reason = ""
         returncode = 1
+        delivery_started = False
         try:
             if self.cancelled.is_set():
                 raise RuntimeError("cancelled before start")
@@ -2423,6 +2480,14 @@ class AgentRunner:
                     creationflags=NO_WINDOW,
                 )
             proc = self.process
+            # Popen succeeded: the execution backend has received the full
+            # turn prompt. Auto-injected hub messages are now consumed.
+            delivery_started = True
+            try:
+                MAILBOX.mark_delivered_for_turn(turn_id=turn_id)
+            except Exception:
+                # Mailbox bookkeeping must never kill an already-started Grok.
+                pass
             # Persist child PID + its creation time so recover() can reap orphans
             # after a daemon crash without risking a reused-PID mis-kill.
             created = process_create_time(proc.pid)
@@ -2490,6 +2555,13 @@ class AgentRunner:
             returncode = proc.wait()
             stderr_thread.join(timeout=2)
         except Exception as exc:
+            if not delivery_started:
+                try:
+                    released = MAILBOX.release_scheduled_for_turn(turn_id=turn_id)
+                    if released:
+                        MAILBOX.notify(self.agent_id)
+                except Exception:
+                    pass
             returncode = 1
             errors.append(str(exc))
             add_event(self.agent_id, turn_id, "error", str(exc), {"exception": repr(exc)})
@@ -2591,8 +2663,29 @@ def get_runner(agent_id: str, *, create: bool = True) -> AgentRunner | None:
         return runner
 
 
+
+def worker_coordination_instructions() -> str:
+    """Stable discoverability hint for current `grok -p` workers.
+
+    Grok 1.0.0 cannot auto-register the native MCP bridge on the headless -p
+    transport, so the CLI remains the functional fallback. The prompt contains
+    no capability token; credentials stay in child-only environment variables.
+    """
+    python_path = str(Path(sys.executable).resolve())
+    cli_path = str((ROOT / "grok_hub.py").resolve())
+    return (
+        "\n\n[Agent Fabric coordination]\n"
+        "You can coordinate with Main and sibling workers through the durable hub. "
+        "Use the worker CLI when coordination is useful; do not invent peer messages.\n"
+        f"Python executable: {python_path}\n"
+        f"Hub CLI script: {cli_path}\n"
+        "Invoke that Python executable with the hub script and one of: `peers`, `inbox`, "
+        "`send --to <peer-id> --message <text>`, or `wait --timeout 120`; adapt quoting to the active shell."
+    )
+
+
 def worker_bridge_env(agent_id: str) -> dict:
-    """Return the worker-bridge env vars for a spawned agent, backfilling a hub token."""
+    """Return child-only worker bridge credentials and discoverability paths."""
     with connect() as db:
         row = db.execute("SELECT hub_token FROM agents WHERE id=?", (agent_id,)).fetchone()
         if row is None:
@@ -2608,6 +2701,9 @@ def worker_bridge_env(agent_id: str) -> dict:
         "GROK_OBSERVER_AGENT_ID": agent_id,
         "GROK_OBSERVER_AGENT_TOKEN": token,
         "GROK_OBSERVER_WORKER_CONTROL_PORT": str(ACTUAL_WORKER_CONTROL_PORT),
+        "GROK_OBSERVER_PYTHON": str(Path(sys.executable).resolve()),
+        "GROK_OBSERVER_HUB_CLI": str((ROOT / "grok_hub.py").resolve()),
+        "GROK_OBSERVER_NATIVE_BRIDGE": str((ROOT / "native_bridge.py").resolve()),
     }
 
 
@@ -2790,13 +2886,9 @@ def resolve_agent_settings(profile: str, worktree, max_turns) -> tuple[dict, boo
     return (defaults, effective_worktree, effective_max_turns)
 
 
-def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple[str, dict]:
-    """Create a detached git worktree for an agent; returns (worker_cwd, meta).
 
-    Meta carries repo_root, repo_rel_cwd, worktree_base_sha, original_cwd and
-    dirty_parent. Raises ValueError when cwd is not inside a git repository or
-    when the worktree cannot be created (a failed attempt is cleaned up).
-    """
+def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple[str, dict]:
+    """Create a detached git worktree; return (worker_cwd, metadata)."""
     repo = subprocess.run(
         ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, timeout=20,
@@ -2812,42 +2904,123 @@ def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple
     if base.returncode != 0 or not base.stdout.strip():
         raise ValueError("failed to resolve worktree base")
     base_sha = base.stdout.strip()
-    target = DATA / "worktrees" / agent_id
-    target.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "-C", repo_root, "worktree", "add", "--detach", str(target), "HEAD"],
-        capture_output=True, text=True, timeout=60,
-    )
-    if result.returncode != 0:
-        shutil.rmtree(target, ignore_errors=True)
-        detail = (result.stderr or result.stdout or "").strip()
-        raise ValueError("failed to create worktree: " + detail[-200:])
-    worker_cwd = target / repo_rel_cwd
-    worker_cwd.mkdir(parents=True, exist_ok=True)
     status = subprocess.run(
         ["git", "-C", repo_root, "status", "--porcelain"],
         capture_output=True, text=True, timeout=20,
     )
     dirty_parent = bool(status.stdout.strip())
-    return (str(worker_cwd), {
+
+    worktree_root = DATA / "worktrees" / agent_id
+    worktree_root.parent.mkdir(parents=True, exist_ok=True)
+    if worktree_root.exists():
+        shutil.rmtree(worktree_root, ignore_errors=True)
+    result = subprocess.run(
+        ["git", "-C", repo_root, "worktree", "add", "--detach", str(worktree_root), base_sha],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(worktree_root, ignore_errors=True)
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ValueError("failed to create worktree: " + detail[-200:])
+
+    worker_cwd = worktree_root if repo_rel_cwd == "." else worktree_root / repo_rel_cwd
+    worker_cwd.mkdir(parents=True, exist_ok=True)
+    return str(worker_cwd), {
         "repo_root": repo_root,
         "repo_rel_cwd": repo_rel_cwd,
+        "worktree_root": str(worktree_root),
         "worktree_base_sha": base_sha,
         "original_cwd": str(original_cwd),
         "dirty_parent": dirty_parent,
-    })
+    }
+
+
+
+def _resolve_worktree_root(repo_root: str | None, candidate: str) -> str | None:
+    """Resolve legacy worker-subdir paths to the actual registered worktree root.
+
+    Returns None when no safe root can be resolved. The main repository root is
+    never a valid worktree root: a stale DATA/worktrees/<id> path inside the repo
+    would otherwise match it and poison cleanup/removal.
+    """
+    main_root: str | None = None
+    if repo_root:
+        try:
+            probe = subprocess.run(
+                ["git", "-C", repo_root, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                main_root = probe.stdout.strip()
+        except Exception:
+            pass
+
+    def is_main_root(root: str) -> bool:
+        if not main_root:
+            return False
+        try:
+            return os.path.normcase(os.path.realpath(root)) == os.path.normcase(
+                os.path.realpath(main_root)
+            )
+        except OSError:
+            return False
+
+    path = Path(candidate)
+    if path.exists():
+        try:
+            resolved = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if resolved.returncode == 0 and resolved.stdout.strip():
+                root = resolved.stdout.strip()
+                if not is_main_root(root):
+                    return root
+        except Exception:
+            pass
+    if repo_root:
+        try:
+            listed = subprocess.run(
+                ["git", "-C", repo_root, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if listed.returncode == 0:
+                target = path.resolve()
+                roots = []
+                for line in listed.stdout.splitlines():
+                    if line.startswith("worktree "):
+                        roots.append(Path(line[9:].strip()))
+                for root in roots:
+                    if is_main_root(str(root)):
+                        continue
+                    try:
+                        target.relative_to(root.resolve())
+                        return str(root)
+                    except (ValueError, OSError):
+                        continue
+        except Exception:
+            pass
+    return None
 
 
 def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
-    """Best-effort removal of an agent worktree; never raises.
-
-    Uses repo_root as the git control point so a half-created worktree can
-    still be removed; the directory is force-deleted as a fallback.
-    """
+    """Best-effort removal using the registered worktree root, never worker cwd."""
+    actual_root = _resolve_worktree_root(repo_root, worktree_path)
+    if actual_root is None:
+        return
+    if repo_root is not None:
+        try:
+            same_root = os.path.normcase(os.path.realpath(actual_root)) == os.path.normcase(
+                os.path.realpath(repo_root)
+            )
+        except OSError:
+            same_root = False
+        if same_root:
+            return
     if repo_root:
         try:
             subprocess.run(
-                ["git", "-C", repo_root, "worktree", "remove", "--force", worktree_path],
+                ["git", "-C", repo_root, "worktree", "remove", "--force", actual_root],
                 capture_output=True, text=True, timeout=60,
             )
         except Exception:
@@ -2859,36 +3032,41 @@ def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
             )
         except Exception:
             pass
-    shutil.rmtree(worktree_path, ignore_errors=True)
+    shutil.rmtree(actual_root, ignore_errors=True)
+
 
 
 def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
-    """Snapshot a completed agent's worktree into durable patch artifacts.
-
-    Returns (patch_artifact, untracked): patch_artifact is the repo-relative
-    path of the gzip artifact holding ``git diff --binary`` against the base
-    sha (None when no diff is available), untracked is a list of
-    {"path": rel, "artifact": repo-relative path} for untracked files.
-    """
+    """Snapshot isolated changes into a tracked patch plus lossless untracked artifacts."""
     with connect() as db:
         row = db.execute(
-            "SELECT worktree_path, worktree_base_sha FROM agents WHERE id=?", (agent_id,)
+            "SELECT worktree_root,worktree_path,worktree_base_sha,repo_root FROM agents WHERE id=?",
+            (agent_id,),
         ).fetchone()
-    if not row or not row["worktree_path"] or not os.path.isdir(row["worktree_path"]):
+    if not row:
         return None, []
-    worktree_path = row["worktree_path"]
+    candidate = row["worktree_root"] or row["worktree_path"]
+    if not candidate:
+        return None, []
+    worktree_root = _resolve_worktree_root(row["repo_root"], candidate)
+    if worktree_root is None:
+        return None, []
+    if not os.path.isdir(worktree_root):
+        return None, []
+
     base_sha = row["worktree_base_sha"]
     patch_path = None
     if base_sha:
         diff = subprocess.run(
-            ["git", "-C", worktree_path, "diff", "--binary", base_sha],
-            capture_output=True, text=True, timeout=60,
+            ["git", "-C", worktree_root, "diff", "--binary", base_sha],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
         if diff.returncode == 0 and diff.stdout.strip():
             patch_path = artifact(agent_id, "worktree_patch", diff.stdout)
-    untracked = []
+
+    untracked: list[dict] = []
     listed = subprocess.run(
-        ["git", "-C", worktree_path, "ls-files", "--others", "--exclude-standard", "-z"],
+        ["git", "-C", worktree_root, "ls-files", "--others", "--exclude-standard", "-z"],
         capture_output=True, timeout=60,
     )
     if listed.returncode == 0:
@@ -2897,37 +3075,39 @@ def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
                 continue
             rel = raw.decode("utf-8", errors="replace")
             try:
-                with (Path(worktree_path) / rel).open("rb") as handle:
-                    content = handle.read()
+                content = (Path(worktree_root) / rel).read_bytes()
             except OSError:
                 continue
-            text = content.decode("utf-8", errors="replace")
-            artifact_path = artifact(agent_id, "untracked_" + rel.replace("/", "_").replace("\\", "_"), text)
-            untracked.append({"path": rel, "artifact": artifact_path})
+            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", rel)[:100] or "file"
+            artifact_path = artifact_bytes(agent_id, "untracked_" + safe_label, content)
+            untracked.append({
+                "path": rel,
+                "artifact": artifact_path,
+                "encoding": "base64",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            })
     return patch_path, untracked
 
 
-def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None) -> dict:
-    """Create a single agent: limits, task/agent/turn/search_index rows, enqueue, viewer.
 
-    Shared by create_agent and create_agents. Callers are responsible for
-    validating agent_name/prompt and resolving cwd.
-    """
+def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None) -> dict:
+    """Create a single agent with optional isolated worktree."""
     agent_id = str(uuid.uuid4())
     defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns)
-    prompt_effective = prompt + defaults["prompt_suffix"]
+    prompt_effective = prompt + defaults["prompt_suffix"] + worker_coordination_instructions()
     thread_id = context.get("codex_thread_id") or "unknown"
     stamp = now()
     original_cwd_value = str(Path(cwd).resolve())
-    worktree_path = None
+    worktree_path = None  # worker cwd (legacy/public compatibility)
+    worktree_root = None
     worktree_meta = {}
     try:
         if eff_worktree:
-            # Cheap limit pre-check BEFORE the worktree exists on disk.
+            # Cheap limit pre-check BEFORE creating disk/git resources.
             with CREATE_LOCK, connect() as db:
                 thread_active = db.execute(
-                    "SELECT COUNT(*) AS c FROM agents "
-                    "WHERE thread_id=? AND status IN ('queued','running')",
+                    "SELECT COUNT(*) AS c FROM agents WHERE thread_id=? AND status IN ('queued','running')",
                     (thread_id,),
                 ).fetchone()["c"]
                 if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
@@ -2943,13 +3123,15 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                         f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
                         f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
                     )
-            worktree_path, worktree_meta = create_agent_worktree(Path(original_cwd_value), agent_id, Path(original_cwd_value))
+            worktree_path, worktree_meta = create_agent_worktree(
+                Path(original_cwd_value), agent_id, Path(original_cwd_value)
+            )
+            worktree_root = worktree_meta.get("worktree_root")
             cwd = worktree_path
+
         with CREATE_LOCK, connect() as db:
-            # 1) Per-conversation (thread) cap — primary product limit.
             thread_active = db.execute(
-                "SELECT COUNT(*) AS c FROM agents "
-                "WHERE thread_id=? AND status IN ('queued','running')",
+                "SELECT COUNT(*) AS c FROM agents WHERE thread_id=? AND status IN ('queued','running')",
                 (thread_id,),
             ).fetchone()["c"]
             if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
@@ -2957,7 +3139,6 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                     f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
                     f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
                 )
-            # 2) Global safety net across all conversations.
             active_count = db.execute(
                 "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
             ).fetchone()["c"]
@@ -2966,33 +3147,46 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                     f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
                     f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
                 )
-            # Same cwd is allowed (parallel subagents); used only for soft warning.
             same_cwd = db.execute(
                 "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
                 (cwd,),
             ).fetchall()
             task_title = str(codex_thread_title or "").strip() or thread_id
             display_title = derive_display_title(agent_name, prompt)
+            # Task/project metadata remains anchored to the user's original cwd;
+            # an isolated worker cwd is an execution detail, not the conversation root.
             db.execute(
                 "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
+                (thread_id, task_title, original_cwd_value, context.get("codex_origin", "Codex"), stamp, stamp),
             )
-            # Refresh path/title for known threads; keep user pin/archive flags.
             db.execute(
                 "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
-                (task_title, cwd, stamp, thread_id),
+                (task_title, original_cwd_value, stamp, thread_id),
             )
             db.execute(
-                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,worktree_path,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?)",
-                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, secrets.token_urlsafe(32), eff_max_turns, str(cwd) if eff_worktree else None, worktree_meta.get("original_cwd"), worktree_meta.get("repo_root"), worktree_meta.get("repo_rel_cwd"), worktree_meta.get("worktree_base_sha"), "worktree" if eff_worktree else "shared", stamp, stamp),
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,"
+                "worktree_path,worktree_root,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    agent_id, thread_id, agent_name, cwd, agent_id, display_title,
+                    secrets.token_urlsafe(32), eff_max_turns,
+                    str(cwd) if eff_worktree else None,
+                    worktree_root,
+                    worktree_meta.get("original_cwd"), worktree_meta.get("repo_root"),
+                    worktree_meta.get("repo_rel_cwd"), worktree_meta.get("worktree_base_sha"),
+                    "worktree" if eff_worktree else "shared", stamp, stamp,
+                ),
             )
-            cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt_effective, stamp))
+            cursor = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)",
+                (agent_id, prompt_effective, stamp),
+            )
             turn_id = cursor.lastrowid
             db.execute(
                 "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
                 (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt_effective}\n{thread_id}\n{task_title}"),
             )
+
         if worktree_meta.get("dirty_parent"):
             add_event(
                 agent_id,
@@ -3003,7 +3197,11 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
             )
         with CONDITIONS_LOCK:
             CONDITIONS[agent_id] = threading.Condition()
-        rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
+        rule_sources = [
+            str(path)
+            for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md")
+            if path.exists()
+        ]
         add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
         if same_cwd:
             add_event(
@@ -3020,7 +3218,6 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
         assert runner is not None
         with CREATE_LOCK:
             if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
-                # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
                 with connect() as db:
                     db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                     db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
@@ -3032,10 +3229,16 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
             runner.enqueue(turn_id, prompt_effective)
         opened = ensure_viewer(agent_id)
     except Exception:
-        if worktree_path:
-            remove_agent_worktree(worktree_meta.get("repo_root"), worktree_path)
+        cleanup_target = worktree_root or worktree_path
+        if cleanup_target:
+            remove_agent_worktree(worktree_meta.get("repo_root"), cleanup_target)
         raise
-    return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
+    return {
+        "agent_id": agent_id,
+        "status": "queued",
+        "viewer_url": f"{viewer_url()}/#/agents/{agent_id}",
+        "browser_opened": opened,
+    }
 
 
 def action(name: str, args: dict, context: dict) -> dict:
@@ -3316,8 +3519,8 @@ def action(name: str, args: dict, context: dict) -> dict:
             agent = rowdict(
                 db.execute(
                     "SELECT id,name,status,revision,updated_at,signoff_verdict,final_text,error,"
-                    "signoff_summary,verification,worktree_path,worktree_base_sha,repo_root,"
-                    "original_cwd FROM agents WHERE id=?",
+                    "signoff_summary,verification,cwd,worktree_path,worktree_root,worktree_base_sha,repo_root,"
+                    "repo_rel_cwd,original_cwd FROM agents WHERE id=?",
                     (args.get("agent_id"),),
                 ).fetchone()
             )
@@ -3363,13 +3566,16 @@ def action(name: str, args: dict, context: dict) -> dict:
                 "changes": changes,
             })
             isolation = {"mode": "shared"}
-            if agent.get("worktree_path"):
+            if agent.get("worktree_root") or agent.get("worktree_path"):
                 patch_path, untracked = build_worktree_result(agent["id"])
                 isolation = {
                     "mode": "worktree",
                     "base_sha": agent.get("worktree_base_sha"),
                     "repo_root": agent.get("repo_root"),
                     "original_cwd": agent.get("original_cwd"),
+                    "repo_rel_cwd": agent.get("repo_rel_cwd"),
+                    "worktree_root": agent.get("worktree_root"),
+                    "worker_cwd": agent.get("cwd") or agent.get("worktree_path"),
                     "worktree_path": agent.get("worktree_path"),
                     "patch_artifact": patch_path,
                     "untracked_artifacts": untracked,
@@ -3700,15 +3906,16 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if match:
             agent_id = match.group(1)
             with connect() as db:
-                agent = db.execute("SELECT id,status,worktree_path,repo_root FROM agents WHERE id=?", (agent_id,)).fetchone()
+                agent = db.execute("SELECT id,status,worktree_path,worktree_root,repo_root FROM agents WHERE id=?", (agent_id,)).fetchone()
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 if agent["status"] in {"queued", "running"}:
                     return json_response(self, {"error": "running agents cannot be removed from the observer"}, 409)
             # Reclaim in-memory resources before deleting durable state.
             reclaim_agent_resources(agent_id)
-            if agent["worktree_path"]:
-                remove_agent_worktree(agent["repo_root"], agent["worktree_path"])
+            cleanup_target = agent["worktree_root"] or agent["worktree_path"]
+            if cleanup_target:
+                remove_agent_worktree(agent["repo_root"], cleanup_target)
             with connect() as db:
                 db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                 db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
@@ -4233,26 +4440,32 @@ def delete_orphan_tasks(db) -> None:
     )
 
 
+
 def cleanup() -> None:
-    """Delete expired terminal agents only; reclaim runners/conditions/threads first."""
+    """Delete expired terminal agents; reclaim worktree roots correctly."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
     with connect() as db:
         ids = [
-            (row["id"], row["worktree_path"], row["repo_root"])
+            (row["id"], row["worktree_root"], row["worktree_path"], row["repo_root"])
             for row in db.execute(
-                "SELECT id, worktree_path, repo_root FROM agents WHERE updated_at<? AND status NOT IN ('running','queued')",
+                "SELECT id,worktree_root,worktree_path,repo_root FROM agents "
+                "WHERE updated_at<? AND status NOT IN ('running','queued')",
                 (cutoff,),
             )
         ]
-    for agent_id, worktree_path, repo_root in ids:
+    for agent_id, worktree_root, worktree_path, repo_root in ids:
         reclaim_agent_resources(agent_id)
-        if worktree_path:
-            remove_agent_worktree(repo_root, worktree_path)
+        cleanup_target = worktree_root or worktree_path
+        if cleanup_target:
+            remove_agent_worktree(repo_root, cleanup_target)
         with connect() as db:
             db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
             db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
         shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
+
     with connect() as db:
+        # Preserve the existing mailbox-history retention contract in this
+        # focused fix. Message expiry / failed-recipient policy remains a P2.
         delete_orphan_tasks(db)
         if ids:
             try:
@@ -4270,77 +4483,107 @@ def cleanup_loop() -> None:
             print(f"cleanup failed: {exc}", file=sys.stderr, flush=True)
 
 
-def recover() -> None:
-    """On daemon restart: kill recorded orphan children and fail in-flight agents."""
+
+def recover(*, start_runners: bool = True) -> None:
+    """Repair crash state without destroying durable queued turns.
+
+    Only turns that were actually `running` at daemon death are failed. Queued
+    turns remain queued and are resumed after the control ports are bound.
+    """
     with connect() as db:
         stale = db.execute(
-            "SELECT id, child_pid, child_started_at FROM agents WHERE status IN ('running','queued')"
+            "SELECT id,child_pid,child_started_at FROM agents WHERE status='running'"
         ).fetchall()
+
     for row in stale:
         agent_id = row["id"]
         child_pid = row["child_pid"]
         reaped = False
         skipped_reuse = False
+        pid = 0
         if child_pid is not None:
             try:
                 pid = int(child_pid)
             except (TypeError, ValueError):
                 pid = 0
             if pid > 0 and pid_is_alive(pid):
-                # Guard against PID reuse: only kill if the live process's creation
-                # time still matches what we recorded for this child (±2s tolerance).
                 expected = row["child_started_at"]
                 actual = process_create_time(pid)
                 if expected is not None and actual is not None:
                     try:
-                        mismatch = abs(actual - float(expected)) > 2.0
+                        skipped_reuse = abs(actual - float(expected)) > 2.0
                     except (TypeError, ValueError):
-                        mismatch = False
-                    if mismatch:
-                        skipped_reuse = True
+                        skipped_reuse = False
                 if not skipped_reuse:
                     terminate_pid(pid)
                     reaped = True
-        error = "Observer daemon restarted before completion"
+
+        error = "Observer daemon restarted during a running turn"
         if reaped:
             error += f"; orphan process reaped (pid={pid})"
         elif skipped_reuse:
             error += f"; recorded pid={pid} was reused by another process, not killed"
         stamp = now()
         with connect() as db:
-            db.execute(
-                "UPDATE agents SET status='failed',error=?,child_pid=NULL,updated_at=?,revision=revision+1 WHERE id=?",
-                (error, stamp, agent_id),
-            )
+            # Do not fail durable queued turns. A running turn may have partial
+            # external side effects, so conservative recovery still fails it.
             db.execute(
                 "UPDATE turns SET status='failed',completed_at=COALESCE(completed_at, ?) "
-                "WHERE agent_id=? AND status IN ('queued','running')",
+                "WHERE agent_id=? AND status='running'",
                 (stamp, agent_id),
             )
-    # Delivery recovery (after the fail loop so its turn updates are visible):
-    # (a) Release message claims owned by failed turns (daemon died mid-delivery).
+            queued_left = int(
+                db.execute(
+                    "SELECT COUNT(*) AS c FROM turns WHERE agent_id=? AND status='queued'",
+                    (agent_id,),
+                ).fetchone()["c"]
+            )
+            db.execute(
+                "UPDATE agents SET status=?,error=?,child_pid=NULL,current_turn=NULL,updated_at=?,revision=revision+1 "
+                "WHERE id=?",
+                ("queued" if queued_left else "failed", error, stamp, agent_id),
+            )
+
+    # A delivery claim attached to a failed pre-crash running turn must be made
+    # visible again. Claims attached to queued turns are intentionally preserved.
     with connect() as db:
         db.execute(
             "UPDATE agent_messages SET target_turn_id=NULL "
             "WHERE state='pending' AND target_turn_id IN (SELECT id FROM turns WHERE status='failed')"
         )
-    # (c) Sweep completed workers with pending unscheduled messages.
+
+    if start_runners:
+        recover_runners()
+
+
+def recover_runners() -> None:
+    """Start post-recovery schedulers/runners after worker control ports are live."""
+    # First turn unscheduled pending mail for idle completed workers into durable
+    # queued turns. maybe_schedule_delivery itself is idempotent per target.
     with connect() as db:
         peers = [
             row["to_peer"]
             for row in db.execute(
-                "SELECT DISTINCT to_peer FROM agent_messages WHERE state='pending' AND target_turn_id IS NULL"
+                "SELECT DISTINCT m.to_peer FROM agent_messages m "
+                "JOIN agents a ON a.id=m.to_peer "
+                "WHERE m.state='pending' AND m.consumed_at IS NULL "
+                "AND m.target_turn_id IS NULL AND a.status='completed'"
             )
         ]
     for peer in peers:
         maybe_schedule_delivery(peer)
-    # (b) Wake runners for durable queued turns: the DB is the source of truth,
-    # so a fresh runner's _work poll picks up anything enqueue() missed.
+
     with connect() as db:
         agent_ids = [
             row["agent_id"]
             for row in db.execute("SELECT DISTINCT agent_id FROM turns WHERE status='queued'")
         ]
+        for agent_id in agent_ids:
+            db.execute(
+                "UPDATE agents SET status='queued',updated_at=? "
+                "WHERE id=? AND status NOT IN ('cancelled','running')",
+                (now(), agent_id),
+            )
     for agent_id in agent_ids:
         get_runner(agent_id)
 
@@ -4374,8 +4617,7 @@ def main() -> None:
     print(f"observer daemon starting pid={os.getpid()}", file=sys.stderr, flush=True)
     init_db()
     cleanup()
-    recover()
-    threading.Thread(target=cleanup_loop, daemon=True).start()
+    recover(start_runners=False)
 
     # Prefer the configured control port; only fall back if it is free and we own the lock.
     server = None
@@ -4407,6 +4649,9 @@ def main() -> None:
         print("worker control server unavailable (no free port)", file=sys.stderr, flush=True)
 
     write_state()
+    # Recovered workers receive the actual bound worker-control port.
+    recover_runners()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
     try:
         server.serve_forever()
     finally:

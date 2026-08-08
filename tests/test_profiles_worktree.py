@@ -8,6 +8,7 @@ max_turns validation.
 
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 import os
@@ -436,9 +437,14 @@ class ProfilesWorktreeTest(_IsolatedDbMixin, unittest.TestCase):
         self.assertEqual(self._normpath(isolation["original_cwd"]), self._normpath(repo.resolve()))
         self.assertEqual(self._normpath(isolation["worktree_path"]), self._normpath(worktree_path))
         self.assertIsNotNone(isolation["patch_artifact"])
+        untracked_entry = isolation["untracked_artifacts"][0]
+        self.assertEqual(untracked_entry["path"], "new.txt")
+        self.assertTrue(untracked_entry["artifact"].endswith(".txt.gz"))
+        self.assertEqual(untracked_entry["size"], len("fresh content\n".encode("utf-8")))
+        import hashlib
         self.assertEqual(
-            isolation["untracked_artifacts"],
-            [{"path": "new.txt", "artifact": isolation["untracked_artifacts"][0]["artifact"]}],
+            untracked_entry["sha256"],
+            hashlib.sha256("fresh content\n".encode("utf-8")).hexdigest(),
         )
         self.assertIn("tracked.txt", isolation["changed_files"])
         # The patch artifact must replay cleanly onto a fresh clone at base_sha.
@@ -448,7 +454,7 @@ class ProfilesWorktreeTest(_IsolatedDbMixin, unittest.TestCase):
         self.assertIn("appended", patch_text)
         untracked_rel = isolation["untracked_artifacts"][0]["artifact"]
         with gzip.open(daemon.ROOT / untracked_rel, "rt", encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "fresh content\n")
+            self.assertEqual(base64.b64decode(handle.read()), b"fresh content\n")
         clone_dir = self.folder / "clone"
         subprocess.run(["git", "clone", str(repo), str(clone_dir)], check=True, capture_output=True)
         subprocess.run(["git", "checkout", head], cwd=clone_dir, check=True, capture_output=True)

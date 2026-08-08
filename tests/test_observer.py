@@ -1296,7 +1296,7 @@ class ChildPidRecoverTest(_IsolatedDbMixin, unittest.TestCase):
             )
 
         try:
-            daemon.recover()
+            daemon.recover(start_runners=False)
             deadline = time.time() + 3
             while time.time() < deadline and daemon.pid_is_alive(alive.pid):
                 time.sleep(0.05)
@@ -1307,11 +1307,13 @@ class ChildPidRecoverTest(_IsolatedDbMixin, unittest.TestCase):
                 self.assertEqual(a["status"], "failed")
                 self.assertIsNone(a["child_pid"])
                 self.assertIn("orphan process reaped", a["error"] or "")
-                self.assertEqual(d["status"], "failed")
-                self.assertIsNone(d["child_pid"])
-                self.assertIn("restarted", (d["error"] or "").lower())
                 turn_a = db.execute("SELECT status FROM turns WHERE agent_id=?", (alive_id,)).fetchone()
                 self.assertEqual(turn_a["status"], "failed")
+                # Durable queued turns survive restart: the queued agent and its
+                # turn are preserved (not failed) so they can resume.
+                self.assertEqual(d["status"], "queued")
+                turn_d = db.execute("SELECT status FROM turns WHERE agent_id=?", (dead_id,)).fetchone()
+                self.assertEqual(turn_d["status"], "queued")
         finally:
             if daemon.pid_is_alive(alive.pid):
                 daemon.terminate_pid(alive.pid)
@@ -1905,7 +1907,9 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
         self.assertTrue(final["done"], final)
         result = daemon.action("result", {"agent_id": agent_id}, {})
         prompts = [t["prompt"] for t in result["turn_results"]]
-        self.assertEqual(prompts[0], "multi")
+        # The base prompt carries the auto-injected coordination fallback hint.
+        self.assertTrue(prompts[0].startswith("multi"))
+        self.assertIn("[Agent Fabric coordination]", prompts[0])
         self.assertIn("first", prompts)
         self.assertIn("second", prompts)
         # Independent replacement turns, order preserved after the interrupted base turn.

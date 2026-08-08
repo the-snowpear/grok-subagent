@@ -10,6 +10,7 @@ idempotent delivery, and the CLI request payload shape.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -449,6 +450,10 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
                 "GROK_OBSERVER_AGENT_TOKEN": token,
                 # Workers must get the worker control port, never the host port.
                 "GROK_OBSERVER_WORKER_CONTROL_PORT": str(daemon.ACTUAL_WORKER_CONTROL_PORT),
+                # Fallback hub discovery for current grok -p workers.
+                "GROK_OBSERVER_HUB_CLI": str(daemon.ROOT / "grok_hub.py"),
+                "GROK_OBSERVER_NATIVE_BRIDGE": str(daemon.ROOT / "native_bridge.py"),
+                "GROK_OBSERVER_PYTHON": sys.executable,
             },
         )
         self.assertNotIn("GROK_OBSERVER_CONTROL_PORT", env)
@@ -463,6 +468,10 @@ class WorkerBridgeTest(_IsolatedDbMixin, unittest.TestCase):
         self.assertEqual(env["GROK_OBSERVER_AGENT_ID"], worker_id)
         self.assertTrue(env["GROK_OBSERVER_AGENT_TOKEN"])
         self.assertEqual(env["GROK_OBSERVER_WORKER_CONTROL_PORT"], str(daemon.ACTUAL_WORKER_CONTROL_PORT))
+        self.assertNotIn("GROK_OBSERVER_CONTROL_PORT", env)
+        self.assertEqual(env["GROK_OBSERVER_HUB_CLI"], str(daemon.ROOT / "grok_hub.py"))
+        self.assertEqual(env["GROK_OBSERVER_NATIVE_BRIDGE"], str(daemon.ROOT / "native_bridge.py"))
+        self.assertEqual(env["GROK_OBSERVER_PYTHON"], sys.executable)
         stored = self._hub_token(worker_id)
         self.assertTrue(stored)
         self.assertEqual(stored, env["GROK_OBSERVER_AGENT_TOKEN"])

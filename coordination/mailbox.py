@@ -5,11 +5,8 @@ Critical invariants:
 - send commits before notify.
 - inbox drain is atomic.
 - wait has no send-between-query-and-sleep lost wakeup.
-
-The connect factory must accept a keyword-only `immediate: bool = False`.
-With immediate=True it yields a BEGIN IMMEDIATE write transaction (PRAGMAs
-run first) that commits on clean exit and rolls back on exception; with
-False it behaves like daemon.connect().
+- messages claimed by an automatic delivery turn are hidden from inbox/wait;
+  a pre-spawn failure releases the claim and makes them visible again.
 """
 
 from __future__ import annotations
@@ -105,8 +102,6 @@ class Mailbox:
 
         message_id = str(uuid.uuid4())
         created_at = self._now()
-
-        # IMPORTANT: commit before notify.
         with self._connect() as db:
             db.execute(
                 """
@@ -115,8 +110,7 @@ class Mailbox:
                     kind, body, reply_to, delivery_mode,
                     state, target_turn_id, error,
                     created_at, delivered_at, consumed_at
-                )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     message_id,
@@ -137,7 +131,6 @@ class Mailbox:
             )
 
         self.notify(to_peer)
-
         message = Message(
             id=message_id,
             thread_id=thread_id,
@@ -155,73 +148,44 @@ class Mailbox:
             consumed_at=None,
         )
 
-        # Post-commit hook (outside any DB transaction): lets the daemon
-        # schedule delivery without racing the insert.
+        # The row is already durable. Scheduling is a best-effort wake path;
+        # reporting the send as failed after commit encourages client retries and
+        # duplicates. Startup/terminal sweeps can schedule it later.
         if self._on_message_committed is not None:
-            self._on_message_committed(message)
-
+            try:
+                self._on_message_committed(message)
+            except Exception:
+                pass
         return message
 
-    def pending_for_delivery(
-        self,
-        *,
-        to_peer: str,
-        limit: int = MAX_INBOX_MESSAGES,
-    ) -> list[Message]:
-        """Oldest-first pending messages not yet claimed by a delivery turn."""
-        with self._connect() as db:
-            rows = db.execute(
-                """
-                SELECT *
-                FROM agent_messages
-                WHERE to_peer=? AND state='pending' AND target_turn_id IS NULL
-                ORDER BY created_at ASC, id ASC
-                LIMIT ?
-                """,
-                (to_peer, max(1, min(limit, MAX_INBOX_MESSAGES))),
-            ).fetchall()
-        return [self._row_to_message(row) for row in rows]
+    def mark_delivered_for_turn(self, *, turn_id: int) -> int:
+        """Mark auto-injected messages delivered *and consumed*.
 
-    def schedule_messages(
-        self,
-        *,
-        thread_id: str,
-        message_ids: list[str],
-        turn_id: int,
-    ) -> int:
-        """Claim pending messages for a delivery turn.
-
-        The conditional UPDATE means concurrent schedulers cannot double-claim:
-        only messages still pending with no target turn are assigned, and the
-        rowcount reflects exactly the claimed set.
+        A worker that received the message in its follow-up prompt must not see
+        the same message again through inbox/wait.
         """
-        if not message_ids:
-            return 0
-        placeholders = ",".join("?" for _ in message_ids)
-        with self._connect(immediate=True) as db:
+        stamp = self._now()
+        with self._connect() as db:
             cursor = db.execute(
-                f"""
+                """
                 UPDATE agent_messages
-                SET target_turn_id=?
-                WHERE id IN ({placeholders})
-                  AND state='pending'
-                  AND target_turn_id IS NULL
+                SET state='delivered', delivered_at=?, consumed_at=COALESCE(consumed_at, ?)
+                WHERE target_turn_id=? AND state='pending'
                 """,
-                (turn_id, *message_ids),
+                (stamp, stamp, turn_id),
             )
             return cursor.rowcount
 
-    def mark_delivered_for_turn(self, *, turn_id: int) -> int:
-        """Mark all pending messages linked to a delivery turn as delivered."""
-        delivered_at = self._now()
+    def release_scheduled_for_turn(self, *, turn_id: int) -> int:
+        """Release claims for a delivery turn that failed before child spawn."""
         with self._connect() as db:
             cursor = db.execute(
                 """
                 UPDATE agent_messages
-                SET state='delivered', delivered_at=?
-                WHERE target_turn_id=? AND state='pending'
+                SET target_turn_id=NULL
+                WHERE target_turn_id=? AND state='pending' AND consumed_at IS NULL
                 """,
-                (delivered_at, turn_id),
+                (turn_id,),
             )
             return cursor.rowcount
 
@@ -232,19 +196,22 @@ class Mailbox:
         from_peer: str | None = None,
         limit: int = MAX_INBOX_MESSAGES,
     ) -> list[Message]:
-        where = ["to_peer=?", "consumed_at IS NULL"]
+        where = [
+            "to_peer=?",
+            "state='pending'",
+            "consumed_at IS NULL",
+            "target_turn_id IS NULL",
+        ]
         params: list[object] = [peer_id]
         if from_peer is not None:
             where.append("from_peer=?")
             params.append(from_peer)
-
+        params.append(max(1, min(limit, MAX_INBOX_MESSAGES)))
         sql = (
             "SELECT * FROM agent_messages "
             f"WHERE {' AND '.join(where)} "
             "ORDER BY created_at ASC, id ASC LIMIT ?"
         )
-        params.append(max(1, min(limit, MAX_INBOX_MESSAGES)))
-
         with self._connect() as db:
             rows = db.execute(sql, tuple(params)).fetchall()
 
@@ -253,10 +220,10 @@ class Mailbox:
         for row in rows:
             msg = self._row_to_message(row)
             size = len(msg.body.encode("utf-8"))
-            # Oldest-first within the byte cap; a single message (even one
-            # larger than the cap) is always returned alone, never dropped.
             if result and used + size > MAX_INBOX_BYTES:
                 break
+            # Never silently lose a single message because it alone is larger
+            # than the aggregate inbox byte cap.
             result.append(msg)
             used += size
         return result
@@ -265,18 +232,15 @@ class Mailbox:
         if peek:
             return self._select_unconsumed(peer_id=peer_id)
 
-        # IMPORTANT: one atomic write transaction covering SELECT -> choose
-        # ids -> mark exactly those ids consumed. BEGIN IMMEDIATE reserves
-        # the write lock so two concurrent drains cannot both claim the same
-        # rows; errors propagate to the caller (the factory rolls back).
         stamp = self._now()
-
         with self._connect(immediate=True) as db:
             rows = db.execute(
                 """
-                SELECT *
-                FROM agent_messages
-                WHERE to_peer=? AND consumed_at IS NULL
+                SELECT * FROM agent_messages
+                WHERE to_peer=?
+                  AND state='pending'
+                  AND consumed_at IS NULL
+                  AND target_turn_id IS NULL
                 ORDER BY created_at ASC, id ASC
                 LIMIT ?
                 """,
@@ -298,11 +262,13 @@ class Mailbox:
                     """
                     UPDATE agent_messages
                     SET state='consumed', consumed_at=?
-                    WHERE id=? AND consumed_at IS NULL
+                    WHERE id=?
+                      AND state='pending'
+                      AND consumed_at IS NULL
+                      AND target_turn_id IS NULL
                     """,
                     (stamp, msg.id),
                 )
-
         return selected
 
     def wait(
@@ -328,8 +294,7 @@ class Mailbox:
             with state.condition:
                 before = state.revision
 
-            # Second DB check closes:
-            # query empty -> sender commit+notify -> waiter begins waiting.
+            # Second DB check closes query-empty -> commit+notify -> sleep.
             messages = self._select_unconsumed(
                 peer_id=peer_id,
                 from_peer=from_peer,
@@ -352,7 +317,6 @@ class Mailbox:
         peer_id: str,
         from_peer: str | None = None,
     ) -> Message | None:
-        """Non-consuming peek at the oldest unconsumed message; used by unified wait."""
         messages = self._select_unconsumed(
             peer_id=peer_id,
             from_peer=from_peer,
@@ -361,13 +325,11 @@ class Mailbox:
         return messages[0] if messages else None
 
     def wait_surface(self, peer_id: str) -> tuple[threading.Condition, int]:
-        """Expose the per-peer condition and current revision for external waiters (unified wait)."""
         state = self._wait_state(peer_id)
         with state.condition:
             return state.condition, state.revision
 
     def revision(self, peer_id: str) -> int:
-        """Current mailbox revision for the peer."""
         state = self._wait_state(peer_id)
         with state.condition:
             return state.revision
