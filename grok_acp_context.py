@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
+import shutil
 import subprocess
 import threading
 import time
@@ -25,7 +27,24 @@ from typing import Any
 
 
 class AcpProbeError(RuntimeError):
-    """Raised when the disposable ACP probe cannot complete safely."""
+    """Raised when the disposable ACP probe cannot complete safely.
+
+    ``code``/``method``/``data`` carry the structured JSON-RPC error details
+    when the failure came from an error response; they are ``None`` otherwise.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        method: str | None = None,
+        data: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.method = method
+        self.data = data
 
 
 _EOF = object()
@@ -52,12 +71,22 @@ def context_summary(info: dict[str, Any]) -> str:
 class _JsonRpcStdio:
     """Small newline-delimited JSON-RPC client with bounded waits."""
 
-    def __init__(self, cwd: Path, env: dict[str, str], timeout: float = 8.0):
+    def __init__(
+        self,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float = 8.0,
+        executable: str | None = None,
+    ):
         self.timeout = max(2.0, float(timeout))
+        # The cache identity resolves to this exact path, so the probe must
+        # Popen the same executable to keep the cache key and launch target
+        # consistent. Falls back to PATH lookup of "grok" for standalone use.
+        self.executable = executable or "grok"
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             self.proc = subprocess.Popen(
-                ["grok", "agent", "--always-approve", "stdio"],
+                [self.executable, "agent", "--always-approve", "stdio"],
                 cwd=str(cwd),
                 env=env,
                 stdin=subprocess.PIPE,
@@ -135,9 +164,18 @@ class _JsonRpcStdio:
                 error = item.get("error")
                 if isinstance(error, dict):
                     detail = error.get("message") or error.get("data") or error
+                    code = error.get("code")
+                    data = error.get("data")
                 else:
                     detail = error
-                raise AcpProbeError(f"ACP {method} failed: {detail}")
+                    code = None
+                    data = None
+                raise AcpProbeError(
+                    f"ACP {method} failed: {detail}",
+                    code=code,
+                    method=method,
+                    data=data,
+                )
             return item.get("result")
 
     def close(self) -> None:
@@ -187,8 +225,15 @@ def probe_session_context(
     *,
     env: dict[str, str] | None = None,
     timeout: float = 8.0,
+    executable: str | None = None,
 ) -> dict[str, Any]:
-    """Load a persisted Grok session and return its SessionInfoResponse."""
+    """Load a persisted Grok session and return its SessionInfoResponse.
+
+    ``executable`` is the resolved grok binary path used by the ACP probe; it
+    defaults to PATH lookup of ``grok`` when omitted. Callers that key the
+    negative cache by ``grok_binary_identity()`` must pass ``identity[0]`` so
+    the launched process matches the cached identity.
+    """
     sid = str(session_id or "").strip()
     if not sid:
         raise AcpProbeError("missing Grok session id")
@@ -202,7 +247,7 @@ def probe_session_context(
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
     deadline = time.monotonic() + max(3.0, float(timeout))
 
-    with _JsonRpcStdio(workdir, child_env, timeout=timeout) as rpc:
+    with _JsonRpcStdio(workdir, child_env, timeout=timeout, executable=executable) as rpc:
         init_raw = rpc.request(
             "initialize",
             {
@@ -251,3 +296,141 @@ def probe_session_context(
         if not context or not int(context.get("total") or 0):
             raise AcpProbeError("x.ai/session/info returned no context snapshot")
         return info
+
+
+_UNSUPPORTED_METHOD = "x.ai/session/info"
+_JSONRPC_METHOD_NOT_FOUND = -32601
+
+_VERSION_PATTERN = re.compile(r"(\d+(?:\.\d+)*)")
+_MISSING = object()
+
+# Version lookup is memoized per (path, size, mtime_ns). Replacing the binary
+# changes the fingerprint, which forces a fresh lookup and a new identity, so a
+# cached "unsupported" verdict does not survive a grok upgrade.
+_version_memo: dict[tuple[str, int, int], str | None] = {}
+_version_memo_lock = threading.Lock()
+# Full identity per resolved path, reused while the stat fingerprint is
+# unchanged, so steady-state turns only pay a cheap path/stat + dict lookup.
+_identity_cache: dict[str, tuple[str, str | None, int, int]] = {}
+_identity_cache_lock = threading.Lock()
+
+
+def _run_grok_version(path: Path) -> str | None:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        completed = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3.0,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    blob = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    match = _VERSION_PATTERN.search(blob)
+    return match.group(1) if match else None
+
+
+def _version_for(path: Path, st: Any) -> str | None:
+    memo_key = (str(path), st.st_size, st.st_mtime_ns)
+    with _version_memo_lock:
+        version = _version_memo.get(memo_key, _MISSING)
+    if version is _MISSING:
+        version = _run_grok_version(path)
+        with _version_memo_lock:
+            _version_memo.setdefault(memo_key, version)
+    return version
+
+
+def grok_binary_identity(
+    *, resolve_version: bool = True
+) -> tuple[str, str | None, int, int] | None:
+    """Return a cheap identity for the resolved ``grok`` executable.
+
+    Identity is ``(resolved absolute path, version, size, mtime_ns)``; the
+    resolved path is exactly the executable the ACP probe will Popen, keeping
+    the cache key and launch target consistent. ``version`` is looked up at
+    most once per (path, size, mtime) via a memoized ``grok --version`` call,
+    and the full identity is reused while the stat fingerprint is unchanged,
+    so later turns cost only a path/stat check.
+
+    Pass ``resolve_version=False`` for a scheduler-side pre-check that never
+    spawns a subprocess: it returns the memoized identity only when the
+    fingerprint is unchanged, otherwise ``None`` so the probe worker resolves
+    the fresh identity itself. Returns ``None`` when ``grok`` cannot be
+    resolved.
+    """
+    exe = shutil.which("grok")
+    if not exe:
+        return None
+    try:
+        resolved = Path(exe).resolve()
+        st = resolved.stat()
+    except OSError:
+        return None
+    key = str(resolved)
+    with _identity_cache_lock:
+        cached = _identity_cache.get(key)
+    if cached is not None and cached[2] == st.st_size and cached[3] == st.st_mtime_ns:
+        return cached
+    if not resolve_version:
+        return None
+    version = _version_for(resolved, st)
+    identity = (key, version, st.st_size, st.st_mtime_ns)
+    with _identity_cache_lock:
+        _identity_cache[key] = identity
+    return identity
+
+
+def probe_is_unsupported(err: Any) -> bool:
+    """True only for a definitive JSON-RPC ``-32601`` on ``x.ai/session/info``."""
+    return (
+        isinstance(err, AcpProbeError)
+        and err.code == _JSONRPC_METHOD_NOT_FOUND
+        and err.method == _UNSUPPORTED_METHOD
+    )
+
+
+class AcpUnsupportedCache:
+    """Process-local negative cache for definitively unsupported ACP methods.
+
+    A thread-safe, in-memory-only set of ``(identity, method)`` keys. Nothing
+    is ever written to disk, so a process restart always re-probes. Only a
+    real probe that received JSON-RPC ``-32601`` for the method may record an
+    entry.
+    """
+
+    def __init__(self) -> None:
+        self._entries: set[tuple[Any, str]] = set()
+        self._lock = threading.Lock()
+
+    def record_unsupported(self, identity: Any, method: str) -> bool:
+        """Remember that ``method`` is unsupported for ``identity``.
+
+        Returns True when a new entry was actually added (first time for this
+        identity/method), False when it was already recorded.
+        """
+        key = (identity, method)
+        with self._lock:
+            if key in self._entries:
+                return False
+            self._entries.add(key)
+            return True
+
+    def is_unsupported(self, identity: Any, method: str) -> bool:
+        with self._lock:
+            return (identity, method) in self._entries
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+acp_unsupported_cache = AcpUnsupportedCache()

@@ -111,13 +111,24 @@ when no response usage was seen. The disposable ACP probe does **not** use
 `x.ai/session/usage` for lifetime totals because Grok documents that its in-memory usage
 ledger resets when a persisted session is resumed in a new agent process.
 
+Real grok 1.0.0's `grok agent stdio` runtime does not expose `x.ai/session/info` and
+answers with JSON-RPC `-32601 Method not found`. When the first real probe in an observer
+process receives exactly that error for `x.ai/session/info`, the observer records the
+method as unsupported in a **process-local** negative cache keyed by the resolved `grok`
+executable (path, version, size, mtime). Later terminal turns skip the disposable ACP
+process entirely. The cache is never written to disk — restarting the observer, or
+replacing/upgrading the `grok` binary so its path/size/mtime changes, invalidates it and
+probing is retried. Timeouts, auth failures, network errors, invalid-params, and
+process-start failures are never cached; only a definitive `-32601` for
+`x.ai/session/info` is.
+
 Environment variables:
 
 | Variable | Default | Purpose |
 |---|---:|---|
 | `GROK_OBSERVER_CONTEXT_TELEMETRY` | `1` | Set `0`/`false`/`no`/`off` to disable the post-turn ACP ContextInfo probe. |
 | `GROK_OBSERVER_CONTEXT_PROBE_TIMEOUT` | `8` | ACP probe timeout in seconds (clamped to 2-20). |
-| `GROK_OBSERVER_CONTEXT_DEBUG` | unset | When non-empty, write skipped/failed context-probe diagnostics to stderr. |
+| `GROK_OBSERVER_CONTEXT_DEBUG` | unset | When non-empty, write context-probe diagnostics to stderr, including the one-time negative-cache record for an unsupported `x.ai/session/info`. |
 
 Operational note: `server.py` reuses an already-running observer daemon. After installing
 or switching to this version, restart the Grok Subagent MCP/observer once so the new

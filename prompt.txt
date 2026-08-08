@@ -1,0 +1,1692 @@
+你现在负责 grok-subagent 的 Grok Work Orchestrate V2 最终 Review-Fix Round。
+
+模型：
+deepseek-v4-flash
+thinking_level=max
+
+这是一个严格收口轮次。
+
+不要继续设计新架构。
+不要扩大产品范围。
+不要重写 Agent Fabric。
+不要顺手解决已知 future work。
+
+目标只有：
+
+1. 证明并修正 model-facing MCP/tool schema，使 Codex 真能调用
+   role / reasoning_effort。
+2. 把“Codex/Main 是唯一 orchestrator / task authority”从纯 prompt
+   约定提升为一个最小、兼容的 runtime scheduling guarantee。
+3. 收口三个非阻塞但值得本轮一起处理的 P2：
+   - explore/review 对 dirty workspace 的默认安全性；
+   - 真正的 orchestration follow-up E2E 证明；
+   - 缩短 grok-work SKILL.md 自身上下文开销。
+4. 保持此前全部 Agent Fabric crash consistency / worktree /
+   mailbox / prompt transport 修复不变。
+
+完成后：
+- 可以 commit；
+- 可以 push feature branch；
+- 禁止 merge main；
+- 禁止 force push。
+
+==================================================
+0. REPOSITORY / EXPECTED STATE
+==================================================
+
+主仓库：
+
+D:/Project/grok-subagent
+
+本轮 clean worktree：
+
+D:/Project/grok-subagent-orchestrate-v2
+
+Repository:
+
+the-snowpear/grok-subagent
+
+Feature branch:
+
+agent/grok-work-orchestrate-v2
+
+预期当前 feature HEAD：
+
+bbf0aae9fafc05a21316cc05a17674d87e8c62f9
+
+feature 原始 base：
+
+0dedb5cb2179bcbf30ad03ec1da8d8030308be20
+
+也就是已 merge 的 Agent Fabric main。
+
+开始前执行：
+
+git status --short
+git branch --show-current
+git rev-parse HEAD
+git log --oneline --decorate -12
+
+git fetch origin
+
+git rev-parse origin/agent/grok-work-orchestrate-v2
+git rev-parse origin/main
+
+必须确认：
+
+当前 branch == agent/grok-work-orchestrate-v2
+
+HEAD ==
+bbf0aae9fafc05a21316cc05a17674d87e8c62f9
+
+origin/agent/grok-work-orchestrate-v2 ==
+bbf0aae9fafc05a21316cc05a17674d87e8c62f9
+
+如果 feature HEAD 已变化：
+
+STOP。
+
+报告：
+
+EXPECTED:
+bbf0aae9...
+
+ACTUAL:
+<sha>
+
+不要在未知提交上继续。
+
+==================================================
+1. WORKSPACE SAFETY — HARD RULE
+==================================================
+
+原始用户工作区：
+
+D:/Project/grok-subagent
+
+存在独立、未提交 ACP Context 工作。
+
+已知包括：
+
+M README.md
+M grok_acp_context.py
+M live_streaming.py
+?? tests/test_acp_negative_cache.py
+
+以及可能存在其他 ACP/context telemetry 本地内容。
+
+禁止：
+
+- 在原 dirty worktree 修改代码
+- git reset --hard 原工作区
+- git clean 原工作区
+- git stash 原工作区
+- checkout 覆盖 ACP 文件
+- stage ACP 文件
+- commit ACP 文件
+- 把 ACP 内容复制进 feature
+- 删除 ACP untracked test
+- squash/rebase 已有历史
+- force push
+
+本轮所有代码修改只在：
+
+D:/Project/grok-subagent-orchestrate-v2
+
+执行。
+
+开始与结束都检查原工作区：
+
+git -C D:/Project/grok-subagent status --short
+
+必须保持原样。
+
+==================================================
+2. CURRENT IMPLEMENTATION — ACCEPTED PARTS
+==================================================
+
+以下内容已经通过上一轮 review。
+
+不要重新设计。
+
+reasoning_effort：
+
+- canonical field = reasoning_effort
+- runtime default = "max"
+- agents.reasoning_effort 持久化
+- create_agent 支持 override
+- create_agents 支持 batch default + per-item override
+- malformed effort 在创建 worktree / DB rows 前失败
+- child command 使用：
+  --reasoning-effort <stored value>
+- completed-agent follow-up 使用同一个 agent row，所以 effort 继承
+- status/result/observer 暴露 reasoning_effort
+- 不建立虚假的 enum
+- 当前 Grok 1.0.0 没有 per-turn effective reasoning telemetry
+- 所以只能保证 configured/requested effort，不得宣称模型内部已验证为 max
+
+flat topology：
+
+- 保持：
+  --no-subagents
+
+Codex/Main 是唯一 orchestration control plane。
+
+不要打开 Grok nested subagents。
+
+原有 Agent Fabric：
+
+- durable mailbox
+- child_spawned_at
+- PID identity
+- recovery containment
+- safe worktree
+- binary artifact preservation
+- Windows UTF-16 prompt sizing
+- prompt retention
+- cancelled recovery
+
+全部保持原语义。
+
+==================================================
+3. BLOCKER P1-A
+MODEL-FACING TOOL SCHEMA MUST BE REAL
+==================================================
+
+问题：
+
+当前 patch 已证明：
+
+Python caller
+  -> daemon.action("create_agent")
+  -> role / reasoning_effort
+
+可以工作。
+
+但这还没有证明：
+
+Codex
+  -> MCP/model-facing tool schema
+  -> create_agent/create_agents
+  -> daemon.action
+  -> runtime
+
+真的能看到并传递这些字段。
+
+新增 tests 不能继续只调用：
+
+daemon.action(...)
+
+然后声称 MCP contract 已验证。
+
+----------------------------------
+3.1 先审计真实工具入口
+----------------------------------
+
+不要假设 schema 在 server.py 某个固定变量里。
+
+实际搜索：
+
+rg -n "create_agent|create_agents|inputSchema|input_schema|tools/list|list_tools|MCP|tool.*schema|action\\(" \
+  server.py daemon.py native_bridge.py native_transport.py *.py
+
+找到：
+
+- model 能看到的 canonical tool definition；
+- tools/list 或等价 schema builder；
+- model tool invocation 到 daemon.action 的 dispatch path；
+- create_agent/create_agents 的参数定义在哪里。
+
+不要建立第二套 tool registry。
+
+必须修改真实 canonical source。
+
+----------------------------------
+3.2 create_agent model schema
+----------------------------------
+
+Codex 可见的 create_agent schema 至少必须允许：
+
+role:
+  optional
+  one of:
+    explore
+    implement
+    review
+
+reasoning_effort:
+  optional string
+
+以及已有：
+
+agent_name
+prompt
+cwd
+profile
+worktree
+max_turns
+...
+
+role / reasoning_effort 必须最终原样进入 daemon.action。
+
+不要让 schema：
+
+- strip 字段；
+- reject 合法字段；
+- rename 成 thinking_level；
+- 在 model layer 创建另一个 effort alias。
+
+canonical API 继续只叫：
+
+reasoning_effort
+
+----------------------------------
+3.3 create_agents model schema
+----------------------------------
+
+必须支持：
+
+top-level:
+
+reasoning_effort
+role
+
+作为 batch default。
+
+每个 agents[] item 也必须支持：
+
+reasoning_effort
+role
+
+item override > batch default。
+
+不要破坏已有 item fields。
+
+----------------------------------
+3.4 必须补 boundary-level regression
+----------------------------------
+
+新增测试不能用：
+
+inspect.getsource
+字符串 grep daemon.py
+单纯 daemon.action()
+
+测试必须从真实 model-facing tool/schema boundary 出发。
+
+例如：
+
+1. 调真实 tool-list/schema builder；
+2. 找到 create_agent；
+3. 验证 role/reasoning_effort 对模型可见；
+4. 找到 create_agents；
+5. 验证 batch + per-item fields 对模型可见；
+6. 通过真实 dispatch/helper 执行一次 tool invocation；
+7. 最后检查 DB：
+   agents.role
+   agents.reasoning_effort
+   或创建结果。
+
+具体函数名按仓库真实实现。
+
+不要为了测试再复制一套假 schema。
+
+如果当前 server 层实际是 generic dict 透传：
+
+也必须写一个真实 boundary test 证明这一点。
+
+不能仅在报告里写“它应该能透传”。
+
+==================================================
+4. BLOCKER P1-B
+MAIN-OWNED FOLLOW-UP SCHEDULING
+==================================================
+
+这是本轮最重要的语义修复。
+
+产品契约：
+
+Codex/Main 是唯一 orchestrator。
+
+workers 可以：
+
+- 提供 evidence；
+- 提供 findings；
+- peer clarification；
+- peer evidence request。
+
+但 worker 不能在 Main 未 adjudicate 的情况下：
+
+Reviewer
+  -> Implementer
+  -> 自动产生一个新的修改型 follow-up turn
+
+否则 Main 的决策 authority 只是 prompt etiquette。
+
+----------------------------------
+4.1 不要做全面 RBAC
+----------------------------------
+
+不要扩成大型权限系统。
+
+不要：
+
+- 新 token subsystem
+- ACL engine
+- role hierarchy
+- capability server
+- message policy DSL
+- 大量 message kinds
+- 重写 mailbox
+
+本轮只需要一个最小 runtime primitive：
+
+**Main 才能自动唤醒 role-tagged orchestrate worker 的 completed follow-up。**
+
+----------------------------------
+4.2 Persist role
+----------------------------------
+
+当前 role 只在 create time 解析，这不够。
+
+新增：
+
+agents.role
+
+建议迁移：
+
+ALTER TABLE agents ADD COLUMN role TEXT
+
+legacy rows：
+
+role = NULL
+
+不要给历史普通 agent 强行赋角色。
+
+create_agent/create_agents：
+
+resolved role 写入 agents.role。
+
+role 必须在：
+
+status
+result
+
+以及已有 public/catalog/detail surface 中合理暴露。
+
+这样 observer/debug 时能知道：
+
+explore
+implement
+review
+NULL legacy
+
+不要把 role 重新解析。
+
+completed follow-up 使用同一个 agent row，所以自然继承 stored role。
+
+----------------------------------
+4.3 Main identity
+----------------------------------
+
+使用已有 canonical：
+
+main_peer_id(thread_id)
+
+不要根据：
+
+display name
+agent name
+"Main" 字符串
+
+猜 sender。
+
+----------------------------------
+4.4 Auto-followup authority rule
+----------------------------------
+
+修改 canonical completed-worker delivery scheduling path：
+
+maybe_schedule_delivery(...)
+
+或真实等价函数。
+
+规则：
+
+IF target agent.role IS NULL:
+    保持当前 legacy Agent Fabric 行为不变。
+
+IF target agent.role IN ('explore','implement','review'):
+    只有：
+        message.from_peer == main_peer_id(agent.thread_id)
+    的 pending messages
+    才能被自动 claim 到一个新的 follow-up turn。
+
+来自其他 worker 的消息：
+
+- 不删除；
+- 不 mark delivered；
+- 不 consumed；
+- target_turn_id 保持 NULL；
+- 不创建 follow-up；
+- 保持 pending。
+
+这是重点：
+
+peer message 不等于丢失。
+
+它只是：
+
+**没有 scheduling authority。**
+
+如果 worker 当时处于 active/running 状态并主动通过 inbox/wait
+读取 peer clarification，现有协作能力可以继续存在。
+
+但 completed orchestrate worker 不得被 peer 自动重新激活。
+
+----------------------------------
+4.5 为什么对全部 role-tagged workers 生效
+----------------------------------
+
+不仅 implement。
+
+对：
+
+explore
+implement
+review
+
+都使用 Main-owned automatic follow-up scheduling。
+
+这样：
+
+Main
+  -> Explorer clarification follow-up
+
+允许。
+
+Main
+  -> Implementer Fix Order
+
+允许。
+
+Main
+  -> Reviewer re-review request
+
+允许。
+
+Reviewer
+  -> Implementer
+
+不能自动创建 turn。
+
+Explorer
+  -> Reviewer
+
+不能自动创建 turn。
+
+Implementer
+  -> Reviewer
+
+不能自动创建 turn。
+
+这让 Main 真正拥有 workflow phase progression。
+
+----------------------------------
+4.6 不要求 message kind redesign
+----------------------------------
+
+优先采用：
+
+stored role
++
+sender gate
+
+不要因为本轮修复新增一个复杂：
+
+work_order/fix_order/evidence/clarification
+
+message-type state machine。
+
+现有 agent_messages.kind 如果已有用途，保持兼容。
+
+Main 发出的普通 message 已经代表 Main 授权，因此可以唤醒
+role-tagged worker。
+
+以后若需要细粒度 authority 再单独设计。
+
+本轮不要 scope creep。
+
+==================================================
+5. AUTHORITY REGRESSION TESTS
+==================================================
+
+必须新增行为级测试。
+
+不得仅检查 prompt 文本。
+
+----------------------------------
+T1 role persistence
+----------------------------------
+
+create：
+
+role="implement"
+
+assert DB：
+
+agents.role == "implement"
+
+status/result：
+
+role == "implement"
+
+follow-up 后仍：
+
+role == "implement"
+
+同样至少覆盖 explore/review 中一个。
+
+----------------------------------
+T2 legacy compatibility
+----------------------------------
+
+创建/seed 一个：
+
+role IS NULL
+
+completed legacy agent。
+
+peer 给它发 message。
+
+保持历史 Agent Fabric auto-followup 行为。
+
+不能因为 orchestrate authority gate 破坏 generic Agent Fabric。
+
+----------------------------------
+T3 reviewer cannot wake implementer
+----------------------------------
+
+创建：
+
+Implementer:
+  role=implement
+  completed
+
+Reviewer:
+  role=review
+  completed
+
+Reviewer peer 向 Implementer send：
+
+"please change X"
+
+断言：
+
+- message.state == pending
+- target_turn_id IS NULL
+- Implementer 仍 completed
+- Implementer 没有新 turn
+- message 未 consumed
+- message 未 delivered
+
+即：
+
+review finding 本身没有 execution authority。
+
+----------------------------------
+T4 Main can wake same implementer
+----------------------------------
+
+随后：
+
+Main -> same Implementer
+
+发送一个 Fix Order。
+
+断言：
+
+- 正好创建一个新 turn
+- target_turn_id == follow-up turn id
+- same agent id
+- same grok_session_id
+- same reasoning_effort
+- same role
+- same worktree contract
+- follow-up 正常执行
+- Main message delivered + consumed
+
+----------------------------------
+T5 mixed queue
+----------------------------------
+
+completed Implementer 有两条 pending：
+
+1. Reviewer -> Implementer
+2. Main -> Implementer
+
+调用 scheduler。
+
+必须：
+
+只 claim Main message。
+
+Reviewer message：
+
+target_turn_id remains NULL
+state=pending
+consumed_at=NULL
+
+Main message：
+
+target_turn_id=new turn
+
+不能把 peer message 一起 coalesce 到 Main-authorized turn。
+
+----------------------------------
+T6 restart sweep
+----------------------------------
+
+role=implement completed agent：
+
+仅有 peer pending message。
+
+运行 recovery/sweep。
+
+不得产生 follow-up。
+
+加入 Main pending message 后：
+
+recovery/sweep 可以产生 follow-up。
+
+----------------------------------
+T7 Reviewer re-review
+----------------------------------
+
+role=review completed reviewer。
+
+Main 发：
+
+"verify fix round 1"
+
+必须允许创建 reviewer follow-up。
+
+证明 authority gate 不是“禁止 reviewer follow-up”，而是：
+
+Main owns scheduling authority。
+
+==================================================
+6. P2-A
+DIRTY WORKSPACE SAFETY FOR EXPLORE / REVIEW
+==================================================
+
+当前：
+
+explore -> shared cwd
+review  -> shared cwd
+
+同时 read-only 只有 prompt policy。
+
+而实际开发过程中已经出现过 worker 误写 dirty workspace。
+
+所以 grok-work 默认不应该让 Explorer/Reviewer 直接站在用户 dirty
+working tree 上。
+
+但不要破坏非 git 兼容性。
+
+----------------------------------
+6.1 推荐实现策略
+----------------------------------
+
+不要盲目把所有 role 的 global worktree_default 改成 True，
+如果这会导致非 git cwd 创建失败。
+
+优先让：
+
+skills/grok-work/SKILL.md
+
+明确：
+
+对 git-backed implementation tasks：
+
+Explorer:
+  worktree=true
+
+Reviewer:
+  worktree=true
+
+Implementer:
+  worktree=true
+
+即三个角色默认都在 isolated worktree 执行。
+
+例外：
+
+只有任务**明确依赖当前未提交工作区内容**，Main 才可以做决定：
+
+worktree=false
+
+并明确记录：
+
+- 为什么必须读取 dirty state；
+- read-only 仍只是 prompt policy；
+- 不能声称硬 sandbox。
+
+如果你能在 runtime 中以很小改动实现：
+
+role default = isolated when cwd is git repo
+fallback shared when non-git
+
+且不会增加复杂状态，
+
+可以这样实现。
+
+否则：
+
+保持 runtime generic，
+由 grok-work Work Order 显式传 worktree=true。
+
+优先最小改动和兼容性。
+
+----------------------------------
+6.2 Behavioral safety test
+----------------------------------
+
+至少证明 grok-work 推荐路径下：
+
+Explorer / Reviewer 的 cwd 不等于用户原 git worktree。
+
+用一个真实临时 git repo：
+
+main repo:
+  tracked file
+  dirty local modification
+
+创建：
+
+role=explore, worktree=True
+role=review,  worktree=True
+
+断言：
+
+- worker worktree_root 位于 DATA/worktrees/**
+- original dirty repo 内容没有改变
+- isolation_mode=worktree
+
+不需要模拟恶意 agent。
+
+重点是默认 orchestration invocation 有隔离。
+
+==================================================
+7. P2-B
+REAL ORCHESTRATION FOLLOW-UP E2E PROOF
+==================================================
+
+当前 test_thin_orchestrator_control_flow 有价值，
+但更多证明：
+
+create role
+effort
+worktree
+mailbox follow-up
+
+而不是整个 authority boundary。
+
+本轮至少把 E2E 提升成：
+
+Explorer
+  -> result
+Main decision (test harness)
+  -> Implementer
+Implementer completed
+  -> actual result / patch artifact exists where applicable
+Reviewer
+  -> finding
+NO runtime mutation yet
+Main
+  -> Fix Order
+same Implementer follow-up
+  -> completed
+Main
+  -> same Reviewer re-review follow-up
+  -> completed
+
+重点验证：
+
+1. Reviewer finding alone 不创建 Implementer turn；
+2. Main Fix Order 才创建；
+3. Reviewer verification 也是 Main 唤醒；
+4. same Implementer：
+   - agent id unchanged
+   - session unchanged
+   - effort unchanged
+   - role unchanged
+5. messages 不重复；
+6. flat --no-subagents 保持；
+7. 如果有 isolated patch artifact，Reviewer 输入引用真实 artifact，
+   不要只写一个虚构字符串。
+
+不要试图 unit test “Codex 是否聪明地选对方案”。
+
+Main 的 semantic decision 属于模型行为，不属于 daemon state machine。
+
+测试 runtime authority 和 transport 即可。
+
+==================================================
+8. P2-C
+SHRINK SKILL MAIN-CONTEXT OVERHEAD
+==================================================
+
+当前 grok-work SKILL.md 已经把逻辑写对，
+但是对一个目标是 thin-main-context 的 Skill 来说仍偏长。
+
+目标：
+
+SKILL.md 只做 control plane。
+
+不要把所有模板完整重复在 SKILL.md 和 references 两遍。
+
+----------------------------------
+8.1 Target structure
+----------------------------------
+
+建议将：
+
+skills/grok-work/SKILL.md
+
+压缩到约：
+
+100–150 行
+
+这是指导目标，不是为了行数硬删重要规则。
+
+保留：
+
+1. frontmatter
+2. objective
+3. authority table / reserved Main decisions
+4. defaults
+5. S/M/L agent graph
+6. phase skeleton
+7. Main context firewall
+8. failure/signoff
+9. references
+
+移走详细：
+
+Evidence Packet template
+Implementer Work Order template
+Reviewer Work Order template
+Fix Order template
+Decision Snapshot template
+详细 token budget explanation
+详细 runtime capability explanation
+
+到：
+
+references/decision-budget-contract.md
+references/runtime-contract.md
+
+SKILL.md 只链接：
+
+“需要生成 Work Order 时读取 decision-budget-contract.md”
+
+“需要确认 runtime capability 时读取 runtime-contract.md”
+
+这符合 progressive loading。
+
+----------------------------------
+8.2 不要破坏核心语义
+----------------------------------
+
+压缩后仍必须明确：
+
+Codex decides.
+Workers collect/implement/review.
+Reviewer finding -> Main adjudication.
+Main Fix Order -> original Implementer.
+Default configured reasoning_effort=max.
+Minimal sufficient agent graph.
+Thin Main context.
+Flat topology.
+No silent Codex implementation fallback.
+
+==================================================
+9. UPDATE RUNTIME CONTRACT WORDING
+==================================================
+
+修改：
+
+skills/grok-work/references/runtime-contract.md
+
+把 authority 描述改成准确的 runtime guarantee。
+
+明确区分：
+
+HARD RUNTIME GUARANTEE：
+
+- role 持久化；
+- role-tagged completed workers 的自动 follow-up scheduling
+  只有 Main-authored messages 可以触发；
+- peer messages 保持 pending，不会自动激活 worker；
+- role=NULL legacy agents 保持旧行为。
+
+PROMPT POLICY ONLY：
+
+- explore/review 不修改文件；
+- implementer 不扩大 scope；
+- worker 不根据 peer 建议自行改变架构；
+- read-only 不是 OS sandbox。
+
+不要写：
+
+“Reviewer cannot send messages”
+
+如果 runtime 实际仍允许 peer send。
+
+正确措辞：
+
+“Reviewer/peer message does not possess automatic follow-up scheduling authority.”
+
+==================================================
+10. REASONING_EFFORT — DO NOT REOPEN
+==================================================
+
+本轮不要重新发明 effort 系统。
+
+保持：
+
+REASONING_EFFORT_DEFAULT = "max"
+
+canonical field：
+
+reasoning_effort
+
+shape validation：
+
+保持当前合理实现。
+
+CLI：
+
+--reasoning-effort <value>
+
+stored agent row 优先。
+
+只需完成：
+
+model-facing schema exposure
+
+以及相关 boundary regression。
+
+文档继续写：
+
+configured/requested reasoning effort
+
+不要写：
+
+verified internal model reasoning level
+
+因为 Grok 1.0.0 没有该 telemetry。
+
+==================================================
+11. DO NOT REGRESS AGENT FABRIC
+==================================================
+
+本轮 diff 不得改变这些已有 invariant：
+
+----------------------------------
+Delivery
+----------------------------------
+
+Popen 成功前失败：
+message claim release。
+
+Popen 后：
+turns.child_spawned_at 是唯一 execution/delivery proof。
+
+agents.child_started_at：
+只用于 PID identity。
+
+process_create_time None/exception：
+不能 fail 已 spawn turn。
+
+----------------------------------
+Recovery
+----------------------------------
+
+queued turns survive restart。
+
+PID terminate：
+positive identity only。
+
+single-agent recovery failure：
+不能 abort entire recover。
+
+----------------------------------
+Mailbox
+----------------------------------
+
+send commit before notification semantics。
+
+auto-delivered messages：
+delivered + consumed。
+
+no duplicate follow-up。
+
+large message：
+no silent truncation。
+
+----------------------------------
+Worktree
+----------------------------------
+
+任何 shutil.rmtree target：
+必须是 DATA/worktrees strict descendant。
+
+主 repo 永远不能成为 destructive target。
+
+binary patch/untracked artifacts：
+继续 lossless。
+
+----------------------------------
+Prompt transport
+----------------------------------
+
+Windows UTF-16 units sizing。
+
+single prompt source。
+
+lazy probe。
+
+prompt retention。
+
+----------------------------------
+Topology
+----------------------------------
+
+--no-subagents
+
+始终保留。
+
+==================================================
+12. EXPECTED FILE SCOPE
+==================================================
+
+合理修改范围预计：
+
+daemon.py
+server.py                      # only if canonical schema really lives here
+或真实 MCP/tool definition file
+skills/grok-work/SKILL.md
+skills/grok-work/references/runtime-contract.md
+skills/grok-work/references/decision-budget-contract.md
+tests/test_orchestrate_v2.py
+可能新增一个真实 tool-boundary test file
+
+如果开始大量修改：
+
+coordination/mailbox.py
+prompt_transport.py
+native_bridge.py
+worktree machinery
+
+先停下来判断是否 scope creep。
+
+authority gate 应优先在 scheduler/filter 层做最小修改。
+
+==================================================
+13. RECOMMENDED COMMIT PLAN
+==================================================
+
+建议 3 个小 commit：
+
+1.
+
+fix: expose orchestrate controls at model tool boundary
+
+内容：
+
+- model-facing create_agent/create_agents schema
+- role/reasoning_effort boundary plumbing
+- boundary regression tests
+
+2.
+
+fix: make main own orchestrate follow-up scheduling
+
+内容：
+
+- agents.role persistence
+- Main-only auto-followup sender gate for role-tagged workers
+- legacy role=NULL compatibility
+- mixed queue / recovery tests
+- Main reviewer re-review test
+
+3.
+
+fix: isolate orchestrate readers and trim skill context
+
+内容：
+
+- git-backed explore/review isolated invocation
+- orchestration E2E strengthening
+- shrink SKILL.md
+- update runtime/decision references
+
+如果实际 diff 很小，可以 2 commits。
+
+不要 squash 已有：
+
+f4fcc61
+f62d0d4
+a66ff87
+bbf0aae
+
+==================================================
+14. FOCUSED TEST MATRIX
+==================================================
+
+至少需要新增/更新测试覆盖：
+
+A. Model boundary
+
+A1 create_agent exported schema includes:
+   role
+   reasoning_effort
+
+A2 create_agents exported schema includes:
+   batch role
+   batch reasoning_effort
+   per-item role
+   per-item reasoning_effort
+
+A3 real tool dispatch keeps the fields.
+
+B. Role persistence
+
+B1 create role persists DB.
+
+B2 status/result expose role.
+
+B3 follow-up retains role.
+
+B4 legacy role NULL still works.
+
+C. Authority
+
+C1 reviewer -> completed implementer:
+   no auto followup.
+
+C2 main -> completed implementer:
+   exactly one followup.
+
+C3 mixed reviewer + Main:
+   only Main message claimed.
+
+C4 peer-only recovery sweep:
+   no followup.
+
+C5 Main recovery sweep:
+   followup.
+
+C6 Main -> completed reviewer:
+   re-review followup allowed.
+
+C7 role=NULL generic peer:
+   legacy behavior unchanged.
+
+D. Isolation
+
+D1 git-backed explore worktree isolated.
+
+D2 git-backed review worktree isolated.
+
+D3 original dirty parent untouched.
+
+E. Orchestration
+
+E1 reviewer finding alone causes no implementer mutation.
+
+E2 Main Fix Order causes same-agent followup.
+
+E3 session/effort/role/worktree retained.
+
+E4 Main reviewer verification followup works.
+
+E5 no duplicate turns/messages.
+
+E6 --no-subagents maintained.
+
+==================================================
+15. VALIDATION
+==================================================
+
+先 focused：
+
+python -m unittest tests.test_orchestrate_v2 -v
+
+以及新增 model-boundary test module。
+
+再：
+
+python -m py_compile \
+  daemon.py \
+  server.py \
+  prompt_transport.py \
+  coordination/*.py \
+  grok_hub.py \
+  native_bridge.py \
+  native_transport.py
+
+Windows shell 下按实际命令语法执行。
+
+然后：
+
+python -m unittest discover -s tests -v
+
+不要预设 test count。
+
+上一轮 feature 是：
+
+270/270
+
+本轮应该 >270。
+
+报告实际：
+
+X/X PASS
+
+继续执行仓库真实存在的：
+
+python tools/final_merge_static_check.py
+
+python tools/round4_static_check.py
+
+如果路径不同先确认。
+
+然后：
+
+git diff --check
+
+git status --short
+
+git diff --stat origin/main...HEAD
+git diff --name-status origin/main...HEAD
+
+确认无 ACP 内容。
+
+==================================================
+16. MANUAL MODEL-BOUNDARY SMOKE
+==================================================
+
+如果 MCP/server 层可以在本地不启动真实 Grok 的情况下执行 tool discovery：
+
+实际打印/检查一次：
+
+create_agent schema
+create_agents schema
+
+确认 Codex-facing schema 中出现：
+
+role
+reasoning_effort
+
+如果可以通过本地 MCP client/helper 调用：
+
+调用一个：
+
+create_agent(
+    role="explore",
+    reasoning_effort="max",
+    ...
+)
+
+并检查 daemon DB。
+
+不要把纯 daemon.action 测试称为 MCP smoke。
+
+==================================================
+17. REAL GROK CLI CHECK
+==================================================
+
+无需重复大量在线运行。
+
+只确认已有结论未被破坏：
+
+grok --version
+grok -p --help
+
+确认：
+
+--reasoning-effort
+
+仍存在。
+
+不用重新研究 arbitrary values。
+
+不要扩大 scope。
+
+==================================================
+18. FINAL SELF-REVIEW
+==================================================
+
+提交前逐项回答：
+
+P1-A:
+Codex-facing tool schema 是否真的能看到 role/reasoning_effort？
+
+证据是什么？
+测试是否经过真实 model boundary？
+
+P1-B:
+一个 completed role=implement agent：
+
+Reviewer message
+是否可以自动 create turn？
+
+答案必须：
+NO
+
+Main message
+是否可以自动 create turn？
+
+答案必须：
+YES
+
+role=NULL legacy agent：
+旧行为是否保留？
+
+答案必须：
+YES
+
+Mixed queue：
+Reviewer message 是否被 Main-authorized turn 顺带 claim？
+
+答案必须：
+NO
+
+Reviewer verification：
+Main 是否能重新唤醒 completed Reviewer？
+
+答案必须：
+YES
+
+Workspace：
+默认 grok-work git-backed Explorer/Reviewer 是否避免直接站用户 dirty tree？
+
+Skill：
+Codex decision authority 是否仍明确？
+Main context firewall 是否仍明确？
+是否减少了 SKILL 本身重复内容？
+
+==================================================
+19. PUSH
+==================================================
+
+验证全部通过后：
+
+git status --short
+
+确认 clean。
+
+git log --oneline --decorate -10
+
+push：
+
+git push origin agent/grok-work-orchestrate-v2
+
+NO FORCE。
+
+不要：
+
+git merge main
+git checkout main 并 merge
+创建 main merge commit
+删除 feature branch
+
+最终必须：
+
+NOT MERGED
+
+==================================================
+20. FINAL REPORT FORMAT
+==================================================
+
+严格返回：
+
+# Grok Work Orchestrate V2 Final Fix Report
+
+## Decision
+
+READY FOR INDEPENDENT REVIEW
+或
+BLOCKED
+
+## Refs
+
+branch:
+agent/grok-work-orchestrate-v2
+
+base:
+0dedb5cb2179bcbf30ad03ec1da8d8030308be20
+
+starting head:
+bbf0aae9fafc05a21316cc05a17674d87e8c62f9
+
+final head:
+<SHA>
+
+pushed:
+YES/NO
+
+merged:
+NO
+
+## P1-A Model-facing tool boundary
+
+Canonical schema location:
+...
+
+create_agent:
+role exposed: YES/NO
+reasoning_effort exposed: YES/NO
+
+create_agents:
+batch role: YES/NO
+batch reasoning_effort: YES/NO
+per-item role: YES/NO
+per-item reasoning_effort: YES/NO
+
+Dispatch proof:
+...
+
+Regression tests:
+...
+
+## P1-B Main-owned scheduling authority
+
+Role persistence:
+...
+
+Legacy role=NULL behavior:
+...
+
+Reviewer -> Implementer:
+NO AUTO FOLLOWUP / FAIL
+
+Main -> Implementer:
+FOLLOWUP CREATED / FAIL
+
+Mixed queue:
+...
+
+Recovery sweep:
+...
+
+Main -> Reviewer re-review:
+...
+
+Runtime guarantee wording:
+...
+
+## Workspace isolation
+
+Explorer default path:
+...
+
+Reviewer default path:
+...
+
+Dirty parent test:
+PASS/FAIL
+
+Read-only hard sandbox:
+NO
+(prompt policy only)
+
+## Skill/context optimization
+
+SKILL.md before:
+~258 lines
+
+SKILL.md after:
+<N> lines
+
+Moved to references:
+...
+
+Decision authority preserved:
+YES/NO
+
+Main context firewall preserved:
+YES/NO
+
+## Reasoning effort
+
+runtime default:
+max
+
+model-facing exposed:
+YES/NO
+
+stored:
+YES/NO
+
+follow-up inherited:
+YES/NO
+
+CLI:
+--reasoning-effort
+
+effective-model telemetry:
+NOT AVAILABLE
+
+## Tests
+
+focused orchestrate:
+X/X PASS
+
+model boundary:
+X/X PASS
+
+full suite:
+X/X PASS
+
+py_compile:
+PASS
+
+final_merge_static_check:
+PASS
+
+round4_static_check:
+PASS
+
+git diff --check:
+PASS
+
+## Regression gates
+
+delivery:
+PASS
+
+recovery:
+PASS
+
+mailbox:
+PASS
+
+PID identity:
+PASS
+
+worktree destructive safety:
+PASS
+
+binary artifacts:
+PASS
+
+Windows prompt transport:
+PASS
+
+cancelled recovery:
+PASS
+
+flat topology:
+PASS
+
+## Workspace hygiene
+
+Original ACP dirty worktree:
+UNCHANGED
+
+ACP staged:
+NO
+
+ACP committed:
+NO
+
+## Findings
+
+P0:
+none / ...
+
+P1:
+none / ...
+
+P2:
+none / ...
+
+P3:
+...
+
+## Commits
+
+<sha> <message>
+...
+
+## Final state
+
+READY FOR INDEPENDENT REVIEW
+
+NOT MERGED
+
+==================================================
+21. FINAL SCOPE RULE
+==================================================
+
+本轮的成功标准不是：
+
+“增加更多 orchestration 功能”。
+
+而是：
+
+1. Codex 能真实调用新字段；
+2. runtime 可以证明 Main 拥有 role-worker follow-up scheduling authority；
+3. worker peer collaboration 仍存在，但不等于 task authority；
+4. legacy Agent Fabric 不回归；
+5. dirty workspace 风险降低；
+6. grok-work 自己更薄、更省 Main context；
+7. 不破坏此前已 merge 的 Agent Fabric correctness。
+
+完成这些就停。
+
+不要继续设计 V3。

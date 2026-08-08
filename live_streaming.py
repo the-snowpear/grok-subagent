@@ -19,8 +19,16 @@ import threading
 
 import daemon as observer
 from context_telemetry import emit_context_snapshot
-from grok_acp_context import AcpProbeError, probe_session_context
+from grok_acp_context import (
+    AcpProbeError,
+    acp_unsupported_cache,
+    grok_binary_identity,
+    probe_is_unsupported,
+    probe_session_context,
+)
 
+
+_UNSUPPORTED_ACP_METHOD = "x.ai/session/info"
 
 LIVE_SOURCE_TYPES = {
     "agent_message_chunk": "text",
@@ -120,9 +128,24 @@ def _context_probe_target(agent_id: str, turn_id: int) -> tuple[str, str] | None
         return None
 
 
+def _context_debug(message: str) -> None:
+    if os.environ.get("GROK_OBSERVER_CONTEXT_DEBUG", "").strip():
+        print(f"[grok-observer] {message}", file=sys.stderr)
+
+
 def _probe_context_worker(agent_id: str, turn_id: int) -> None:
     key = (agent_id, int(turn_id))
+    # Resolved once, before the probe starts, and reused for both the cache
+    # key and the launched executable. Recording a -32601 must reference this
+    # same identity: re-resolving in the error handler would attribute the
+    # failure to whatever binary replaced grok mid-probe (TOCTOU).
+    identity = None
     try:
+        identity = grok_binary_identity()
+        if identity is not None and acp_unsupported_cache.is_unsupported(
+            identity, _UNSUPPORTED_ACP_METHOD
+        ):
+            return
         target = _context_probe_target(agent_id, turn_id)
         if not target:
             return
@@ -133,17 +156,27 @@ def _probe_context_worker(agent_id: str, turn_id: int) -> None:
             cwd,
             env=child_env,
             timeout=_context_probe_timeout(),
+            # Launch the exact resolved executable the cache identity was keyed
+            # on, so the probed process always matches the cached verdict.
+            executable=identity[0] if identity is not None else None,
         )
         # Drop a stale snapshot if a follow-up turn started while ACP was loading.
         if _context_probe_target(agent_id, turn_id) is None:
             return
         emit_context_snapshot(agent_id, turn_id, info, _original_add_event)
     except (AcpProbeError, OSError, ValueError, RuntimeError) as exc:
-        if os.environ.get("GROK_OBSERVER_CONTEXT_DEBUG", "").strip():
-            print(f"[grok-observer] context probe skipped: {exc}", file=sys.stderr)
+        if probe_is_unsupported(exc) and identity is not None:
+            if acp_unsupported_cache.record_unsupported(
+                identity, _UNSUPPORTED_ACP_METHOD
+            ):
+                _context_debug(
+                    f"context probe: {_UNSUPPORTED_ACP_METHOD} unsupported "
+                    f"(JSON-RPC {exc.code}), negative-cached for this process"
+                )
+        else:
+            _context_debug(f"context probe skipped: {exc}")
     except Exception as exc:  # telemetry must never fail delegated work
-        if os.environ.get("GROK_OBSERVER_CONTEXT_DEBUG", "").strip():
-            print(f"[grok-observer] context probe error: {exc!r}", file=sys.stderr)
+        _context_debug(f"context probe error: {exc!r}")
     finally:
         with _probe_lock:
             _probe_inflight.discard(key)
@@ -154,6 +187,14 @@ def _schedule_context_probe(agent_id: str, turn_id: int | None) -> None:
         return
     # Fake-Grok fixtures intentionally do not expose an ACP session store.
     if os.environ.get("GROK_OBSERVER_FAKE_GROK"):
+        return
+    # Cheap scheduler pre-check (path/stat only, never spawns a subprocess):
+    # skip spawning a probe worker when the current binary is already known to
+    # be unsupported. The worker repeats the check against the fresh identity.
+    identity = grok_binary_identity(resolve_version=False)
+    if identity is not None and acp_unsupported_cache.is_unsupported(
+        identity, _UNSUPPORTED_ACP_METHOD
+    ):
         return
     key = (agent_id, int(turn_id))
     with _probe_lock:
