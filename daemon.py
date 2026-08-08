@@ -442,6 +442,18 @@ def artifact_bytes(agent_id: str, label: str, content: bytes) -> str:
     return artifact(agent_id, label, encoded)
 
 
+def artifact_raw_bytes(agent_id: str, label: str, content: bytes) -> str:
+    """Persist arbitrary bytes losslessly as a raw-gzip artifact (no base64 wrapper)."""
+    digest = hashlib.sha256(content).hexdigest()[:16]
+    folder = ARTIFACTS / agent_id
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{label}-{digest}.gz"
+    if not path.exists():
+        with gzip.open(path, "wb") as handle:
+            handle.write(content)
+    return str(path.relative_to(ROOT))
+
+
 # Catalog (sidebar) waiters: one global condition; bumped on any agent/task meta change.
 CATALOG_CONDITION = threading.Condition()
 CATALOG_REVISION = 0
@@ -3080,14 +3092,47 @@ def _resolve_worktree_root(repo_root: str | None, candidate: str) -> str | None:
     return None
 
 
+def _safe_worktree_delete_target(path: str | Path) -> Path | None:
+    """Resolve a removal candidate, requiring it to live strictly under DATA/worktrees.
+
+    Structural guard for worktree cleanup: rmtree is only ever permitted on a
+    strict descendant of DATA/worktrees. Returns None when the candidate equals
+    DATA/worktrees itself, lies outside it, or cannot be resolved.
+    """
+    try:
+        base = (DATA / "worktrees").resolve(strict=False)
+        candidate = Path(path).resolve(strict=False)
+    except OSError:
+        return None
+    if candidate == base:
+        return None
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+    return candidate
+
+
 def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
-    """Best-effort removal using the registered worktree root, never worker cwd."""
+    """Best-effort removal using the registered worktree root, never worker cwd.
+
+    Removal is structurally confined to registered worktree roots under
+    DATA/worktrees; any candidate outside that tree is refused before any git
+    or filesystem operation, regardless of repo_root state.
+    """
     actual_root = _resolve_worktree_root(repo_root, worktree_path)
     if actual_root is None:
         return
+    safe = _safe_worktree_delete_target(actual_root or worktree_path)
+    if safe is None:
+        print(
+            f"refusing to remove worktree outside DATA/worktrees: {worktree_path}",
+            file=sys.stderr,
+        )
+        return
     if repo_root is not None:
         try:
-            same_root = os.path.normcase(os.path.realpath(actual_root)) == os.path.normcase(
+            same_root = os.path.normcase(os.path.realpath(safe)) == os.path.normcase(
                 os.path.realpath(repo_root)
             )
         except OSError:
@@ -3097,7 +3142,7 @@ def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
     if repo_root:
         try:
             subprocess.run(
-                ["git", "-C", repo_root, "worktree", "remove", "--force", actual_root],
+                ["git", "-C", repo_root, "worktree", "remove", "--force", str(safe)],
                 capture_output=True, text=True, timeout=60,
             )
         except Exception:
@@ -3109,7 +3154,7 @@ def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
             )
         except Exception:
             pass
-    shutil.rmtree(actual_root, ignore_errors=True)
+    shutil.rmtree(safe, ignore_errors=True)
 
 
 
@@ -3128,6 +3173,8 @@ def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
     worktree_root = _resolve_worktree_root(row["repo_root"], candidate)
     if worktree_root is None:
         return None, []
+    if _safe_worktree_delete_target(worktree_root) is None:
+        return None, []
     if not os.path.isdir(worktree_root):
         return None, []
 
@@ -3136,10 +3183,10 @@ def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
     if base_sha:
         diff = subprocess.run(
             ["git", "-C", worktree_root, "diff", "--binary", base_sha],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            capture_output=True, timeout=60,
         )
         if diff.returncode == 0 and diff.stdout.strip():
-            patch_path = artifact(agent_id, "worktree_patch", diff.stdout)
+            patch_path = artifact_raw_bytes(agent_id, "worktree_patch", diff.stdout)
 
     untracked: list[dict] = []
     listed = subprocess.run(
@@ -3658,6 +3705,12 @@ def action(name: str, args: dict, context: dict) -> dict:
                     "untracked_artifacts": untracked,
                     "changed_files": [c["path"] for c in changes],
                 }
+                if patch_path is not None:
+                    with gzip.open(ROOT / patch_path, "rb") as handle:
+                        patch_raw = handle.read()
+                    isolation["patch_encoding"] = "raw-gzip"
+                    isolation["patch_size"] = len(patch_raw)
+                    isolation["patch_sha256"] = hashlib.sha256(patch_raw).hexdigest()
             base["isolation"] = isolation
         return base
     if name == "wait":
