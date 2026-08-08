@@ -127,8 +127,9 @@ PROFILES = {
 }
 
 # Create-time worker roles: role -> worktree default + prompt steering suffix.
-# Roles resolve at create time only (no persistence): follow-ups reuse the
-# same agent row whose settings are already fixed.
+# The resolved role is persisted on the agent row (agents.role). Follow-up
+# turns reuse that stored role for scheduling authority; the role prompt
+# policies themselves are applied when the agent is created.
 # NOTE: read-only roles are enforced by PROMPT POLICY only, not by
 # OS/tool-level sandbox enforcement (documented limitation).
 ROLE_POLICIES = {
@@ -1948,14 +1949,6 @@ def maybe_schedule_delivery(agent_id: str) -> int:
             )
             if active:
                 return 0
-            rows = db.execute(
-                "SELECT id,from_peer,body FROM agent_messages "
-                "WHERE to_peer=? AND state='pending' AND consumed_at IS NULL AND target_turn_id IS NULL "
-                "ORDER BY created_at ASC,id ASC LIMIT 100",
-                (agent_id,),
-            ).fetchall()
-            if not rows:
-                return 0
             if agent["role"] in ROLE_POLICIES:
                 # Main-owned scheduling authority: Codex/Main is the only
                 # orchestrator, so only Main-authored messages may auto-wake a
@@ -1965,10 +1958,29 @@ def maybe_schedule_delivery(agent_id: str) -> int:
                 # marked delivered, NOT consumed, their target_turn_id stays
                 # NULL, and no follow-up is created. They simply lack the
                 # authority to re-activate a completed orchestrate worker.
+                # The authority sender filter MUST run inside SQL BEFORE the
+                # delivery batch LIMIT: otherwise >100 older pending peer
+                # messages would consume the entire selection window and
+                # starve newer Main-authored work (control-plane liveness).
                 main_peer = main_peer_id(str(agent["thread_id"]))
-                rows = [row for row in rows if str(row["from_peer"]) == main_peer]
-                if not rows:
-                    return 0
+                rows = db.execute(
+                    "SELECT id,from_peer,body FROM agent_messages "
+                    "WHERE to_peer=? AND state='pending' AND consumed_at IS NULL AND target_turn_id IS NULL "
+                    "AND from_peer=? "
+                    "ORDER BY created_at ASC,id ASC LIMIT 100",
+                    (agent_id, main_peer),
+                ).fetchall()
+            else:
+                # Legacy Agent Fabric semantics: a completed role=NULL worker
+                # may be auto-woken by any sender (no Main sender gate).
+                rows = db.execute(
+                    "SELECT id,from_peer,body FROM agent_messages "
+                    "WHERE to_peer=? AND state='pending' AND consumed_at IS NULL AND target_turn_id IS NULL "
+                    "ORDER BY created_at ASC,id ASC LIMIT 100",
+                    (agent_id,),
+                ).fetchall()
+            if not rows:
+                return 0
 
             blocks: list[str] = []
             message_ids: list[str] = []
@@ -3199,15 +3211,27 @@ def resolve_agent_settings(profile: str, worktree, max_turns, *, role=None) -> t
 
     Returns (defaults, effective_worktree, effective_max_turns). Raises
     ValueError on unknown profile, out-of-range max_turns, or invalid role.
+
+    Worktree precedence: explicit ``worktree`` > explicit non-default
+    ``profile`` > role ``worktree_default`` > default profile. An explicitly
+    requested safety profile (e.g. ``isolated``) must never be downgraded by
+    a role's worktree default.
     """
     role = validate_role(role)
+    raw_profile = profile
     profile = str(profile or "default")
     if profile not in PROFILES:
         raise ValueError(f"unknown profile: {profile}")
     defaults = PROFILES[profile]
-    # Explicit worktree always wins; otherwise role default; otherwise profile.
+    explicit_nondefault_profile = (
+        raw_profile is not None
+        and bool(str(raw_profile).strip())
+        and str(raw_profile) != "default"
+    )
     if worktree is not None:
         effective_worktree = bool(worktree)
+    elif explicit_nondefault_profile:
+        effective_worktree = defaults["worktree"]
     elif role is not None:
         effective_worktree = ROLE_POLICIES[role]["worktree_default"]
     else:

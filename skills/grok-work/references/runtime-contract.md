@@ -49,7 +49,9 @@ implement:  默认 isolated worktree（worktree_default=True），允许写
 review:     prompt 带只读策略；git-backed 任务由 grok-work 契约默认 isolated worktree
 ```
 
-- 显式 `worktree` 参数总是覆盖 role 默认；role 不覆盖显式 profile；
+- worktree precedence：显式 `worktree` > 显式非 default profile > role `worktree_default` > default profile；
+  显式安全 profile（如 `isolated`）不会被 role 默认降级；grok-work 的 git-backed role invocation
+  默认显式 `worktree=true`（Explorer/Implementer/Reviewer 全隔离）；
 - `status` / `result` / viewer public/detail / hub peer list 暴露 role；
 - completed follow-up 复用同一 agent 行，role 自然继承，不重新解析。
 
@@ -66,7 +68,11 @@ runtime 的 `maybe_schedule_delivery` 对 **role-tagged** completed worker 施�
   Implementer Fix Order、Explorer clarification follow-up、Reviewer re-review request；
   而 Reviewer→Implementer、Explorer→Reviewer、Implementer→Reviewer 均不能自动创建 turn；
 - `agents.role IS NULL` 的 legacy agents 保持历史 Agent Fabric auto-followup 行为不变；
-- recovery/delivery sweep 走同一个 gate：peer-only pending 不会唤醒 role-tagged worker。
+- recovery/delivery sweep 走同一个 gate：peer-only pending 不会唤醒 role-tagged worker；
+- authority sender filtering 发生在 delivery batch LIMIT **之前**（SQL 层先按
+  `from_peer = main_peer_id(thread_id)` 过滤，再 `ORDER BY created_at,id LIMIT 100`）。
+  Unauthorized peer messages cannot consume the authorized delivery selection
+  window and therefore cannot starve newer Main-authored work（control-plane liveness invariant）。
 
 worker 如果处于 active/running 状态并主动通过 inbox/wait 读取 peer clarification，现有协作能力继续存在；
 只是 completed orchestrate worker 不会被 peer 自动重新激活。

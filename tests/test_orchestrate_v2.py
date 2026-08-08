@@ -29,6 +29,7 @@ import os
 import subprocess
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -313,12 +314,13 @@ class RoleResolutionTests(OrchestrateV2Mixin, unittest.TestCase):
 
     A role is a create-time overlay: it fills the worktree default when the
     caller omitted ``worktree`` and appends a role-specific policy suffix to
-    the effective prompt. An explicit ``worktree`` argument always wins over
-    the role default, roles do not override an explicit profile, invalid
-    roles raise ValueError before any durable state, and the batch-level
-    role default is validated once up front. Read-only enforcement is prompt
-    policy only (no OS/tool-level sandbox). All assertions are behavioral
-    (DB rows, action responses, stored turn prompts, command builder).
+    the effective prompt. Worktree precedence is: explicit ``worktree`` >
+    explicit non-default ``profile`` > role ``worktree_default`` > default
+    profile. Invalid roles raise ValueError before any durable state, and
+    the batch-level role default is validated once up front. Read-only
+    enforcement is prompt policy only (no OS/tool-level sandbox). All
+    assertions are behavioral (DB rows, action responses, stored turn
+    prompts, command builder).
     """
 
     def _turn_prompt(self, agent_id: str) -> str:
@@ -423,6 +425,48 @@ class RoleResolutionTests(OrchestrateV2Mixin, unittest.TestCase):
         self.assertIsNotNone(row["worktree_root"], "explicit worktree=True must win over the explore default")
         self.assertEqual(row["isolation_mode"], "worktree")
         self.assertIn("[role: explore]", self._turn_prompt(aid))
+
+    def test_explicit_nondefault_profile_wins_over_role_default(self):
+        """B7: profile='isolated' beats the explore/review shared-cwd defaults.
+
+        An explicitly requested safety profile must never be downgraded by a
+        role's worktree_default (regression: it used to become worktree=False).
+        """
+        repo = self._make_git_repo(self.root / "repo")
+        for role in ("explore", "review"):
+            created = self._create(
+                f"t-role-profile-{role}", name=f"p-{role}", prompt="investigate",
+                cwd=str(repo), profile="isolated", role=role,
+            )
+            row = self._agent_row(created["agent_id"])
+            self.assertIsNotNone(row["worktree_root"], f"isolated profile must win over {role} default")
+            self.assertIsNotNone(row["worktree_path"])
+            self.assertEqual(row["isolation_mode"], "worktree")
+            self.assertIn(f"[role: {role}]", self._turn_prompt(created["agent_id"]))
+
+    def test_role_default_wins_over_default_profile(self):
+        """B8: role='implement' default worktree beats the default profile."""
+        repo = self._make_git_repo(self.root / "repo")
+        created = self._create(
+            "t-role-profile-impl", name="impl", prompt="build it", cwd=str(repo),
+            role="implement",
+        )
+        row = self._agent_row(created["agent_id"])
+        self.assertIsNotNone(row["worktree_root"], "implement role default must beat the default profile")
+        self.assertEqual(row["isolation_mode"], "worktree")
+
+    def test_explicit_worktree_false_wins_over_isolated_profile_and_role(self):
+        """B9: explicit worktree=False beats profile='isolated' + role='implement'."""
+        repo = self._make_git_repo(self.root / "repo")
+        created = self._create(
+            "t-role-profile-explicit", name="impl", prompt="build it", cwd=str(repo),
+            profile="isolated", role="implement", worktree=False,
+        )
+        row = self._agent_row(created["agent_id"])
+        self.assertIsNone(row["worktree_root"], "explicit worktree=False must win over everything")
+        self.assertIsNone(row["worktree_path"])
+        self.assertEqual(row["isolation_mode"], "shared")
+        self.assertEqual(Path(row["cwd"]), repo)
 
     def test_flat_topology_unchanged(self):
         """B6: role plumbing must not change the flat grok_command topology."""
@@ -880,6 +924,166 @@ class MainOwnedFollowupAuthorityTests(OrchestrateV2Mixin, unittest.TestCase):
         self.assertEqual(len(followups), 1, "Main must be able to wake the reviewer for re-review")
         self.assertEqual(followups[0]["agent_id"], review_aid, "re-review must reuse the reviewer row")
         self.assertEqual(msg["target_turn_id"], followups[0]["id"])
+
+    def test_main_message_not_starved_by_older_peer_messages(self):
+        """T8: >100 older peer messages cannot starve a newer Main Fix Order.
+
+        The authority sender filter must run inside SQL before the delivery
+        batch LIMIT; otherwise the first 100 peer rows would consume the
+        entire selection window and Main's later message would never be
+        claimed, leaving the control plane unable to re-activate the worker.
+        """
+        thread_id = "t-auth-t8"
+        aid = self.seed_agent(thread_id, "completed")
+        with daemon.connect() as db:
+            db.execute("UPDATE agents SET role='implement' WHERE id=?", (aid,))
+        for index in range(125):
+            daemon.MAILBOX.send(
+                thread_id=thread_id, from_peer="reviewer-peer", to_peer=aid,
+                body=f"peer-{index:03d}",
+            )
+        with daemon.connect() as db:
+            peers = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages "
+                "WHERE to_peer=? AND from_peer='reviewer-peer'",
+                (aid,),
+            ).fetchone()["c"]
+            unclaimed = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages "
+                "WHERE to_peer=? AND target_turn_id IS NULL",
+                (aid,),
+            ).fetchone()["c"]
+        self.assertEqual(peers, 125)
+        self.assertEqual(unclaimed, 125, "all peer messages must stay pending and unclaimed")
+
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=aid,
+            body="Fix Order: authoritative change",
+        )
+        with daemon.connect() as db:
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+            main_msg = db.execute(
+                "SELECT target_turn_id FROM agent_messages "
+                "WHERE to_peer=? AND from_peer=?",
+                (aid, main_peer_id(thread_id)),
+            ).fetchone()
+            peer_rows = db.execute(
+                "SELECT state,target_turn_id,consumed_at FROM agent_messages "
+                "WHERE to_peer=? AND from_peer='reviewer-peer'",
+                (aid,),
+            ).fetchall()
+            turn_prompt = db.execute(
+                "SELECT prompt FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["prompt"]
+        self.assertEqual(turns, 1, "Main must be scheduled despite 125 older peer messages")
+        self.assertIsNotNone(main_msg["target_turn_id"], "Main message must be claimed")
+        for row in peer_rows:
+            self.assertEqual(row["state"], "pending", "no peer message may be claimed")
+            self.assertIsNone(row["target_turn_id"])
+            self.assertIsNone(row["consumed_at"])
+        self.assertIn("Fix Order: authoritative change", turn_prompt)
+        self.assertNotIn("peer-000", turn_prompt, "peer messages must not be coalesced into the turn")
+
+    def test_delivery_sweep_not_starved_by_older_peer_messages(self):
+        """T9: delivery_sweep must not be stuck behind the first 100 peer rows.
+
+        With >100 older peer messages pending and no Main message, the sweep
+        creates no follow-up. Once a Main message exists, the same sweep must
+        claim it even though every row ahead of it in created_at order is an
+        unauthorized peer message.
+        """
+        thread_id = "t-auth-t9"
+        aid = self.seed_agent(thread_id, "completed")
+        with daemon.connect() as db:
+            db.execute("UPDATE agents SET role='implement' WHERE id=?", (aid,))
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            for index in range(125):
+                db.execute(
+                    "INSERT INTO agent_messages(id,thread_id,from_peer,to_peer,body,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), thread_id, "reviewer-peer", aid, f"peer-{index:03d}", stamp),
+                )
+        daemon.delivery_sweep()
+        with daemon.connect() as db:
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+        self.assertEqual(turns, 0, "peer-only sweep must not create a follow-up")
+
+        with daemon.connect() as db:
+            db.execute(
+                "INSERT INTO agent_messages(id,thread_id,from_peer,to_peer,body,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (str(uuid.uuid4()), thread_id, main_peer_id(thread_id), aid,
+                 "Fix Order: authoritative change", daemon.now()),
+            )
+        daemon.delivery_sweep()
+        with daemon.connect() as db:
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+            main_msg = db.execute(
+                "SELECT target_turn_id FROM agent_messages "
+                "WHERE to_peer=? AND from_peer=?",
+                (aid, main_peer_id(thread_id)),
+            ).fetchone()
+            unclaimed_peers = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages "
+                "WHERE to_peer=? AND from_peer='reviewer-peer' AND target_turn_id IS NULL",
+                (aid,),
+            ).fetchone()["c"]
+        self.assertEqual(turns, 1, "sweep must claim Main despite 125 older peer messages")
+        self.assertIsNotNone(main_msg["target_turn_id"])
+        self.assertEqual(unclaimed_peers, 125, "every peer message must stay unclaimed")
+
+    def test_main_batch_limit_applies_after_authority_filter(self):
+        """T10: LIMIT 100 applies to the Main-authorized window only.
+
+        100 peer + 100 Main pending messages: the scheduler claims the whole
+        Main batch in one follow-up while every peer message stays pending
+        and unclaimed. Guards the boundary of the pre-LIMIT sender filter.
+        """
+        thread_id = "t-auth-t10"
+        aid = self.seed_agent(thread_id, "completed")
+        with daemon.connect() as db:
+            db.execute("UPDATE agents SET role='implement' WHERE id=?", (aid,))
+        stamp = daemon.now()
+        with daemon.connect() as db:
+            for index in range(100):
+                db.execute(
+                    "INSERT INTO agent_messages(id,thread_id,from_peer,to_peer,body,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), thread_id, "reviewer-peer", aid, f"peer-{index:03d}", stamp),
+                )
+            for index in range(100):
+                db.execute(
+                    "INSERT INTO agent_messages(id,thread_id,from_peer,to_peer,body,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), thread_id, main_peer_id(thread_id), aid,
+                     f"main-{index:03d}", stamp),
+                )
+        with mock.patch.object(daemon, "get_runner", return_value=None):
+            self.assertEqual(daemon.maybe_schedule_delivery(aid), 100)
+        with daemon.connect() as db:
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+            claimed_main = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages "
+                "WHERE to_peer=? AND from_peer=? AND target_turn_id IS NOT NULL",
+                (aid, main_peer_id(thread_id)),
+            ).fetchone()["c"]
+            claimed_peers = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages "
+                "WHERE to_peer=? AND from_peer='reviewer-peer' AND target_turn_id IS NOT NULL",
+                (aid,),
+            ).fetchone()["c"]
+        self.assertEqual(turns, 1)
+        self.assertEqual(claimed_main, 100, "all 100 Main messages must be claimed in one batch")
+        self.assertEqual(claimed_peers, 0, "no peer message may be claimed")
 
 
 class ReadOnlyRoleIsolationTests(OrchestrateV2Mixin, unittest.TestCase):

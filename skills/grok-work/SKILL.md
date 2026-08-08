@@ -58,7 +58,7 @@ Reviewer:    worktree=true
 Implementer: worktree=true
 ```
 
-worker 不直接站在用户 dirty working tree 上。例外：**只有任务明确依赖当前未提交工作区内容**，Main 才可以决定 `worktree=false`，并在 work order 中记录：为什么必须读取 dirty state；read-only 仍只是 prompt policy，不能声称硬 sandbox。runtime 保持 generic（显式 `worktree` 覆盖 role 默认；非 git cwd 自动回落共享目录）。
+worker 不直接站在用户 dirty working tree 上。例外：**只有任务明确依赖当前未提交工作区内容**，Main 才可以决定 `worktree=false`，并在 work order 中记录：为什么必须读取 dirty state；read-only 仍只是 prompt policy，不能声称硬 sandbox。runtime 保持 generic（显式 `worktree` 覆盖 role 默认；runtime 不会自动从失败的 isolated-worktree 创建降级为 shared cwd——non-git cwd 应由 Main 显式选择 `worktree=false`）。
 
 ## 先定复杂度，再定 agent graph
 
