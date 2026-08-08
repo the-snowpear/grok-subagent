@@ -232,12 +232,35 @@ class Mailbox:
                 time.sleep(retries[attempt])
                 attempt += 1
 
+    def _cursor_bound(self, peer_id: str, after_message_id: str | None) -> int | None:
+        """Resolve a wait cursor to its rowid (insertion-order) bound.
+
+        The lookup is scoped to this caller's inbox (to_peer=peer_id): a
+        foreign message id (addressed to another peer) or an expired/unknown
+        id yields None, which means no filtering — the caller may re-see old
+        messages but never skips pending ones (progress without message loss).
+        Rowid, not (created_at, id), is the cursor key so same-timestamp
+        messages keep their true insertion order instead of an arbitrary
+        uuid4 order.
+        """
+        if not after_message_id:
+            return None
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT rowid FROM agent_messages WHERE id=? AND to_peer=?",
+                (after_message_id, peer_id),
+            ).fetchone()
+        if not row:
+            return None
+        return int(row["rowid"])
+
     def _select_unconsumed(
         self,
         *,
         peer_id: str,
         from_peer: str | None = None,
         limit: int = MAX_INBOX_MESSAGES,
+        after_message_id: str | None = None,
     ) -> list[Message]:
         where = [
             "to_peer=?",
@@ -249,11 +272,15 @@ class Mailbox:
         if from_peer is not None:
             where.append("from_peer=?")
             params.append(from_peer)
+        cursor = self._cursor_bound(peer_id, after_message_id)
+        if cursor is not None:
+            where.append("rowid > ?")
+            params.append(cursor)
         params.append(max(1, min(limit, MAX_INBOX_MESSAGES)))
         sql = (
             "SELECT * FROM agent_messages "
             f"WHERE {' AND '.join(where)} "
-            "ORDER BY created_at ASC, id ASC LIMIT ?"
+            "ORDER BY rowid ASC LIMIT ?"
         )
         with self._connect() as db:
             rows = db.execute(sql, tuple(params)).fetchall()
@@ -284,7 +311,7 @@ class Mailbox:
                   AND state='pending'
                   AND consumed_at IS NULL
                   AND target_turn_id IS NULL
-                ORDER BY created_at ASC, id ASC
+                ORDER BY rowid ASC
                 LIMIT ?
                 """,
                 (peer_id, MAX_INBOX_MESSAGES),
@@ -359,11 +386,13 @@ class Mailbox:
         *,
         peer_id: str,
         from_peer: str | None = None,
+        after_message_id: str | None = None,
     ) -> Message | None:
         messages = self._select_unconsumed(
             peer_id=peer_id,
             from_peer=from_peer,
             limit=1,
+            after_message_id=after_message_id,
         )
         return messages[0] if messages else None
 

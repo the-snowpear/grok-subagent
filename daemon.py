@@ -151,6 +151,26 @@ def validate_role(value) -> str:
         raise ValueError("role must be one of: explore, implement, review")
     return value
 
+# V2.1 result payload granularity: compact (bounded, model-facing default) and
+# full (legacy turn_results/changes preserved verbatim).
+RESULT_DETAILS = ("compact", "full")
+
+# Main-facing hub inbox/wait/wait_any externalize UTF-8 message bodies above
+# this byte size into preview/size/sha256/body_externalized/artifact_ref. The
+# DB row and worker-facing mailbox surfaces stay byte-for-byte lossless.
+MAIN_BODY_EXTERNALIZE_BYTES = 8192
+BODY_PREVIEW_CHARS = 2000
+
+
+class AgentOperationalError(ValueError):
+    """A create failure caused by runtime capacity/resources, not bad input.
+
+    Lets create_agents classify per-item errors: validation (bad arguments),
+    operational (limits, worktree/environment failures), internal (unexpected
+    exceptions, which stop the batch explicitly).
+    """
+
+
 # Canonical control-plane field for per-agent reasoning effort. The installed
 # grok CLI accepts arbitrary --reasoning-effort values (no enum is documented
 # or enforced client-side; "max" is the verified runtime default), so we
@@ -421,6 +441,12 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_agent_messages_target_state_created ON agent_messages(to_peer, state, created_at);
             CREATE INDEX IF NOT EXISTS idx_agent_messages_thread_created ON agent_messages(thread_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_agent_messages_reply ON agent_messages(reply_to);
+            CREATE TABLE IF NOT EXISTS artifact_refs(
+              agent_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
+              path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
+              encoding TEXT NOT NULL, created_at TEXT NOT NULL,
+              PRIMARY KEY(agent_id, kind, path)
+            );
             """
         )
         # Best-effort migrations for older local DBs.
@@ -553,6 +579,104 @@ def artifact_raw_bytes(agent_id: str, label: str, content: bytes) -> str:
         with gzip.open(path, "wb") as handle:
             handle.write(content)
     return str(path.relative_to(ROOT))
+
+
+def _stream_gzip_artifact(agent_id: str, label: str, reader) -> tuple[str, str, int]:
+    """Stream reader bytes into a raw-gzip artifact, hashing/sizing on the fly.
+
+    Never reads the whole content into memory: the caller supplies a chunk
+    reader (file object or subprocess stdout) and receives the artifact
+    relative path plus sha256/size of the RAW (uncompressed) bytes. Used for
+    worktree diff patches and externalized message bodies so metadata never
+    requires a whole-artifact reread.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    folder = ARTIFACTS / agent_id
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / f".{label}-{uuid.uuid4().hex}.tmp"
+    try:
+        with gzip.open(tmp, "wb") as handle:
+            while True:
+                chunk = reader.read(65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                handle.write(chunk)
+        final = folder / f"{label}-{digest.hexdigest()[:16]}.gz"
+        if final.exists():
+            tmp.unlink(missing_ok=True)
+        else:
+            tmp.replace(final)
+        return str(final.relative_to(ROOT)), digest.hexdigest(), size
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _stream_base64_gzip_artifact(agent_id: str, label: str, reader) -> tuple[str, str, int]:
+    """Stream raw bytes into a base64-text gzip artifact (binary replay contract).
+
+    The stored artifact is the base64 encoding of the raw bytes (legacy
+    untracked-file contract), while sha256/size report the RAW bytes.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    folder = ARTIFACTS / agent_id
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / f".{label}-{uuid.uuid4().hex}.tmp"
+    try:
+        with gzip.open(tmp, "wt", encoding="ascii") as handle:
+            while True:
+                chunk = reader.read(65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                handle.write(base64.b64encode(chunk).decode("ascii"))
+        final = folder / f"{label}-{digest.hexdigest()[:16]}.txt.gz"
+        if final.exists():
+            tmp.unlink(missing_ok=True)
+        else:
+            tmp.replace(final)
+        return str(final.relative_to(ROOT)), digest.hexdigest(), size
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def record_artifact_ref(agent_id: str, kind: str, label: str, path: str, sha256: str, size: int, encoding: str) -> None:
+    """Durably record one structured artifact ref (post-worktree evidence)."""
+    with connect() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO artifact_refs(agent_id,kind,label,path,sha256,size,encoding,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (agent_id, kind, label, path, sha256, size, encoding, now()),
+        )
+
+
+def _artifact_refs(agent_id: str, kind: str | None = None) -> list[dict]:
+    """Return recorded artifact refs for an agent, newest first."""
+    sql = "SELECT agent_id,kind,label,path,sha256,size,encoding,created_at FROM artifact_refs WHERE agent_id=?"
+    params: list[object] = [agent_id]
+    if kind is not None:
+        sql += " AND kind=?"
+        params.append(kind)
+    sql += " ORDER BY created_at DESC, rowid DESC"
+    with connect() as db:
+        rows = db.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def artifact_ref_dict(agent_id: str, path: str, sha256: str, size: int, encoding: str) -> dict:
+    """Structured artifact ref: safe absolute path + relative path + hash + size + encoding."""
+    return {
+        "path": path,
+        "relative_path": path,
+        "absolute_path": str((ROOT / path).resolve()),
+        "sha256": sha256,
+        "size": size,
+        "encoding": encoding,
+    }
 
 
 # Catalog (sidebar) waiters: one global condition; bumped on any agent/task meta change.
@@ -2059,7 +2183,8 @@ def maybe_schedule_delivery(agent_id: str) -> int:
             if claimed_count != len(message_ids):
                 raise RuntimeError("mailbox delivery claim race; transaction rolled back")
             db.execute(
-                "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=? AND status='completed'",
+                "UPDATE agents SET status='queued',signoff_verdict=NULL,signoff_summary='',verification='',"
+                "updated_at=?,revision=revision+1 WHERE id=? AND status='completed'",
                 (now(), agent_id),
             )
 
@@ -3271,6 +3396,7 @@ def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple
     repo = subprocess.run(
         ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, timeout=20,
+        encoding="utf-8", errors="replace",
     )
     if repo.returncode != 0:
         raise ValueError("worktree isolation requires a git repository")
@@ -3279,6 +3405,7 @@ def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple
     base = subprocess.run(
         ["git", "-C", repo_root, "rev-parse", "HEAD"],
         capture_output=True, text=True, timeout=20,
+        encoding="utf-8", errors="replace",
     )
     if base.returncode != 0 or not base.stdout.strip():
         raise ValueError("failed to resolve worktree base")
@@ -3286,6 +3413,7 @@ def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple
     status = subprocess.run(
         ["git", "-C", repo_root, "status", "--porcelain"],
         capture_output=True, text=True, timeout=20,
+        encoding="utf-8", errors="replace",
     )
     dirty_parent = bool(status.stdout.strip())
 
@@ -3296,6 +3424,7 @@ def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple
     result = subprocess.run(
         ["git", "-C", repo_root, "worktree", "add", "--detach", str(worktree_root), base_sha],
         capture_output=True, text=True, timeout=60,
+        encoding="utf-8", errors="replace",
     )
     if result.returncode != 0:
         shutil.rmtree(worktree_root, ignore_errors=True)
@@ -3328,6 +3457,7 @@ def _resolve_worktree_root(repo_root: str | None, candidate: str) -> str | None:
             probe = subprocess.run(
                 ["git", "-C", repo_root, "rev-parse", "--show-toplevel"],
                 capture_output=True, text=True, timeout=20,
+                encoding="utf-8", errors="replace",
             )
             if probe.returncode == 0 and probe.stdout.strip():
                 main_root = probe.stdout.strip()
@@ -3350,6 +3480,7 @@ def _resolve_worktree_root(repo_root: str | None, candidate: str) -> str | None:
             resolved = subprocess.run(
                 ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
                 capture_output=True, text=True, timeout=20,
+                encoding="utf-8", errors="replace",
             )
             if resolved.returncode == 0 and resolved.stdout.strip():
                 root = resolved.stdout.strip()
@@ -3362,6 +3493,7 @@ def _resolve_worktree_root(repo_root: str | None, candidate: str) -> str | None:
             listed = subprocess.run(
                 ["git", "-C", repo_root, "worktree", "list", "--porcelain"],
                 capture_output=True, text=True, timeout=20,
+                encoding="utf-8", errors="replace",
             )
             if listed.returncode == 0:
                 target = path.resolve()
@@ -3434,6 +3566,7 @@ def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
             subprocess.run(
                 ["git", "-C", repo_root, "worktree", "remove", "--force", str(safe)],
                 capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
             )
         except Exception:
             pass
@@ -3441,6 +3574,7 @@ def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
             subprocess.run(
                 ["git", "-C", repo_root, "worktree", "prune"],
                 capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
             )
         except Exception:
             pass
@@ -3449,7 +3583,14 @@ def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
 
 
 def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
-    """Snapshot isolated changes into a tracked patch plus lossless untracked artifacts."""
+    """Snapshot isolated changes into a tracked patch plus lossless untracked artifacts.
+
+    Patch and untracked content are streamed chunk-by-chunk into gzip artifacts
+    (sha256/size computed on the raw bytes as they flow; the diff is never
+    capture_output'd and files are never read whole). Every artifact ref is
+    recorded durably in artifact_refs so a result still exposes full evidence
+    after the worktree has been deleted (post-worktree evidence).
+    """
     with connect() as db:
         row = db.execute(
             "SELECT worktree_root,worktree_path,worktree_base_sha,repo_root FROM agents WHERE id=?",
@@ -3462,45 +3603,109 @@ def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
         return None, []
     worktree_root = _resolve_worktree_root(row["repo_root"], candidate)
     if worktree_root is None:
-        return None, []
+        # The worktree may already have been deleted by cleanup (git worktree
+        # remove + prune leaves no resolvable root). Post-worktree evidence
+        # replay stays allowed when the registered candidate is a strict
+        # DATA/worktrees descendant; any other candidate refuses. This only
+        # gates evidence replay — destructive removal safety is unchanged.
+        if _safe_worktree_delete_target(candidate) is None:
+            return None, []
+        worktree_root = candidate
     if _safe_worktree_delete_target(worktree_root) is None:
         return None, []
-    if not os.path.isdir(worktree_root):
-        return None, []
+    if os.path.isdir(worktree_root):
+        base_sha = row["worktree_base_sha"]
+        patch_path = None
+        if base_sha:
+            # Stream the diff: gzip + hash while reading; no capture_output.
+            proc = subprocess.Popen(
+                ["git", "-C", worktree_root, "diff", "--binary", base_sha],
+                stdout=subprocess.PIPE,
+            )
+            assert proc.stdout is not None
+            patch_sha = ""
+            patch_size = 0
+            try:
+                patch_path, patch_sha, patch_size = _stream_gzip_artifact(
+                    agent_id, "worktree_patch", proc.stdout
+                )
+                proc.wait(timeout=60)
+            finally:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    proc.wait()
+            if proc.returncode != 0 or patch_size == 0:
+                if patch_path is not None:
+                    try:
+                        (ROOT / patch_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                patch_path = None
+                if proc.returncode == 0:
+                    # Clean empty diff: the worktree no longer differs from
+                    # base, so any previously recorded patch ref is stale.
+                    with connect() as db:
+                        db.execute(
+                            "DELETE FROM artifact_refs WHERE agent_id=? AND kind='patch'",
+                            (agent_id,),
+                        )
+            else:
+                record_artifact_ref(
+                    agent_id, "patch", "worktree_patch", patch_path, patch_sha, patch_size, "raw-gzip"
+                )
 
-    base_sha = row["worktree_base_sha"]
-    patch_path = None
-    if base_sha:
-        diff = subprocess.run(
-            ["git", "-C", worktree_root, "diff", "--binary", base_sha],
+        untracked: list[dict] = []
+        listed = subprocess.run(
+            ["git", "-C", worktree_root, "ls-files", "--others", "--exclude-standard", "-z"],
             capture_output=True, timeout=60,
         )
-        if diff.returncode == 0 and diff.stdout.strip():
-            patch_path = artifact_raw_bytes(agent_id, "worktree_patch", diff.stdout)
+        if listed.returncode == 0:
+            for raw in listed.stdout.split(b"\0"):
+                if not raw:
+                    continue
+                rel = raw.decode("utf-8", errors="replace")
+                safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", rel)[:100] or "file"
+                file_path = Path(worktree_root) / rel
+                try:
+                    with file_path.open("rb") as reader:
+                        artifact_path, sha256, raw_size = _stream_base64_gzip_artifact(
+                            agent_id, "untracked_" + safe_label, reader
+                        )
+                except OSError:
+                    continue
+                record_artifact_ref(
+                    agent_id, "untracked", rel, artifact_path, sha256, raw_size, "base64"
+                )
+                untracked.append({
+                    "path": rel,
+                    "artifact": artifact_path,
+                    "encoding": "base64",
+                    "size": raw_size,
+                    "sha256": sha256,
+                    "ref": artifact_ref_dict(agent_id, artifact_path, sha256, raw_size, "base64"),
+                })
+        return patch_path, untracked
 
-    untracked: list[dict] = []
-    listed = subprocess.run(
-        ["git", "-C", worktree_root, "ls-files", "--others", "--exclude-standard", "-z"],
-        capture_output=True, timeout=60,
-    )
-    if listed.returncode == 0:
-        for raw in listed.stdout.split(b"\0"):
-            if not raw:
-                continue
-            rel = raw.decode("utf-8", errors="replace")
-            try:
-                content = (Path(worktree_root) / rel).read_bytes()
-            except OSError:
-                continue
-            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", rel)[:100] or "file"
-            artifact_path = artifact_bytes(agent_id, "untracked_" + safe_label, content)
-            untracked.append({
-                "path": rel,
-                "artifact": artifact_path,
-                "encoding": "base64",
-                "size": len(content),
-                "sha256": hashlib.sha256(content).hexdigest(),
-            })
+    # Worktree already deleted: replay evidence from the durable refs table.
+    patch_ref = _artifact_refs(agent_id, "patch")
+    patch_path = patch_ref[0]["path"] if patch_ref else None
+    untracked = []
+    for ref in _artifact_refs(agent_id, "untracked"):
+        untracked.append({
+            "path": ref["label"],
+            "artifact": ref["path"],
+            "encoding": ref["encoding"],
+            "size": ref["size"],
+            "sha256": ref["sha256"],
+            "ref": artifact_ref_dict(agent_id, ref["path"], ref["sha256"], ref["size"], ref["encoding"]),
+        })
     return patch_path, untracked
 
 
@@ -3531,7 +3736,7 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                     (thread_id,),
                 ).fetchone()["c"]
                 if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
-                    raise ValueError(
+                    raise AgentOperationalError(
                         f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
                         f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
                     )
@@ -3539,13 +3744,18 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                     "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
                 ).fetchone()["c"]
                 if int(active_count) >= MAX_ACTIVE_AGENTS:
-                    raise ValueError(
+                    raise AgentOperationalError(
                         f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
                         f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
                     )
-            worktree_path, worktree_meta = create_agent_worktree(
-                Path(original_cwd_value), agent_id, Path(original_cwd_value)
-            )
+            try:
+                worktree_path, worktree_meta = create_agent_worktree(
+                    Path(original_cwd_value), agent_id, Path(original_cwd_value)
+                )
+            except ValueError as exc:
+                # Environment/capacity failures (no git repo, worktree add
+                # failure) are operational, not argument validation.
+                raise AgentOperationalError(str(exc)) from exc
             worktree_root = worktree_meta.get("worktree_root")
             cwd = worktree_path
 
@@ -3555,7 +3765,7 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                 (thread_id,),
             ).fetchone()["c"]
             if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
-                raise ValueError(
+                raise AgentOperationalError(
                     f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
                     f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
                 )
@@ -3563,7 +3773,7 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                 "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
             ).fetchone()["c"]
             if int(active_count) >= MAX_ACTIVE_AGENTS:
-                raise ValueError(
+                raise AgentOperationalError(
                     f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
                     f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
                 )
@@ -3643,7 +3853,7 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
                     db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                     db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
                 reclaim_agent_resources(agent_id)
-                raise ValueError(
+                raise AgentOperationalError(
                     f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
                     f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
                 )
@@ -3662,6 +3872,35 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
     }
 
 
+def _main_artifact_folder(peer_id: str) -> str:
+    """Sanitized artifact folder for Main-bound message bodies (Windows-safe)."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(peer_id)) or "main"
+
+
+def _externalize_main_message(msg: dict) -> dict:
+    """Externalize a Main-facing mailbox message body above the size threshold.
+
+    The DB row and worker-facing mailbox surfaces keep the byte-for-byte
+    lossless body; only Main-facing surfaces (hub inbox/wait, wait_any) get
+    preview/size/sha256/body_externalized/artifact_ref for large UTF-8 bodies.
+    """
+    body = str(msg.get("body") or "")
+    size = len(body.encode("utf-8"))
+    if size <= MAIN_BODY_EXTERNALIZE_BYTES:
+        msg["body_externalized"] = False
+        return msg
+    sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    folder = _main_artifact_folder(msg.get("to_peer") or "main")
+    path = artifact_raw_bytes(folder, "message_body", body.encode("utf-8"))
+    external = dict(msg)
+    external["body"] = body[:BODY_PREVIEW_CHARS]
+    external["body_externalized"] = True
+    external["size"] = size
+    external["sha256"] = sha256
+    external["artifact_ref"] = artifact_ref_dict(folder, path, sha256, size, "raw-gzip")
+    return external
+
+
 def action(name: str, args: dict, context: dict) -> dict:
     if name == "ping":
         return {"status": "ok", "viewer_url": viewer_url()}
@@ -3670,7 +3909,13 @@ def action(name: str, args: dict, context: dict) -> dict:
         return {"viewer_url": viewer_url(), "browser_opened": opened}
     if name == "hub":
         thread_id = str(context.get("codex_thread_id") or "unknown")
-        return HUB.handle_main(thread_id=thread_id, args=args)
+        data = HUB.handle_main(thread_id=thread_id, args=args)
+        op = str(args.get("op") or "").strip().lower()
+        if op == "inbox":
+            data["messages"] = [_externalize_main_message(m) for m in data["messages"]]
+        elif op == "wait" and data.get("kind") == "message":
+            data["message"] = _externalize_main_message(data["message"])
+        return data
     if name == "create_agent":
         prompt = str(args.get("prompt", "")).strip()
         agent_name = str(args.get("agent_name", "")).strip()
@@ -3691,7 +3936,7 @@ def action(name: str, args: dict, context: dict) -> dict:
             raise ValueError("at most 20 agents per batch")
         results = []
         errors = []
-        # Validate the batch-level default ONCE up front: an invalid default
+        # Validate the batch-level defaults ONCE up front: an invalid default
         # aborts the whole batch before any agent is created.
         batch_effort = args.get("reasoning_effort")
         if batch_effort is not None:
@@ -3699,27 +3944,52 @@ def action(name: str, args: dict, context: dict) -> dict:
         batch_role = args.get("role")
         if batch_role is not None:
             validate_role(batch_role)
+        batch_worktree = args.get("worktree")
+        if batch_worktree is not None and not isinstance(batch_worktree, bool):
+            raise ValueError("worktree must be a boolean")
+        internal_fatal = False
         for i, item in enumerate(agents):
             if not isinstance(item, dict):
-                errors.append({"index": i, "error": "agent entry must be an object"})
+                errors.append({"index": i, "class": "validation", "error": "agent entry must be an object"})
                 continue
             prompt = str(item.get("prompt", "")).strip()
             agent_name = str(item.get("agent_name", "")).strip()
             if not prompt or not agent_name:
-                errors.append({"index": i, "error": "agent_name and prompt are required"})
+                errors.append({"index": i, "class": "validation", "error": "agent_name and prompt are required"})
+                continue
+            item_worktree = item.get("worktree")
+            if item_worktree is not None and not isinstance(item_worktree, bool):
+                errors.append({"index": i, "class": "validation", "error": "worktree must be a boolean"})
                 continue
             cwd = str(Path(item.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
             try:
                 created = _create_agent_one(
                     agent_name, prompt, cwd, item.get("codex_thread_title"), context,
-                    profile=item.get("profile"), worktree=item.get("worktree"), max_turns=item.get("max_turns"),
+                    profile=item.get("profile"),
+                    worktree=item_worktree if item_worktree is not None else batch_worktree,
+                    max_turns=item.get("max_turns"),
                     reasoning_effort=item.get("reasoning_effort", batch_effort),
                     role=item.get("role", batch_role),
                 )
                 results.append({"index": i, **created})
+            except AgentOperationalError as exc:
+                errors.append({"index": i, "class": "operational", "error": str(exc)})
             except ValueError as exc:
-                errors.append({"index": i, "error": str(exc)})
-        return {"agents": results, "created": len(results), "errors": errors}
+                errors.append({"index": i, "class": "validation", "error": str(exc)})
+            except Exception as exc:  # never silently swallow an internal failure
+                errors.append({
+                    "index": i,
+                    "class": "internal",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                internal_fatal = True
+                break
+        response = {"agents": results, "created": len(results), "errors": errors}
+        if internal_fatal:
+            # Explicit fatal marker: the batch stopped early, created ids so
+            # far remain exposed, and remaining items were not attempted.
+            response["internal_error"] = True
+        return response
     if name == "wait_any":
         raw_ids = args.get("agent_ids") or []
         if not isinstance(raw_ids, list) or any(not str(x).strip() for x in raw_ids):
@@ -3730,6 +4000,10 @@ def action(name: str, args: dict, context: dict) -> dict:
             raise ValueError("timeout_seconds must be an integer")
         timeout = max(1, min(300, raw_timeout))
         from_peer = str(args.get("from") or "").strip() or None
+        after_message_id = args.get("after_message_id")
+        if after_message_id is not None and not isinstance(after_message_id, str):
+            raise ValueError("after_message_id must be a string")
+        after_message_id = str(after_message_id).strip() or None
         thread_id = context.get("codex_thread_id") or "unknown"
         caller = main_peer_id(thread_id)
         # Thread-scoped resolution: cross-thread and unknown ids both resolve to
@@ -3741,9 +4015,10 @@ def action(name: str, args: dict, context: dict) -> dict:
             raise ValueError("peer not found")
         deadline = time.monotonic() + timeout
         while True:
-            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
+            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer, after_message_id=after_message_id)
             if msg is not None:
-                return {"kind": "message", "message": msg.to_dict()}
+                external = _externalize_main_message(msg.to_dict())
+                return {"kind": "message", "message": external, "next_cursor": msg.id}
             for aid in agent_ids:
                 done, data = agent_wait_done(aid)
                 if done:
@@ -3753,9 +4028,10 @@ def action(name: str, args: dict, context: dict) -> dict:
                 return {"kind": "timeout"}
             condition, revision = MAILBOX.wait_surface(caller)
             # Second DB check closes the send-between-check-and-sleep race.
-            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
+            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer, after_message_id=after_message_id)
             if msg is not None:
-                return {"kind": "message", "message": msg.to_dict()}
+                external = _externalize_main_message(msg.to_dict())
+                return {"kind": "message", "message": external, "next_cursor": msg.id}
             for aid in agent_ids:
                 done, data = agent_wait_done(aid)
                 if done:
@@ -3768,8 +4044,11 @@ def action(name: str, args: dict, context: dict) -> dict:
         agent_id, prompt = args.get("agent_id"), str(args.get("prompt", "")).strip()
         if not prompt:
             raise ValueError("prompt is required")
+        thread_id = str(context.get("codex_thread_id") or "unknown")
         with connect() as db:
-            agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute(
+                "SELECT status FROM agents WHERE id=? AND thread_id=?", (agent_id, thread_id)
+            ).fetchone()
             if not agent:
                 raise ValueError("agent not found")
             if agent["status"] == "cancelled":
@@ -3779,11 +4058,20 @@ def action(name: str, args: dict, context: dict) -> dict:
             number = db.execute("SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?", (agent_id,)).fetchone()["n"]
             cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)", (agent_id, number, prompt, now()))
             turn_id = cursor.lastrowid
+            # Scheduling a new authorized turn clears any prior signoff state.
             # While a turn is running, keep aggregate status as running; otherwise queued.
             if agent["status"] != "running":
-                db.execute("UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=?", (now(), agent_id))
+                db.execute(
+                    "UPDATE agents SET status='queued',signoff_verdict=NULL,signoff_summary='',verification='',"
+                    "updated_at=?,revision=revision+1 WHERE id=?",
+                    (now(), agent_id),
+                )
             else:
-                db.execute("UPDATE agents SET updated_at=?,revision=revision+1 WHERE id=?", (now(), agent_id))
+                db.execute(
+                    "UPDATE agents SET signoff_verdict=NULL,signoff_summary='',verification='',"
+                    "updated_at=?,revision=revision+1 WHERE id=?",
+                    (now(), agent_id),
+                )
         runner = get_runner(agent_id)
         assert runner is not None
         with CREATE_LOCK:
@@ -3814,9 +4102,12 @@ def action(name: str, args: dict, context: dict) -> dict:
         except (TypeError, ValueError) as exc:
             raise ValueError("timeout_seconds must be an integer") from exc
         timeout_seconds = min(max(timeout_seconds, 1), 300)
+        thread_id = str(context.get("codex_thread_id") or "unknown")
 
         with connect() as db:
-            agent = db.execute("SELECT status,current_turn FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute(
+                "SELECT status,current_turn FROM agents WHERE id=? AND thread_id=?", (agent_id, thread_id)
+            ).fetchone()
             if not agent:
                 raise ValueError("agent not found")
             if agent["status"] == "cancelled":
@@ -3833,8 +4124,10 @@ def action(name: str, args: dict, context: dict) -> dict:
             turn_id = cursor.lastrowid
             current_turn = int(agent["current_turn"] or 0)
             was_running = agent["status"] == "running" and current_turn > 0
+            # Scheduling a new authorized turn clears any prior signoff state.
             db.execute(
-                "UPDATE agents SET status=?,updated_at=?,revision=revision+1 WHERE id=?",
+                "UPDATE agents SET status=?,signoff_verdict=NULL,signoff_summary='',verification='',"
+                "updated_at=?,revision=revision+1 WHERE id=?",
                 ("running" if was_running else "queued", now(), agent_id),
             )
         runner = get_runner(agent_id)
@@ -3948,13 +4241,20 @@ def action(name: str, args: dict, context: dict) -> dict:
             "lossless_interject": False,
         }
     if name in {"status", "result"}:
+        thread_id = str(context.get("codex_thread_id") or "unknown")
+        if name == "result":
+            detail = str(args.get("detail") or "compact").strip().lower()
+            if detail not in RESULT_DETAILS:
+                raise ValueError("detail must be one of: compact, full")
+        else:
+            detail = "compact"
         with connect() as db:
             agent = rowdict(
                 db.execute(
                     "SELECT id,name,status,revision,updated_at,reasoning_effort,role,signoff_verdict,final_text,error,"
                     "signoff_summary,verification,cwd,worktree_path,worktree_root,worktree_base_sha,repo_root,"
-                    "repo_rel_cwd,original_cwd FROM agents WHERE id=?",
-                    (args.get("agent_id"),),
+                    "repo_rel_cwd,original_cwd FROM agents WHERE id=? AND thread_id=?",
+                    (args.get("agent_id"), thread_id),
                 ).fetchone()
             )
             if not agent:
@@ -3963,13 +4263,14 @@ def action(name: str, args: dict, context: dict) -> dict:
             turn_rows = []
             last_completed_result = ""
             if name == "result":
-                turn_rows = [
-                    dict(row)
-                    for row in db.execute(
-                        "SELECT turn_no,prompt,status,result,stop_reason,created_at,started_at,completed_at FROM turns WHERE agent_id=? ORDER BY turn_no",
-                        (agent["id"],),
-                    )
-                ]
+                if detail == "full":
+                    turn_rows = [
+                        dict(row)
+                        for row in db.execute(
+                            "SELECT turn_no,prompt,status,result,stop_reason,created_at,started_at,completed_at FROM turns WHERE agent_id=? ORDER BY turn_no",
+                            (agent["id"],),
+                        )
+                    ]
                 last_done = db.execute(
                     "SELECT result FROM turns WHERE agent_id=? AND status='completed' "
                     "ORDER BY turn_no DESC LIMIT 1",
@@ -3984,6 +4285,13 @@ def action(name: str, args: dict, context: dict) -> dict:
                         (agent["id"],),
                     )
                 ]
+                change_paths = [
+                    row["path"]
+                    for row in db.execute(
+                        "SELECT path, MIN(id) AS mid FROM changes WHERE agent_id=? GROUP BY path ORDER BY mid",
+                        (agent["id"],),
+                    )
+                ]
         base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "reasoning_effort", "role", "signoff_verdict")}
         base.update({"turns": turns, "changed_files": unique_changed_files(agent["id"])})
         if name == "result":
@@ -3995,9 +4303,23 @@ def action(name: str, args: dict, context: dict) -> dict:
                 "error": agent["error"],
                 "signoff_summary": agent["signoff_summary"],
                 "verification": agent["verification"],
-                "turn_results": turn_rows,
-                "changes": changes,
+                "changed_file_paths": change_paths,
             })
+            if detail == "full":
+                # Legacy shape preserved verbatim: full turn history + changes.
+                base["turn_results"] = turn_rows
+                base["changes"] = changes
+            else:
+                # Compact: bounded per-turn summary (no prompts, no result text).
+                with connect() as db:
+                    base["turn_summary"] = [
+                        dict(row)
+                        for row in db.execute(
+                            "SELECT turn_no,status,stop_reason,created_at,started_at,completed_at "
+                            "FROM turns WHERE agent_id=? ORDER BY turn_no",
+                            (agent["id"],),
+                        )
+                    ]
             isolation = {"mode": "shared"}
             if agent.get("worktree_root") or agent.get("worktree_path"):
                 patch_path, untracked = build_worktree_result(agent["id"])
@@ -4014,16 +4336,33 @@ def action(name: str, args: dict, context: dict) -> dict:
                     "untracked_artifacts": untracked,
                     "changed_files": [c["path"] for c in changes],
                 }
-                if patch_path is not None:
-                    with gzip.open(ROOT / patch_path, "rb") as handle:
-                        patch_raw = handle.read()
-                    isolation["patch_encoding"] = "raw-gzip"
-                    isolation["patch_size"] = len(patch_raw)
-                    isolation["patch_sha256"] = hashlib.sha256(patch_raw).hexdigest()
+                # Structured patch ref from the durable artifact_refs table
+                # (fresh when the worktree exists, post-worktree evidence when
+                # it has been deleted); legacy flat fields stay in sync.
+                patch_ref = _artifact_refs(agent["id"], "patch")
+                if patch_ref:
+                    ref = patch_ref[0]
+                    isolation["patch_artifact"] = ref["path"]
+                    isolation["patch_encoding"] = ref["encoding"]
+                    isolation["patch_size"] = ref["size"]
+                    isolation["patch_sha256"] = ref["sha256"]
+                    isolation["patch_ref"] = artifact_ref_dict(
+                        agent["id"], ref["path"], ref["sha256"], ref["size"], ref["encoding"]
+                    )
+                else:
+                    isolation["patch_ref"] = None
+                for entry in untracked:
+                    entry.setdefault("ref", None)
             base["isolation"] = isolation
         return base
     if name == "wait":
         agent_id = args.get("agent_id")
+        thread_id = str(context.get("codex_thread_id") or "unknown")
+        with connect() as db:
+            if not db.execute(
+                "SELECT 1 FROM agents WHERE id=? AND thread_id=?", (agent_id, thread_id)
+            ).fetchone():
+                raise ValueError("agent not found")
         timeout = min(max(int(args.get("timeout_seconds", 300)), 1), 300)
         with CONDITIONS_LOCK:
             condition = CONDITIONS.setdefault(agent_id, threading.Condition())
@@ -4054,8 +4393,11 @@ def action(name: str, args: dict, context: dict) -> dict:
         agent_id = args.get("agent_id")
         if not agent_id:
             raise ValueError("agent_id is required")
+        thread_id = str(context.get("codex_thread_id") or "unknown")
         with connect() as db:
-            agent = db.execute("SELECT id,status FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute(
+                "SELECT id,status FROM agents WHERE id=? AND thread_id=?", (agent_id, thread_id)
+            ).fetchone()
             if not agent:
                 raise ValueError("agent not found")
         runner = get_runner(agent_id, create=False)
@@ -4079,12 +4421,39 @@ def action(name: str, args: dict, context: dict) -> dict:
         verdict = args.get("verdict")
         if verdict not in {"accepted", "partial", "rejected"}:
             raise ValueError("invalid verdict")
+        thread_id = str(context.get("codex_thread_id") or "unknown")
+        agent_id = args.get("agent_id")
+        # One conditional UPDATE closes the signoff gate-vs-write TOCTOU: the
+        # status predicate is evaluated at write time inside the same statement
+        # that records the verdict, so a concurrent status change between a
+        # separate check and an unconditional write can no longer smuggle a
+        # signoff onto a queued/running agent. rowcount distinguishes refusal
+        # from absence. Verdict is validated to a fixed enum above, so the
+        # interpolated gate is safe.
+        status_gate = "status NOT IN ('queued','running')"
+        if verdict == "accepted":
+            status_gate += " AND status='completed'"
         with connect() as db:
-            if not db.execute("SELECT 1 FROM agents WHERE id=?", (args.get("agent_id"),)).fetchone():
+            rowcount = db.execute(
+                "UPDATE agents SET signoff_verdict=?,signoff_summary=?,verification=?,"
+                "updated_at=?,revision=revision+1 WHERE id=? AND thread_id=? AND " + status_gate,
+                (verdict, args.get("summary", ""), args.get("verification", ""), now(), agent_id, thread_id),
+            ).rowcount
+        if rowcount == 0:
+            # Classify the refusal with the same non-leaking error shapes as
+            # the pre-atomic gate (agent identity is never disclosed).
+            with connect() as db:
+                agent = db.execute(
+                    "SELECT status FROM agents WHERE id=? AND thread_id=?",
+                    (agent_id, thread_id),
+                ).fetchone()
+            if not agent:
                 raise ValueError("agent not found")
-            db.execute("UPDATE agents SET signoff_verdict=?,signoff_summary=?,verification=?,updated_at=?,revision=revision+1 WHERE id=?", (verdict, args.get("summary", ""), args.get("verification", ""), now(), args.get("agent_id")))
-        add_event(args["agent_id"], None, "signoff", f"Codex 签收：{verdict}", args)
-        return {"agent_id": args["agent_id"], "verdict": verdict, "recorded": True}
+            if agent["status"] in {"queued", "running"}:
+                raise ValueError("agent is not terminal; signoff rejected")
+            raise ValueError("accepted signoff requires a completed agent")
+        add_event(agent_id, None, "signoff", f"Codex 签收：{verdict}", args)
+        return {"agent_id": agent_id, "verdict": verdict, "recorded": True}
     raise ValueError(f"unknown action: {name}")
 
 
@@ -4702,7 +5071,8 @@ def process_create_time(pid: int) -> float | None:
             kernel32.CloseHandle(handle)
     # POSIX: derive from /proc/<pid>/stat starttime relative to boot time.
     try:
-        raw = open(f"/proc/{pid}/stat", "rb").read()
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read()
         # comm (field 2) may contain spaces/parens; slice past the final ')'.
         after = raw[raw.rindex(b")") + 2:].split(b" ")
         starttime_ticks = int(after[19])
@@ -4738,11 +5108,21 @@ def pid_is_alive(pid: int) -> bool:
             return True
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
+    # Linux /proc is authoritative when readable: a zombie (state Z) has exited
+    # and must count as NOT running even though kill(0) would still succeed.
+    # Context-managed read; anything unreadable falls back to kill(0).
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read()
+        after = raw[raw.rindex(b")") + 2:].split(b" ")
+        state = after[0] if after else b""
+        return state != b"Z"
+    except (OSError, ValueError, IndexError):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
 
 def terminate_pid(pid: int) -> None:

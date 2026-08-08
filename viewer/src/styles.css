@@ -826,6 +826,26 @@ a {
   color: var(--muted);
 }
 
+/* Worker role chip in the sidebar subline (explore/implement/review). */
+.agent-role {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 3px;
+  margin-right: 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-style: normal;
+  font-weight: 600;
+  color: var(--accent);
+  vertical-align: 1px;
+}
+
+/* Configured reasoning effort next to the status text. */
+.agent-effort {
+  margin-left: 4px;
+  opacity: 0.85;
+}
+
 .status-dot {
   width: 6px;
   height: 6px;

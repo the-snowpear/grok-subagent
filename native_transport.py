@@ -46,6 +46,10 @@ def _run_grok(args: list[str]) -> str | None:
             ["grok", *args],
             capture_output=True,
             text=True,
+            # Explicit UTF-8: grok output is UTF-8; on ACP-936 Windows the
+            # implicit locale decode would mojibake or crash the probe.
+            encoding="utf-8",
+            errors="replace",
             timeout=_PROBE_TIMEOUT_SECONDS,
             check=False,
             creationflags=_NO_WINDOW,

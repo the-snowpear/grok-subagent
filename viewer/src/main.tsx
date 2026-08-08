@@ -41,6 +41,7 @@ import {
   Zap,
 } from "lucide-react";
 import "./styles.css";
+import { effortLabel, roleLabel } from "./agentMeta";
 import { HighlightSnippet, type SearchMatch } from "./searchHighlight";
 import {
   buildChangeTree,
@@ -102,6 +103,10 @@ type Agent = {
   display_title?: string;
   pinned?: number;
   archived?: number;
+  /** Worker role persisted by the runtime (explore | implement | review). */
+  role?: string;
+  /** Resolved reasoning effort (runtime default `max`). */
+  reasoning_effort?: string;
 };
 
 function agentLabel(agent: Pick<Agent, "display_title" | "name">): string {
@@ -2404,6 +2409,8 @@ function App() {
                                 agent.status,
                               );
                               const title = agentLabel(agent);
+                              const roleTag = roleLabel(agent.role);
+                              const effortTag = effortLabel(agent.reasoning_effort);
                               return (
                                 <li
                                   key={agent.id}
@@ -2425,7 +2432,23 @@ function App() {
                                     <span className="agent-copy">
                                       <strong title={`${title}\n${agent.name}`}>{title}</strong>
                                       <span>
+                                        {roleTag && (
+                                          <em
+                                            className="agent-role"
+                                            title={`角色：${roleTag}`}
+                                          >
+                                            {roleTag}
+                                          </em>
+                                        )}
                                         {STATUS_LABELS[label] || label}
+                                        {effortTag && (
+                                          <span
+                                            className="agent-effort"
+                                            title={`推理强度 reasoning_effort=${effortTag}`}
+                                          >
+                                            {effortTag}
+                                          </span>
+                                        )}
                                         {isArchived(agent.archived) ? " · 归档" : ""}
                                         {" · "}
                                         {formatTime(agent.updated_at)}
@@ -2598,6 +2621,16 @@ function App() {
                   ? current.grok_session_id.slice(0, 8)
                   : "—"}
               </span>
+              {roleLabel(current.role) && (
+                <span title={`角色 role=${current.role || ""}`}>
+                  角色 {roleLabel(current.role)}
+                </span>
+              )}
+              {effortLabel(current.reasoning_effort) && (
+                <span title="推理强度 reasoning_effort">
+                  努力 {effortLabel(current.reasoning_effort)}
+                </span>
+              )}
               <span className="mono ellipsis">{current.cwd}</span>
               <span>更新 {formatDateTime(current.updated_at)}</span>
             </div>

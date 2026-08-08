@@ -276,7 +276,7 @@ class ProfilesWorktreeTest(_IsolatedDbMixin, unittest.TestCase):
                     "VALUES(?,?,?,?,?,?,?)",
                     (agent_id, 1, path, kind, added, deleted, stamp),
                 )
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "t"})
         self.assertEqual(result["kind"], "agent_result")
         self.assertEqual(len(result["changes"]), 2)
         self.assertEqual([c["path"] for c in result["changes"]], ["a.txt", "b.txt"])
@@ -429,7 +429,7 @@ class ProfilesWorktreeTest(_IsolatedDbMixin, unittest.TestCase):
                 "VALUES(?,?,?,?,?,?,?)",
                 (agent_id, 1, "tracked.txt", "modified", 2, 1, stamp),
             )
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id}, {"codex_thread_id": "t"})
         isolation = result["isolation"]
         self.assertEqual(isolation["mode"], "worktree")
         self.assertEqual(isolation["base_sha"], head)
@@ -482,7 +482,7 @@ class ProfilesWorktreeTest(_IsolatedDbMixin, unittest.TestCase):
 
     def test_shared_isolation_contract(self):
         agent_id = self._seed_agent()
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id}, {"codex_thread_id": "t"})
         self.assertEqual(result["isolation"], {"mode": "shared"})
 
 

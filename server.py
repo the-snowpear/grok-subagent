@@ -156,12 +156,28 @@ TOOLS = [
     {
         "name": "result",
         "description": (
-            "Return only the final Grok result and compact change/test metadata for Codex review. Verify "
-            "the work locally, then call signoff. Do not re-send the observer link unless the user asks."
+            "Return the final Grok result for Codex review. detail=compact (default) "
+            "returns id/status/role/reasoning_effort/final_text, a bounded per-turn "
+            "summary, changed_files counts and paths, isolation metadata, and "
+            "structured artifact refs (no prompts or full turn history). "
+            "detail=full preserves the legacy turn_results/changes payload. "
+            "Verify the work locally, then call signoff. Do not re-send the observer "
+            "link unless the user asks."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"agent_id": {"type": "string"}},
+            "properties": {
+                "agent_id": {"type": "string"},
+                "detail": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": (
+                        "compact: bounded model-facing summary without prompts or "
+                        "full turn history. full: legacy turn_results/changes."
+                    ),
+                },
+            },
             "required": ["agent_id"],
             "additionalProperties": False,
         },
@@ -276,6 +292,14 @@ TOOLS = [
                         "does not carry its own role. See create_agent."
                     ),
                 },
+                "worktree": {
+                    "type": "boolean",
+                    "description": (
+                        "Batch-level worktree default applied to every item that "
+                        "does not carry its own worktree; when omitted each item "
+                        "falls back to its profile/role legacy default."
+                    ),
+                },
                 "reasoning_effort": {
                     "type": "string",
                     "description": (
@@ -294,7 +318,9 @@ TOOLS = [
             "Unified wait returning the first of: a new hub mailbox message addressed "
             "to Main, any listed agent reaching a terminal state "
             "(completed/failed/cancelled), or the timeout. Agent-terminal latency is "
-            "at most ~0.25s."
+            "at most ~0.25s. The mailbox is non-consuming: pass the returned "
+            "message id as after_message_id to resume past it (progress without "
+            "message loss)."
         ),
         "inputSchema": {
             "type": "object",
@@ -305,6 +331,13 @@ TOOLS = [
                     "minItems": 1,
                 },
                 "from": {"type": "string"},
+                "after_message_id": {
+                    "type": "string",
+                    "description": (
+                        "Cursor: only return messages strictly newer than this id. "
+                        "The returned message's id / next_cursor is the next cursor."
+                    ),
+                },
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": 1,
@@ -397,7 +430,11 @@ def request_timeout_for(name: str, args: dict) -> float:
 
     Wait-like ops honor the requested duration (bounded 1..300s) plus a 5s
     margin so the daemon can answer within the client's wait window; all
-    other ops get a short fixed timeout.
+    other ops get a short fixed timeout. create_agents is synchronous and
+    creates every item sequentially (each may create an isolated git
+    worktree with its own operational timeouts), so its timeout scales with
+    the validated item count: 15s base + 10s per item, bounded at 300s
+    (consistent with the 20-item schema cap).
     """
     if name == "wait":
         requested = int(args.get("timeout_seconds", 300))
@@ -405,6 +442,10 @@ def request_timeout_for(name: str, args: dict) -> float:
     if name == "wait_any" or (name == "hub" and str(args.get("op") or "").lower() == "wait"):
         requested = int(args.get("timeout_seconds", 120))
         return min(max(requested, 1), 300) + 5
+    if name == "create_agents":
+        agents = args.get("agents")
+        item_count = len(agents) if isinstance(agents, list) else 0
+        return min(15 + 10 * max(item_count, 1), 300)
     return 15
 
 
@@ -420,8 +461,9 @@ def call_tool(name: str, args: dict) -> dict:
     timeout = request_timeout_for(name, args)
     data = _request(payload, timeout=timeout)
     # Keep the original JSON text first for compatibility with existing model/client behavior.
+    # Compact serialization only (single line): structuredContent carries the same data.
     result = {
-        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
+        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, separators=(",", ":"))}],
         "structuredContent": data,
     }
     # Link promotion experiment: only create_agent gets one Markdown observer link.

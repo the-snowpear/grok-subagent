@@ -89,6 +89,11 @@ worker 如果处于 active/running 状态并主动通过 inbox/wait 读取 peer 
 措辞注意：runtime 实际仍允许 peer `send` 消息，所以不要说“Reviewer cannot send messages”；准确表述是
 “Reviewer/peer message does not possess automatic follow-up scheduling authority.”
 
+所有 Main 侧 agent 动作（create_agent(s) / send / update_agent / wait / wait_any / result / signoff）
+均 **thread-owned**：agent/peer 按发起线程的 `thread_id` 解析，跨线程 id 不解析（`agent not found`）、
+不泄露其它会话的 worker。`wait_any` 的进度游标 `after_message_id` 只推进、**不消费** mailbox——
+消息保持 pending 直到显式消费。
+
 ## 4. Durable follow-up
 
 Main 批准的 reviewer findings 通过 Hub `send` 给原 Implementer：
@@ -106,7 +111,8 @@ review finding -> Main adjudication -> Fix Order -> message committed
 
 - 每个 item 独立 role/worktree/reasoning_effort（item 覆盖 batch 默认）；batch-level 的
   reasoning_effort / role 在循环前验证一次，非法值整批失败且不留 ghost state；
-- 返回所有 agent IDs；支持统一 wait/result 聚合；并发限制达到时明确返回未创建 items，不静默丢任务。
+- 创建结果**结构化返回**（`agents` + `errors`，errors 带 item index）：部分失败不吞掉成功 items，
+  不静默丢任务；返回所有 agent IDs；支持统一 wait/result 聚合；并发限制达到时明确返回未创建 items。
 
 不要把 batch 能力解释成“默认多开 agent”；`orchestration_budget=efficient` 决定最小充分 fan-out。
 
@@ -115,6 +121,10 @@ review finding -> Main adjudication -> Fix Order -> message committed
 `result` action 已返回结构化 envelope（`kind=agent_result`、`final_text`、`changes`、`isolation`、
 `reasoning_effort`、`role`）；worktree patch 与 untracked 文件以无损 artifact 形式外置（raw-gzip patch +
 base64 untracked，含 sha256/size 元数据）。不要引入第二次模型 summarization 调用；不要截断证据。
+
+result 默认返回 **model-facing 紧凑**结果；`detail=full` 返回完整 envelope，无第二个模型的 lossy
+summary。artifact refs **直接可交接（handoffable）**：后续 turn / Fix Order 直接引用，无需重传。
+Main 大消息响应超阈值时正文外置（externalize bodies），存储与 worker mailbox 保持**无损（lossless）**。
 
 ## 7. Worktree ownership
 

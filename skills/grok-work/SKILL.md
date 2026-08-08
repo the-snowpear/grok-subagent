@@ -1,10 +1,10 @@
 ---
 name: grok-work
 description: >
-  以低主模型成本的 OMP-style orchestrate 模式执行实现任务：Codex/Main 保留需求、架构、拆分、风险取舍、review adjudication、集成与最终 signoff 等关键决策权；代码库探索、代码实现和独立审查交给 Grok Agent Fabric workers。Use when the user runs /grok-work, asks Grok to implement end-to-end, wants 总包/多代理实现, or wants Codex to orchestrate cheaper workers while keeping high-quality decisions. Default worker reasoning effort is max unless explicitly overridden. Prefer grok-fix for an existing findings checklist; lifecycle and safety follow grok-delegation.
+  以低主模型成本的 OMP-style orchestrate 模式执行实现任务：Codex/Main 保留需求、架构、拆分、风险取舍、review adjudication、集成与最终 signoff 等关键决策权；代码库探索、代码实现和独立审查交给 Grok Agent Fabric workers。Use when the user runs /grok-work, asks Grok to implement end-to-end, wants 多代理实现, or wants Codex to orchestrate cheaper workers while keeping high-quality decisions. Default worker reasoning effort is max unless explicitly overridden. Prefer grok-fix for an existing findings checklist; lifecycle and safety follow grok-delegation.
 ---
 
-# Grok Work — Thin-Orchestrator 总包模式
+# Grok Work — Thin-Orchestrator（Main 决策 + Grok 执行）
 
 ## 目标
 
@@ -60,7 +60,9 @@ Reviewer:    worktree=true
 Implementer: worktree=true
 ```
 
-worker 不直接站在用户 dirty working tree 上。例外：**只有任务明确依赖当前未提交工作区内容**，Main 才可以决定 `worktree=false`，并在 work order 中记录：为什么必须读取 dirty state；read-only 仍只是 prompt policy，不能声称硬 sandbox。runtime 保持 generic（显式 `worktree` 覆盖 role 默认；runtime 不会自动从失败的 isolated-worktree 创建降级为 shared cwd——non-git cwd 应由 Main 显式选择 `worktree=false`）。
+worker 不直接站在用户 dirty working tree 上。例外：**只有任务明确依赖当前未提交工作区内容**，Main 才可以决定 `worktree=false`，并在 work order 中记录：为什么必须读取 dirty state；read-only 仍只是 prompt policy，不能声称硬 sandbox。
+
+grok-work 的 git-backed 流程由 Main **显式传 `worktree=true`**（三个角色全隔离），与 generic runtime 的 role `worktree_default` 默认值是两套独立机制——显式值永远覆盖 role 默认，互不推导；runtime 不会自动从失败的 isolated-worktree 创建降级为 shared cwd——non-git cwd 应由 Main 显式选择 `worktree=false`。
 
 ## 先定复杂度，再定 agent graph
 
@@ -87,6 +89,8 @@ Explorer 不是“自由探索整个仓库”，而是每人只回答一个 Main
 
 Explorer 返回 **Evidence Packet**（模板见 `references/decision-budget-contract.md`）。禁止长代码粘贴、完整日志、泛泛教程；详细内容放 artifact/file，只给 Main 路径和必要摘要。
 
+`create_agents` 支持 batch 默认 + per-item override（role/worktree/reasoning_effort）；部分失败**结构化返回**（`errors` 带 item index），不静默丢任务；batch 级非法值整批失败且不留 ghost state。
+
 ## Phase 2 — Codex decision gate
 
 这是本 workflow 的核心价值点。Codex/Main 根据 Evidence Packets 自己完成：选方案、定不做的备选、划 ownership、定接口与状态不变量、定 required tests 和 review focus、识别必修与可接受风险。不要把“选方案”继续下发给 Implementer。
@@ -99,7 +103,7 @@ Explorer 返回 **Evidence Packet**（模板见 `references/decision-budget-cont
 
 ## Phase 4 — Implement fan-out
 
-只对真正无重叠的 units 并行创建 Implementer；默认 `worktree=true`、`reasoning_effort=<resolved>`。不重新探索整个仓库；不扩大需求；自行跑 focused tests；verbose diff/log 写入 artifact，不向 Main 倾倒；返回目标约 400–700 tokens 的 `Implementation Packet`。若两个 units 会实质修改同一核心文件，Main 改成串行或重新划 ownership。
+只对真正无重叠的 units 并行创建 Implementer；默认 `worktree=true`、`reasoning_effort=<resolved>`。不重新探索整个仓库；不扩大需求；自行跑 focused tests；verbose diff/log 写入 artifact，不向 Main 倾倒；返回目标约 400–700 tokens 的 `Implementation Packet`。`result` 默认返回紧凑 model-facing 结果（`detail=full` 取完整 envelope），不要用第二次模型 summarization 或截断证据。若两个 units 会实质修改同一核心文件，Main 改成串行或重新划 ownership。
 
 worker 失败时优先缩小任务/补充 work order；不要自动由 Codex 接管编码。
 
@@ -146,6 +150,8 @@ worker-to-worker Hub 消息可用于**事实澄清/证据请求**，不得作为
 - `rejected`：无法安全达到验收标准。
 
 最终报告以 Main 的决策为主线：`Decision → Workers executed → Review evidence → Main adjudication → Verification → Signoff`。不要把子代理实现表述成 Codex 自己写的。
+
+`signoff` 是 **per-agent 当前轮贡献**的签收（fresh for current turn state），不是 workflow 最终 verdict；最终 verdict 由 Main 集成验证后给出。所有 Main 侧动作（create/update/send/wait/result/signoff）均 thread-owned，只解析发起会话内的 agent/peer。
 
 ## 相关协议
 

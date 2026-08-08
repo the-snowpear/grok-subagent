@@ -217,7 +217,7 @@ class WorktreeRound3Tests(Round3Mixin, unittest.TestCase):
         self.assertEqual(raw_patch, expected)
 
         # Metadata accompanies the patch in the result isolation contract.
-        result = daemon.action("result", {"agent_id": aid}, {})
+        result = daemon.action("result", {"agent_id": aid}, {"codex_thread_id": "round3-binary"})
         isolation = result["isolation"]
         self.assertEqual(isolation["patch_artifact"], patch_path)
         self.assertEqual(isolation["patch_encoding"], "raw-gzip")

@@ -62,9 +62,9 @@ Codex-side skills that orchestrate the existing `grok` MCP tools (`create_agent`
 | `grok-plan` | Codex | Codex (after user OK) | Accept plan, confirm, implement | Plan designer | Not in planning phase |
 | `grok-review` | Codex | Codex (adjudicate) | Supply materials, verify findings | Independent reviewer (read-only) | Grok read-only |
 | `grok-fix` | Codex | Grok | Issue concrete work orders, accept | Fix-by-ticket | Yes |
-| `grok-work` | Grok | Grok | Foreman / supervisor / acceptor | General contractor | Yes |
+| `grok-work` | Codex | Grok | Main: decisions, adjudication, integration, signoff | Bounded worker (explore / implement / review) | Yes |
 
-Hard rules shared by scene skills: tell the user the observer link once after `create_agent`; always `signoff` after local verification when an agent was created; `grok-plan` requires **user confirmation** before Codex implements; `grok-work` must state that work is contracted to Grok with Codex supervising; `grok-review` always asks for the review target unless already specified; `grok-fix` restates verbal findings as a checklist and confirms with the user before coding.
+Hard rules shared by scene skills: tell the user the observer link once after `create_agent`; always `signoff` after local verification when an agent was created; `grok-plan` requires **user confirmation** before Codex implements; `grok-work` states that Grok workers execute within Main-decided contracts — Codex keeps requirements, architecture, interfaces, risk trade-offs, reviewer adjudication, integration, and final signoff; `grok-review` always asks for the review target unless already specified; `grok-fix` restates verbal findings as a checklist and confirms with the user before coding.
 
 ## Behavior
 
@@ -223,9 +223,9 @@ In-flight work is never resumed automatically after a restart.
 ## MCP lifecycle
 
 1. `create_agent` returns an `agent_id` immediately.
-2. Call `wait` once to block until a terminal state (up to 300 seconds). Intermediate observer events do not wake Codex; do not poll with `status`.
-3. Use `result` for the compact final output; the full trace stays in the viewer.
-4. Review and verify locally, then call `signoff`.
+2. Call `wait` once to block until a terminal state (up to 300 seconds). Intermediate observer events do not wake Codex; do not poll with `status`. `wait_any` waits across several agents plus the Main mailbox (first of: new mailbox message, terminal agent, timeout) and advances an `after_message_id` progress cursor **without consuming** mailbox messages.
+3. Use `result` for the compact model-facing output (compact by default; `detail=full` returns the full envelope); the full trace stays in the viewer.
+4. Review and verify locally, then call `signoff`. `signoff` covers that agent's **current contribution only** (fresh for current turn state); the workflow's final verdict remains Main's integration report, not a worker signoff. All agent actions (create/update/send/wait/result/signoff) are **thread-owned** — they only resolve agents and peers within the originating Codex conversation.
 5. Use `send` to queue a later turn. Use `update_agent` to steer an existing agent:
 
    | `mode` | Behavior while a turn is running |
@@ -243,6 +243,10 @@ In-flight work is never resumed automatically after a restart.
 6. Use `cancel` to permanently terminate the agent.
 
 The user selected automatic approval and unrestricted machine access for Grok. The viewer records this clearly but does not enforce a sandbox.
+
+## Versioning
+
+Components are versioned independently — plugin manifest `0.1.0`, MCP server and viewer `2.0.0`, native bridge `1.0.0` — and this repository maintains no tags, changelog, or release pipeline. Do not infer cross-component compatibility from version numbers; a version bump in one component implies nothing about the others.
 
 ## Verification
 

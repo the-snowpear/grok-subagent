@@ -272,20 +272,20 @@ class WaitSemanticsTest(_IsolatedDbMixin, unittest.TestCase):
         agent_id = created["agent_id"]
         deadline = time.time() + 5
         while time.time() < deadline:
-            if daemon.action("status", {"agent_id": agent_id}, {})["status"] == "running":
+            if daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})["status"] == "running":
                 break
             time.sleep(0.05)
         else:
             self.fail("first turn never started")
 
-        updated = daemon.action("update_agent", {"agent_id": agent_id, "prompt": "new direction"}, {})
+        updated = daemon.action("update_agent", {"agent_id": agent_id, "prompt": "new direction"}, {"codex_thread_id": "test-thread"})
         self.assertEqual(updated["mode"], "interrupt_and_resume")
         self.assertEqual(updated["requested_mode"], "auto")
         self.assertFalse(updated["lossless_interject"])
 
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
         self.assertEqual(result["turn_results"][1]["prompt"], "new direction")
 
@@ -311,7 +311,7 @@ class WaitSemanticsTest(_IsolatedDbMixin, unittest.TestCase):
 
         result = {}
         waiter = threading.Thread(
-            target=lambda: result.update(daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 2}, {}))
+            target=lambda: result.update(daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 2}, {"codex_thread_id": "test-thread"}))
         )
         waiter.start()
         time.sleep(0.1)
@@ -348,21 +348,21 @@ class WaitSemanticsTest(_IsolatedDbMixin, unittest.TestCase):
         # Wait until first turn is actively running.
         deadline = time.time() + 5
         while time.time() < deadline:
-            status = daemon.action("status", {"agent_id": agent_id}, {})
+            status = daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
             if status["status"] == "running":
                 break
             time.sleep(0.05)
         else:
             self.fail("first turn never started")
 
-        send_result = daemon.action("send", {"agent_id": agent_id, "prompt": "second turn"}, {})
+        send_result = daemon.action("send", {"agent_id": agent_id, "prompt": "second turn"}, {"codex_thread_id": "test-thread"})
         self.assertEqual(send_result["turn_no"], 2)
 
         # Mid-flight wait must not return done=true after only turn 1.
-        mid = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 1}, {})
+        mid = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 1}, {"codex_thread_id": "test-thread"})
         if mid.get("done"):
             # Only acceptable if both turns already finished within the short window.
-            result = daemon.action("result", {"agent_id": agent_id}, {})
+            result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
             self.assertGreaterEqual(result["turns"], 2)
         else:
             self.assertFalse(mid["done"])
@@ -371,15 +371,15 @@ class WaitSemanticsTest(_IsolatedDbMixin, unittest.TestCase):
             # After first turn ends with pending second, agent must not sit terminal with pending work.
             statuses = {t["turn_no"]: t["status"] for t in turns}
             if statuses.get(1) in {"completed", "failed"} and statuses.get(2) in {"queued", "running"}:
-                agent = daemon.action("status", {"agent_id": agent_id}, {})
+                agent = daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
                 self.assertNotIn(agent["status"], {"completed", "failed", "cancelled"})
 
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["turns"], 2)
 
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         self.assertEqual(result["turns"], 2)
         self.assertEqual(len(result["turn_results"]), 2)
         self.assertEqual([t["turn_no"] for t in result["turn_results"]], [1, 2])
@@ -408,19 +408,19 @@ class CancelLifecycleTest(_IsolatedDbMixin, unittest.TestCase):
 
         deadline = time.time() + 5
         while time.time() < deadline:
-            if marker.exists() or daemon.action("status", {"agent_id": agent_id}, {})["status"] == "running":
+            if marker.exists() or daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})["status"] == "running":
                 break
             time.sleep(0.05)
 
-        cancelled = daemon.action("cancel", {"agent_id": agent_id}, {})
+        cancelled = daemon.action("cancel", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
         self.assertEqual(cancelled["status"], "cancelled")
 
-        wait = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 5}, {})
+        wait = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 5}, {"codex_thread_id": "test-thread"})
         self.assertTrue(wait["done"])
         self.assertEqual(wait["status"], "cancelled")
 
         with self.assertRaises(ValueError) as ctx:
-            daemon.action("send", {"agent_id": agent_id, "prompt": "after cancel"}, {})
+            daemon.action("send", {"agent_id": agent_id, "prompt": "after cancel"}, {"codex_thread_id": "test-thread"})
         self.assertIn("cancelled", str(ctx.exception).lower())
 
         # No further fake_grok launches after cancel.
@@ -448,7 +448,7 @@ class CancelLifecycleTest(_IsolatedDbMixin, unittest.TestCase):
         while time.time() < deadline and not runner.thread.is_alive():
             time.sleep(0.05)
 
-        daemon.action("cancel", {"agent_id": agent_id}, {})
+        daemon.action("cancel", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
         # Worker must exit after cancel (no perpetual queue.get spin).
         runner.thread.join(timeout=5)
         self.assertFalse(runner.thread.is_alive(), "cancel must stop the worker thread")
@@ -465,12 +465,12 @@ class CancelLifecycleTest(_IsolatedDbMixin, unittest.TestCase):
 
         deadline = time.time() + 5
         while time.time() < deadline:
-            if daemon.action("status", {"agent_id": agent_id}, {})["status"] == "running":
+            if daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})["status"] == "running":
                 break
             time.sleep(0.05)
 
-        daemon.action("send", {"agent_id": agent_id, "prompt": "turn-2"}, {})
-        daemon.action("send", {"agent_id": agent_id, "prompt": "turn-3"}, {})
+        daemon.action("send", {"agent_id": agent_id, "prompt": "turn-2"}, {"codex_thread_id": "test-thread"})
+        daemon.action("send", {"agent_id": agent_id, "prompt": "turn-3"}, {"codex_thread_id": "test-thread"})
 
         with daemon.connect() as db:
             queued = db.execute(
@@ -479,8 +479,8 @@ class CancelLifecycleTest(_IsolatedDbMixin, unittest.TestCase):
             ).fetchone()["c"]
         self.assertGreaterEqual(queued, 1)
 
-        daemon.action("cancel", {"agent_id": agent_id}, {})
-        wait = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 5}, {})
+        daemon.action("cancel", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
+        wait = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 5}, {"codex_thread_id": "test-thread"})
         self.assertTrue(wait["done"])
         self.assertEqual(wait["status"], "cancelled")
 
@@ -759,7 +759,7 @@ class CleanupResourceTest(_IsolatedDbMixin, unittest.TestCase):
         with daemon.connect() as db:
             # Wait for active to complete so we can still assert cleanup skips running if any.
             pass
-        daemon.action("wait", {"agent_id": active_id, "timeout_seconds": 10}, {})
+        daemon.action("wait", {"agent_id": active_id, "timeout_seconds": 10}, {"codex_thread_id": "test-thread"})
 
         # Create a second expired completed agent and a fake "running" old one.
         running_old = str(uuid.uuid4())
@@ -1383,12 +1383,12 @@ class ConcurrencyLimitTest(_IsolatedDbMixin, unittest.TestCase):
             "MAX_ACTIVE_AGENTS": daemon.MAX_ACTIVE_AGENTS,
             "MAX_QUEUE_DEPTH": daemon.MAX_QUEUE_DEPTH,
         }
-        self._created_ids: list[str] = []
+        self._created_ids: list[tuple[str, str]] = []
 
     def tearDown(self):
-        for agent_id in self._created_ids:
+        for agent_id, thread_id in self._created_ids:
             try:
-                daemon.action("cancel", {"agent_id": agent_id}, {})
+                daemon.action("cancel", {"agent_id": agent_id}, {"codex_thread_id": thread_id})
             except Exception:
                 pass
         for key, value in self._orig_limits.items():
@@ -1407,7 +1407,7 @@ class ConcurrencyLimitTest(_IsolatedDbMixin, unittest.TestCase):
             },
             {"codex_thread_id": thread_id, "codex_origin": "test"},
         )
-        self._created_ids.append(data["agent_id"])
+        self._created_ids.append((data["agent_id"], thread_id))
         return data
 
     def test_allows_concurrent_same_cwd(self):
@@ -1463,7 +1463,7 @@ class ConcurrencyLimitTest(_IsolatedDbMixin, unittest.TestCase):
                 thread_id="g2",
             )
         self.assertIn("MAX_ACTIVE_AGENTS", str(ctx.exception))
-        self.assertIn(first["agent_id"], self._created_ids)
+        self.assertIn(first["agent_id"], [item[0] for item in self._created_ids])
 
 
 class FinalTextFallbackTest(_IsolatedDbMixin, unittest.TestCase):
@@ -1519,7 +1519,7 @@ class FinalTextFallbackTest(_IsolatedDbMixin, unittest.TestCase):
                 "VALUES(?,1,?,'completed',?,?,?)",
                 (agent_id, "p", "turn result body", stamp, stamp),
             )
-        out = daemon.action("result", {"agent_id": agent_id}, {})
+        out = daemon.action("result", {"agent_id": agent_id}, {"codex_thread_id": "rf"})
         self.assertEqual(out["final_text"], "turn result body")
 
 
@@ -1684,7 +1684,7 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
     def _wait_running(self, agent_id: str, timeout: float = 5.0) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if daemon.action("status", {"agent_id": agent_id}, {})["status"] == "running":
+            if daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})["status"] == "running":
                 return
             time.sleep(0.05)
         self.fail("agent never reached running")
@@ -1741,14 +1741,14 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
         updated = daemon.action(
             "update_agent",
             {"agent_id": agent_id, "prompt": "steer now", "mode": "immediate"},
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["requested_mode"], "immediate")
         self.assertEqual(updated["mode"], "interrupt_and_resume")
         self.assertFalse(updated["lossless_interject"])
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
         types = [e["type"] for e in self._events(agent_id)]
         self.assertIn("interjection", types)
@@ -1758,19 +1758,19 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
         os.environ["GROK_OBSERVER_FAKE_GROK"] = str(FAKE_GROK)
         os.environ["GROK_FAKE_DURATION"] = "0.05"
         agent_id = self._create("quick")["agent_id"]
-        done = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 10}, {})
+        done = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 10}, {"codex_thread_id": "test-thread"})
         self.assertTrue(done["done"], done)
         updated = daemon.action(
             "update_agent",
             {"agent_id": agent_id, "prompt": "second turn", "mode": "tool_boundary"},
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["requested_mode"], "tool_boundary")
         self.assertEqual(updated["mode"], "follow_up")
         self.assertFalse(updated["lossless_interject"])
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 10}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 10}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         statuses = [t["status"] for t in result["turn_results"]]
         self.assertEqual(statuses, ["completed", "completed"])
         self.assertEqual(result["turn_results"][1]["prompt"], "second turn")
@@ -1790,14 +1790,14 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
                 "mode": "tool_boundary",
                 "timeout_seconds": 30,
             },
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["mode"], "waiting_tool_boundary")
         self.assertEqual(updated["requested_mode"], "tool_boundary")
 
         # Still running — must not have interrupted yet.
         time.sleep(0.15)
-        st = daemon.action("status", {"agent_id": agent_id}, {})
+        st = daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
         self.assertEqual(st["status"], "running")
         types_mid = [e["type"] for e in self._events(agent_id)]
         self.assertIn("pending_update", types_mid)
@@ -1820,9 +1820,9 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
                 }
             },
         )
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
         applied = [e for e in self._events(agent_id) if e["type"] == "update_applied"]
         self.assertTrue(applied)
@@ -1844,13 +1844,13 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
                 "mode": "tool_boundary",
                 "timeout_seconds": 1,
             },
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["mode"], "waiting_tool_boundary")
 
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         self.assertEqual([t["status"] for t in result["turn_results"]], ["interrupted", "completed"])
         applied = [e for e in self._events(agent_id) if e["type"] == "update_applied"]
         self.assertTrue(any(e["payload"].get("mode_used") == "immediate_timeout" for e in applied))
@@ -1865,7 +1865,7 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
         updated = daemon.action(
             "update_agent",
             {"agent_id": agent_id, "prompt": "auto steer", "mode": "auto", "timeout_seconds": 20},
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["requested_mode"], "auto")
         self.assertEqual(updated["mode"], "waiting_tool_boundary")
@@ -1878,7 +1878,7 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
             "done",
             {"params": {"update": {"toolCallId": "auto1", "status": "completed"}}},
         )
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 15}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
 
     def test_multiple_boundary_updates_process_in_order(self):
@@ -1891,12 +1891,12 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
         u1 = daemon.action(
             "update_agent",
             {"agent_id": agent_id, "prompt": "first", "mode": "tool_boundary", "timeout_seconds": 20},
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         u2 = daemon.action(
             "update_agent",
             {"agent_id": agent_id, "prompt": "second", "mode": "tool_boundary", "timeout_seconds": 20},
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(u1["mode"], "waiting_tool_boundary")
         self.assertEqual(u2["mode"], "waiting_tool_boundary")
@@ -1909,9 +1909,9 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
             "done",
             {"params": {"update": {"toolCallId": "m1", "status": "completed"}}},
         )
-        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 20}, {})
+        final = daemon.action("wait", {"agent_id": agent_id, "timeout_seconds": 20}, {"codex_thread_id": "test-thread"})
         self.assertTrue(final["done"], final)
-        result = daemon.action("result", {"agent_id": agent_id}, {})
+        result = daemon.action("result", {"agent_id": agent_id, "detail": "full"}, {"codex_thread_id": "test-thread"})
         prompts = [t["prompt"] for t in result["turn_results"]]
         # The base prompt carries the auto-injected coordination fallback hint.
         self.assertTrue(prompts[0].startswith("multi"))
@@ -1940,19 +1940,19 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
                 "mode": "tool_boundary",
                 "timeout_seconds": 60,
             },
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["mode"], "waiting_tool_boundary")
         runner = daemon.get_runner(agent_id, create=False)
         assert runner is not None
         self.assertTrue(runner._pending_boundary)
 
-        daemon.action("cancel", {"agent_id": agent_id}, {})
+        daemon.action("cancel", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
         self.assertFalse(runner._pending_boundary)
         self.assertFalse(runner.has_inflight_tools())
         # Timer must not resurrect work after cancel.
         time.sleep(0.2)
-        st = daemon.action("status", {"agent_id": agent_id}, {})
+        st = daemon.action("status", {"agent_id": agent_id}, {"codex_thread_id": "test-thread"})
         self.assertEqual(st["status"], "cancelled")
 
     def test_shutdown_releases_pending_boundary_timer(self):
@@ -1969,7 +1969,7 @@ class UpdateAgentModeTest(_IsolatedDbMixin, unittest.TestCase):
                 "mode": "tool_boundary",
                 "timeout_seconds": 60,
             },
-            {},
+            {"codex_thread_id": "test-thread"},
         )
         self.assertEqual(updated["mode"], "waiting_tool_boundary")
         runner = daemon.get_runner(agent_id, create=False)

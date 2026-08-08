@@ -24,7 +24,7 @@ description: >
 | 先出方案，实现仍由 Codex | `grok-plan` |
 | 独立 code review | `grok-review` |
 | 按意见单修复 | `grok-fix` |
-| 整段实现总包 Grok | `grok-work` |
+| 整段实现执行交给 Grok（决策/验收归 Codex） | `grok-work` |
 | 小而可验证、无上述剧本 | **本 skill（`grok-delegation`）** |
 
 场景 skill 与本 skill 同时可匹配时，**优先场景 skill**。场景 skill 应遵循下文生命周期与安全规则，不另发明一套政策。
@@ -57,11 +57,13 @@ description: >
 
 可并行继续本地工作。需要委托结果时：
 
-1. 调用一次 `wait`（合适超时）；不要轮询 `status`。
-2. `done` 为 true 后调用 `result` 获取紧凑最终输出。
+1. 调用一次 `wait`（合适超时）；不要轮询 `status`。跨多个 agent 等待用 `wait_any`（返回首个到达的 Main mailbox 消息 / 终态 agent / 超时），其 `after_message_id` 进度游标只推进、**不消费** mailbox。
+2. `done` 为 true 后调用 `result` 获取默认**紧凑**的 model-facing 结果（`detail=full` 可取完整 envelope）。
 3. 仅当紧凑结果不足以审查时，再读完整 observer 日志。
 
 用 `update_agent` 纠偏进行中的任务；`send` 仅用于后续一轮。仅在不再需要其工作时 `cancel`。
+
+所有 Main 侧动作（create/update/send/wait/result/signoff）均 **thread-owned**：只解析发起会话（thread_id）内的 agent 与 peer，跨线程 id 不解析、不泄露。
 
 ## 审查与 signoff
 
@@ -76,6 +78,8 @@ description: >
 附上简明验证说明。只整合已接受部分；必要时区分 Grok 贡献与 Codex 已验证结论。
 
 **凡调用过 `create_agent` 并拿到可审结果，均应在本地验证后 `signoff`**（含意见类工作流）。
+
+`signoff` 仅针对该 agent 的**当前轮贡献**（fresh for current turn state），不构成整个 workflow 的最终结论；最终 verdict 由 Codex/Main 集成验证后给出。
 
 ## 失败处理
 

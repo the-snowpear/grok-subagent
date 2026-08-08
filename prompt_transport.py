@@ -96,6 +96,10 @@ def probe_prompt_file_support() -> str | None:
                 args,
                 capture_output=True,
                 text=True,
+                # Explicit UTF-8: grok help output is UTF-8; on ACP-936 Windows
+                # the implicit locale decode would mojibake or crash the probe.
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
                 check=False,
                 creationflags=creationflags,
