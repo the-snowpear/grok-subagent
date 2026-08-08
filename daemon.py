@@ -441,6 +441,7 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN worktree_base_sha TEXT",
             "ALTER TABLE agents ADD COLUMN isolation_mode TEXT DEFAULT 'shared'",
             "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'max'",
+            "ALTER TABLE agents ADD COLUMN role TEXT",
             "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE changes ADD COLUMN source TEXT DEFAULT 'observed'",
@@ -1934,7 +1935,9 @@ def maybe_schedule_delivery(agent_id: str) -> int:
         # write-side schedulers. This prevents a turn prompt from containing rows
         # that were concurrently consumed or claimed elsewhere.
         with coordination_connect(immediate=True) as db:
-            agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute(
+                "SELECT status,thread_id,role FROM agents WHERE id=?", (agent_id,)
+            ).fetchone()
             if agent is None or agent["status"] != "completed":
                 return 0
             active = int(
@@ -1953,6 +1956,19 @@ def maybe_schedule_delivery(agent_id: str) -> int:
             ).fetchall()
             if not rows:
                 return 0
+            if agent["role"] in ROLE_POLICIES:
+                # Main-owned scheduling authority: Codex/Main is the only
+                # orchestrator, so only Main-authored messages may auto-wake a
+                # completed role-tagged worker into a new follow-up turn. Peer
+                # messages (explore/review findings, clarifications) keep the
+                # full legacy mailbox semantics: they are NOT deleted, NOT
+                # marked delivered, NOT consumed, their target_turn_id stays
+                # NULL, and no follow-up is created. They simply lack the
+                # authority to re-activate a completed orchestrate worker.
+                main_peer = main_peer_id(str(agent["thread_id"]))
+                rows = [row for row in rows if str(row["from_peer"]) == main_peer]
+                if not rows:
+                    return 0
 
             blocks: list[str] = []
             message_ids: list[str] = []
@@ -3041,7 +3057,7 @@ def rowdict(row) -> dict | None:
 PUBLIC_AGENT_FIELDS = (
     "id", "thread_id", "name", "cwd", "status", "revision", "current_turn",
     "final_text", "error", "signoff_verdict", "signoff_summary", "verification",
-    "display_title", "pinned", "archived", "max_turns", "reasoning_effort", "worktree_path",
+    "display_title", "pinned", "archived", "max_turns", "reasoning_effort", "role", "worktree_path",
     "created_at", "updated_at",
 )
 
@@ -3453,7 +3469,10 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
     agent_id = str(uuid.uuid4())
     defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns, role=role)
     # Resolve + validate BEFORE any worktree creation or DB insert so an
-    # invalid effort can never leave durable or disk ghost state behind.
+    # invalid effort/role can never leave durable or disk ghost state behind.
+    # validate_role() already raised for unknown roles inside
+    # resolve_agent_settings; this line only normalizes None/str for storage.
+    role = validate_role(role)
     eff_reasoning_effort = resolve_reasoning_effort(None, reasoning_effort)
     prompt_effective = prompt + defaults["prompt_suffix"] + (ROLE_POLICIES[role]["prompt_suffix"] if role else "") + worker_coordination_instructions()
     thread_id = context.get("codex_thread_id") or "unknown"
@@ -3525,11 +3544,12 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
             )
             db.execute(
                 "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,"
-                "reasoning_effort,worktree_path,worktree_root,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "reasoning_effort,role,worktree_path,worktree_root,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     agent_id, thread_id, agent_name, cwd, agent_id, display_title,
                     secrets.token_urlsafe(32), eff_max_turns, eff_reasoning_effort,
+                    role,
                     str(cwd) if eff_worktree else None,
                     worktree_root,
                     worktree_meta.get("original_cwd"), worktree_meta.get("repo_root"),
@@ -3890,7 +3910,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         with connect() as db:
             agent = rowdict(
                 db.execute(
-                    "SELECT id,name,status,revision,updated_at,reasoning_effort,signoff_verdict,final_text,error,"
+                    "SELECT id,name,status,revision,updated_at,reasoning_effort,role,signoff_verdict,final_text,error,"
                     "signoff_summary,verification,cwd,worktree_path,worktree_root,worktree_base_sha,repo_root,"
                     "repo_rel_cwd,original_cwd FROM agents WHERE id=?",
                     (args.get("agent_id"),),
@@ -3923,7 +3943,7 @@ def action(name: str, args: dict, context: dict) -> dict:
                         (agent["id"],),
                     )
                 ]
-        base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "reasoning_effort", "signoff_verdict")}
+        base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "reasoning_effort", "role", "signoff_verdict")}
         base.update({"turns": turns, "changed_files": unique_changed_files(agent["id"])})
         if name == "result":
             # Prefer agent.final_text; fall back to last completed turn.result when empty.
@@ -4136,7 +4156,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     dict(row)
                     for row in db.execute(
                         "SELECT id,thread_id,name,cwd,status,revision,signoff_verdict,"
-                        "reasoning_effort,display_title,pinned,archived,created_at,updated_at "
+                        "reasoning_effort,role,display_title,pinned,archived,created_at,updated_at "
                         "FROM agents ORDER BY pinned DESC, archived ASC, updated_at DESC"
                     )
                 ]
@@ -4159,7 +4179,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     db.execute(
                         "SELECT id,thread_id,name,cwd,status,revision,current_turn,final_text,error,"
                         "signoff_verdict,signoff_summary,verification,display_title,pinned,archived,"
-                        "max_turns,reasoning_effort,worktree_path,created_at,updated_at FROM agents WHERE id=?",
+                        "max_turns,reasoning_effort,role,worktree_path,created_at,updated_at FROM agents WHERE id=?",
                         (agent_id,),
                     ).fetchone()
                 )

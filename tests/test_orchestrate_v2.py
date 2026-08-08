@@ -628,5 +628,436 @@ class OrchestrationFlowTests(OrchestrateV2Mixin, unittest.TestCase):
         self.assertEqual(status, "completed")
 
 
+class RolePersistenceTests(OrchestrateV2Mixin, unittest.TestCase):
+    """T1: role is durable on the agents row and surfaces through status/result.
+
+    The stored role is the canonical scheduling identity: completed follow-ups
+    reuse the same agent row, so the role is inherited without re-resolution.
+    """
+
+    def test_role_persists_and_surfaces_after_followup(self):
+        """T1: create role='implement' -> DB, status/result, follow-up all keep it."""
+        thread_id = "t-auth-role-persist"
+        repo = self._make_git_repo(self.root / "repo")
+        created = self._create(
+            thread_id, name="impl", prompt="build", cwd=str(repo),
+            role="implement", reasoning_effort="high",
+        )
+        aid = created["agent_id"]
+        row = self._agent_row(aid)
+        self.assertEqual(row["role"], "implement", "resolved role must be stored on the agents row")
+        status = daemon.action("status", {"agent_id": aid}, {"codex_thread_id": thread_id})
+        result = daemon.action("result", {"agent_id": aid}, {"codex_thread_id": thread_id})
+        self.assertEqual(status["role"], "implement")
+        self.assertEqual(result["role"], "implement")
+        self.assertEqual(result["reasoning_effort"], "high")
+
+        # A completed-worker follow-up reuses the same agent row: role retained.
+        self._wait_terminal(aid)
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=aid, body="fix order"
+        )
+        self._wait_terminal(aid)
+        row_after = self._agent_row(aid)
+        self.assertEqual(row_after["role"], "implement", "follow-up must inherit the stored role")
+        self.assertEqual(row_after["reasoning_effort"], "high")
+
+    def test_explore_role_persists(self):
+        """T1: explore role is stored and surfaces in status."""
+        thread_id = "t-auth-role-explore"
+        created = self._create(thread_id, name="expl", prompt="investigate", role="explore")
+        aid = created["agent_id"]
+        self.assertEqual(self._agent_row(aid)["role"], "explore")
+        status = daemon.action("status", {"agent_id": aid}, {"codex_thread_id": thread_id})
+        self.assertEqual(status["role"], "explore")
+
+    def test_legacy_role_null_keeps_legacy_auto_followup(self):
+        """T2: a role NULL legacy agent keeps the historical auto-followup behavior."""
+        thread_id = "t-auth-legacy"
+        aid = self.seed_agent(thread_id, "completed")
+        with daemon.connect() as db:
+            role = db.execute("SELECT role FROM agents WHERE id=?", (aid,)).fetchone()["role"]
+        self.assertIsNone(role, "legacy rows must stay role NULL")
+        # A peer-origin message must still auto-wake a legacy agent: the
+        # orchestrate authority gate only applies to role-tagged workers.
+        daemon.MAILBOX.send(thread_id=thread_id, from_peer="peer-legacy", to_peer=aid, body="legacy wake")
+        with daemon.connect() as db:
+            msg = db.execute(
+                "SELECT target_turn_id,state FROM agent_messages WHERE to_peer=?", (aid,)
+            ).fetchone()
+            turn = db.execute(
+                "SELECT id,agent_id,turn_no FROM turns WHERE id=?", (msg["target_turn_id"],)
+            ).fetchone()
+        self.assertIsNotNone(msg["target_turn_id"], "legacy auto-followup must still claim the message")
+        self.assertEqual(msg["state"], "pending", "claimed but not yet delivered (no child spawn)")
+        self.assertEqual(turn["agent_id"], aid, "legacy follow-up reuses the same agent row")
+        self.assertEqual(turn["turn_no"], 1, "seeded agent has no turn 1, so the first delivery is turn 1")
+
+
+class MainOwnedFollowupAuthorityTests(OrchestrateV2Mixin, unittest.TestCase):
+    """T3-T7: Main owns automatic follow-up scheduling for role-tagged workers.
+
+    The runtime gate lives in maybe_schedule_delivery: a completed worker with
+    a stored role (explore/implement/review) can only be auto-woken by a
+    message whose sender is main_peer_id(thread_id). Peer messages keep the
+    full mailbox semantics but never gain follow-up scheduling authority.
+    """
+
+    def _completed_implementer(self, thread_id: str) -> str:
+        repo = self._make_git_repo(self.root / "repo")
+        created = self._create(
+            thread_id, name="impl", prompt="build the change", cwd=str(repo),
+            role="implement", reasoning_effort="high",
+        )
+        aid = created["agent_id"]
+        self._wait_terminal(aid)
+        return aid
+
+    def test_reviewer_peer_cannot_wake_completed_implementer(self):
+        """T3: a reviewer finding alone must NOT create an implementer follow-up."""
+        thread_id = "t-auth-t3"
+        impl_aid = self._completed_implementer(thread_id)
+        reviewer = self._create(thread_id, name="reviewer", prompt="review", role="review")
+        review_aid = reviewer["agent_id"]
+        self._wait_terminal(review_aid)
+
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=review_aid, to_peer=impl_aid, body="please change X"
+        )
+        with daemon.connect() as db:
+            msg = db.execute(
+                "SELECT state,target_turn_id,consumed_at,delivered_at FROM agent_messages "
+                "WHERE to_peer=? ORDER BY id DESC LIMIT 1",
+                (impl_aid,),
+            ).fetchone()
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (impl_aid,)
+            ).fetchone()["c"]
+            status = db.execute(
+                "SELECT status FROM agents WHERE id=?", (impl_aid,)
+            ).fetchone()["status"]
+        self.assertEqual(msg["state"], "pending", "peer finding must stay pending")
+        self.assertIsNone(msg["target_turn_id"], "peer finding must not be claimed")
+        self.assertIsNone(msg["consumed_at"], "peer finding must not be consumed")
+        self.assertIsNone(msg["delivered_at"], "peer finding must not be delivered")
+        self.assertEqual(turns, 1, "reviewer finding must not create an implementer follow-up")
+        self.assertEqual(status, "completed", "implementer must stay completed")
+
+    def test_main_can_wake_same_implementer(self):
+        """T4: Main's Fix Order wakes the same completed implementer exactly once."""
+        thread_id = "t-auth-t4"
+        impl_aid = self._completed_implementer(thread_id)
+        before = self._agent_row(impl_aid)
+
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=impl_aid,
+            body="Fix Order: adjust input validation",
+        )
+        with daemon.connect() as db:
+            msg = db.execute(
+                "SELECT id,target_turn_id FROM agent_messages WHERE to_peer=? ORDER BY id DESC LIMIT 1",
+                (impl_aid,),
+            ).fetchone()
+            followups = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,agent_id,turn_no FROM turns WHERE agent_id=? AND turn_no=2",
+                    (impl_aid,),
+                )
+            ]
+        self.assertEqual(len(followups), 1, "Main must create exactly one follow-up turn")
+        followup = followups[0]
+        self.assertEqual(msg["target_turn_id"], followup["id"], "Main message must claim the follow-up turn")
+        self.assertEqual(followup["agent_id"], impl_aid, "follow-up must reuse the same agent row")
+        self.assertEqual(followup["turn_no"], 2)
+
+        # The follow-up executes; the same contract is retained and the Main
+        # message is delivered + consumed (no duplicates).
+        self._wait_terminal(impl_aid)
+        after = self._agent_row(impl_aid)
+        self.assertEqual(after["grok_session_id"], before["grok_session_id"])
+        self.assertEqual(after["reasoning_effort"], before["reasoning_effort"])
+        self.assertEqual(after["role"], before["role"])
+        self.assertEqual(after["worktree_root"], before["worktree_root"])
+        self.assertEqual(after["worktree_path"], before["worktree_path"])
+        with daemon.connect() as db:
+            turn_count = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (impl_aid,)
+            ).fetchone()["c"]
+            msg_after = db.execute(
+                "SELECT state,consumed_at FROM agent_messages WHERE id=?", (msg["id"],)
+            ).fetchone()
+        self.assertEqual(turn_count, 2, "implementer must have exactly turn 1 + one follow-up")
+        self.assertEqual(msg_after["state"], "delivered")
+        self.assertIsNotNone(msg_after["consumed_at"])
+
+    def test_mixed_queue_only_main_message_claimed(self):
+        """T5: a peer message is never coalesced into a Main-authorized turn."""
+        thread_id = "t-auth-t5"
+        aid = self.seed_agent(thread_id, "completed")
+        with daemon.connect() as db:
+            db.execute("UPDATE agents SET role='implement' WHERE id=?", (aid,))
+        daemon.MAILBOX.send(thread_id=thread_id, from_peer="reviewer-peer", to_peer=aid, body="finding")
+        daemon.MAILBOX.send(thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=aid, body="fix order")
+        with daemon.connect() as db:
+            rows = db.execute(
+                "SELECT body,state,target_turn_id,consumed_at FROM agent_messages "
+                "WHERE to_peer=? ORDER BY created_at,id",
+                (aid,),
+            ).fetchall()
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+        self.assertEqual(turns, 1, "only the Main message may create a follow-up turn")
+        by_body = {r["body"]: r for r in rows}
+        peer_msg = by_body["finding"]
+        main_msg = by_body["fix order"]
+        self.assertEqual(peer_msg["state"], "pending", "peer message must stay pending")
+        self.assertIsNone(peer_msg["target_turn_id"], "peer message must not be claimed")
+        self.assertIsNone(peer_msg["consumed_at"], "peer message must not be consumed")
+        self.assertIsNotNone(main_msg["target_turn_id"], "Main message must be claimed")
+        self.assertEqual(main_msg["state"], "pending", "claimed but not yet delivered (no child spawn)")
+
+    def test_recovery_sweep_respects_authority_gate(self):
+        """T6: recovery/sweep cannot wake a role-tagged worker from peer mail alone."""
+        thread_id = "t-auth-t6"
+        aid = self.seed_agent(thread_id, "completed")
+        with daemon.connect() as db:
+            db.execute("UPDATE agents SET role='implement' WHERE id=?", (aid,))
+        daemon.MAILBOX.send(thread_id=thread_id, from_peer="reviewer-peer", to_peer=aid, body="finding")
+        daemon.delivery_sweep()
+        with daemon.connect() as db:
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+            msg = db.execute(
+                "SELECT target_turn_id,state FROM agent_messages WHERE to_peer=?", (aid,)
+            ).fetchone()
+        self.assertEqual(turns, 0, "peer-only sweep must not create a follow-up")
+        self.assertIsNone(msg["target_turn_id"])
+        self.assertEqual(msg["state"], "pending")
+
+        # A Main-authored pending message makes the same sweep able to wake it.
+        daemon.MAILBOX.send(thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=aid, body="fix order")
+        daemon.delivery_sweep()
+        with daemon.connect() as db:
+            turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (aid,)
+            ).fetchone()["c"]
+            main_msg = db.execute(
+                "SELECT target_turn_id FROM agent_messages WHERE to_peer=? AND body='fix order'", (aid,)
+            ).fetchone()
+            peer_msg = db.execute(
+                "SELECT target_turn_id FROM agent_messages WHERE to_peer=? AND body='finding'", (aid,)
+            ).fetchone()
+        self.assertEqual(turns, 1, "sweep must wake the worker once a Main message exists")
+        self.assertIsNotNone(main_msg["target_turn_id"])
+        self.assertIsNone(peer_msg["target_turn_id"], "peer message must still not be claimed")
+
+    def test_main_can_wake_completed_reviewer_for_rereview(self):
+        """T7: Main owns scheduling, so a Main request CAN wake a completed reviewer."""
+        thread_id = "t-auth-t7"
+        reviewer = self._create(thread_id, name="reviewer", prompt="review round 1", role="review")
+        review_aid = reviewer["agent_id"]
+        self._wait_terminal(review_aid)
+
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=review_aid,
+            body="verify fix round 1",
+        )
+        with daemon.connect() as db:
+            followups = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,agent_id,turn_no FROM turns WHERE agent_id=? AND turn_no=2",
+                    (review_aid,),
+                )
+            ]
+            msg = db.execute(
+                "SELECT target_turn_id FROM agent_messages WHERE to_peer=? ORDER BY id DESC LIMIT 1",
+                (review_aid,),
+            ).fetchone()
+        self.assertEqual(len(followups), 1, "Main must be able to wake the reviewer for re-review")
+        self.assertEqual(followups[0]["agent_id"], review_aid, "re-review must reuse the reviewer row")
+        self.assertEqual(msg["target_turn_id"], followups[0]["id"])
+
+
+class ReadOnlyRoleIsolationTests(OrchestrateV2Mixin, unittest.TestCase):
+    """D1-D3: grok-work's recommended path isolates explore/review from the parent.
+
+    The runtime stays generic (explicit worktree wins); the orchestration
+    contract (SKILL.md / Work Order) is what requests worktree=True for
+    git-backed explore/review. These tests prove that invocation path keeps
+    the worker off the user's dirty working tree and leaves the parent
+    untouched.
+    """
+
+    def test_git_backed_explore_and_review_run_isolated(self):
+        thread_id = "t-isolation"
+        repo = self._make_git_repo(self.root / "repo")
+        (repo / "tracked.txt").write_text("base\nmodified\n", encoding="utf-8")
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        self.assertTrue(dirty, "the parent repo must be dirty for this test")
+        parent_content_before = (repo / "tracked.txt").read_text(encoding="utf-8")
+        worktree_base = (daemon.DATA / "worktrees").resolve()
+
+        for role in ("explore", "review"):
+            created = self._create(
+                thread_id, name=role, prompt="investigate", cwd=str(repo), role=role, worktree=True,
+            )
+            aid = created["agent_id"]
+            row = self._agent_row(aid)
+            self.assertEqual(
+                row["isolation_mode"], "worktree",
+                f"{role} must run isolated on a git-backed orchestration task",
+            )
+            self.assertIsNotNone(row["worktree_root"])
+            wt = Path(row["worktree_root"]).resolve()
+            self.assertTrue(
+                str(wt).startswith(str(worktree_base)),
+                "worker worktree_root must live under DATA/worktrees",
+            )
+            worker_cwd = Path(row["cwd"]).resolve()
+            self.assertNotEqual(worker_cwd, repo.resolve(), f"{role} must not stand in the original worktree")
+            self.assertTrue(str(worker_cwd).startswith(str(wt)), f"{role} worker cwd must be inside its worktree")
+
+        self.assertEqual(
+            (repo / "tracked.txt").read_text(encoding="utf-8"),
+            parent_content_before,
+            "the dirty parent must stay untouched",
+        )
+
+
+class OrchestrationFollowUpE2ETests(OrchestrateV2Mixin, unittest.TestCase):
+    """E1-E6: full authority boundary flow with a real isolated patch artifact.
+
+    Explorer evidence -> Main decision -> Implementer (isolated worktree,
+    effort high) -> materialized change -> real patch artifact -> Reviewer
+    finding (NO runtime mutation on its own) -> Main Fix Order -> same
+    Implementer follow-up -> Main re-review request -> same Reviewer
+    follow-up. The reviewer re-review prompt references the REAL patch
+    artifact path produced by the runtime, not a fictional string.
+    """
+
+    def test_main_owned_followup_flow_with_real_artifact(self):
+        thread_id = "t-e2e-authority"
+        repo = self._make_git_repo(self.root / "repo")
+
+        # 1) Explorer: evidence for Main's decision (shared cwd by default).
+        explorer = self._create(
+            thread_id, name="explorer", prompt="collect evidence about validation gaps", role="explore",
+        )
+        explorer_aid = explorer["agent_id"]
+        self._wait_terminal(explorer_aid)
+        explorer_result = daemon.action("result", {"agent_id": explorer_aid}, {"codex_thread_id": thread_id})
+        self.assertTrue(str(explorer_result["final_text"]).strip(), "explorer must return evidence")
+
+        # 2) Main decides (test harness) and spawns an Implementer.
+        implementer = self._create(
+            thread_id, name="implementer", prompt="implement the validated change",
+            cwd=str(repo), role="implement", reasoning_effort="high",
+        )
+        impl_aid = implementer["agent_id"]
+        self._wait_terminal(impl_aid)
+        impl_row = self._agent_row(impl_aid)
+        self.assertEqual(impl_row["isolation_mode"], "worktree")
+        self.assertEqual(impl_row["reasoning_effort"], "high")
+        impl_session = impl_row["grok_session_id"]
+
+        # 3) The harness stands in for the implementer's file work: write the
+        #    change into the isolated worktree so the runtime produces a REAL
+        #    patch artifact for the reviewer to inspect.
+        impl_worktree = Path(impl_row["worktree_root"])
+        (impl_worktree / "tracked.txt").write_text("base\nvalidated\n", encoding="utf-8")
+        impl_result = daemon.action("result", {"agent_id": impl_aid}, {"codex_thread_id": thread_id})
+        isolation = impl_result["isolation"]
+        self.assertEqual(isolation["mode"], "worktree")
+        patch_artifact = isolation.get("patch_artifact")
+        self.assertIsNotNone(patch_artifact, "a real patch artifact must exist for the reviewer")
+        artifact_abs = daemon.ROOT / patch_artifact
+        self.assertTrue(artifact_abs.exists(), "the patch artifact must exist on disk")
+
+        # 4) Fresh Reviewer (isolated per the orchestration contract).
+        reviewer = self._create(
+            thread_id, name="reviewer", prompt="review the implementation",
+            cwd=str(repo), role="review", worktree=True,
+        )
+        review_aid = reviewer["agent_id"]
+        self._wait_terminal(review_aid)
+        self.assertNotEqual(review_aid, impl_aid)
+        review_row = self._agent_row(review_aid)
+        self.assertEqual(review_row["isolation_mode"], "worktree")
+
+        # 5) Reviewer finding must NOT mutate the runtime: no implementer turn.
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=review_aid, to_peer=impl_aid, body="finding: validation is missing",
+        )
+        with daemon.connect() as db:
+            impl_turns = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (impl_aid,)
+            ).fetchone()["c"]
+        self.assertEqual(impl_turns, 1, "reviewer finding alone must not create an implementer turn")
+
+        # 6) Main Fix Order wakes the SAME implementer; the real artifact is
+        #    referenced in the follow-up evidence.
+        fix_order = (
+            "Fix Order: add validation for empty payloads. "
+            f"Patch artifact to verify against: {patch_artifact}"
+        )
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=impl_aid, body=fix_order,
+        )
+        self._wait_terminal(impl_aid)
+        impl_after = self._agent_row(impl_aid)
+        self.assertEqual(impl_after["grok_session_id"], impl_session)
+        self.assertEqual(impl_after["reasoning_effort"], "high")
+        self.assertEqual(impl_after["role"], "implement")
+        self.assertEqual(impl_after["worktree_root"], impl_row["worktree_root"])
+        with daemon.connect() as db:
+            impl_turn_count = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (impl_aid,)
+            ).fetchone()["c"]
+        self.assertEqual(impl_turn_count, 2, "implementer must have exactly turn 1 + one follow-up")
+
+        # 7) Main wakes the SAME Reviewer for re-review, referencing the real
+        #    patch artifact path; the reviewer follow-up completes.
+        rereview = (
+            "verify fix round 1 against the patch artifact: "
+            f"{artifact_abs} (sha256 {isolation.get('patch_sha256')})"
+        )
+        daemon.MAILBOX.send(
+            thread_id=thread_id, from_peer=main_peer_id(thread_id), to_peer=review_aid, body=rereview,
+        )
+        self._wait_terminal(review_aid)
+        with daemon.connect() as db:
+            review_turns = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT turn_no,status FROM turns WHERE agent_id=? ORDER BY turn_no", (review_aid,)
+                )
+            ]
+            reviewer_msgs = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages WHERE to_peer=?", (review_aid,)
+            ).fetchone()["c"]
+        self.assertEqual(
+            review_turns,
+            [{"turn_no": 1, "status": "completed"}, {"turn_no": 2, "status": "completed"}],
+            "Main must be able to wake the reviewer for a re-review follow-up",
+        )
+        self.assertEqual(reviewer_msgs, 1, "exactly one re-review message, no duplicates")
+
+        # 8) Flat topology: every built command stays --no-subagents.
+        for aid, label in ((explorer_aid, "explorer"), (impl_aid, "implementer"), (review_aid, "reviewer")):
+            command = self._command(aid)
+            self.assertIn("--no-subagents", command, f"{label} command must stay flat")
+        impl_followup_command = self._command(impl_aid, "resume", first_turn=False)
+        self.assertIn("--no-subagents", impl_followup_command)
+        self.assertIn("--resume", impl_followup_command)
+        self.assertEqual(self._effort_arg(impl_followup_command), "high")
+
+
 if __name__ == "__main__":
     unittest.main()

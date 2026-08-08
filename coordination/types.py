@@ -22,6 +22,7 @@ class Peer:
     kind: PeerKind
     status: str
     updated_at: str
+    role: str | None = None
     activity: str = ""
 
     def to_dict(self) -> dict:
