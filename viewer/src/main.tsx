@@ -16,11 +16,14 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Copy,
   FileCode2,
   Folder,
   FolderOpen,
   GitCompareArrows,
+  ListTodo,
+  Loader2,
   MessageSquare,
   Moon,
   PanelLeftClose,
@@ -30,6 +33,7 @@ import {
   PinOff,
   Search,
   ServerOff,
+  Square,
   Sun,
   Trash2,
   Wrench,
@@ -55,6 +59,7 @@ import {
   editDiffFromInput,
   isToolEvent,
   parsePayload,
+  planFromEvents,
   sumToolStepDiffStats,
   summarizeToolchain,
   toolStepDiffStats,
@@ -62,6 +67,7 @@ import {
   type EditDiffView,
   type Event,
   type LiveActivity,
+  type Plan,
   type StreamItem,
   type ToolStep,
   type Turn,
@@ -1337,6 +1343,74 @@ function DetailsPanel({ agent, turns }: { agent: Agent; turns: Turn[] }) {
   );
 }
 
+/* ─── plan / todo panel ─────────────────────────────────────────────────── */
+
+/**
+ * Codex-style persistent todo card pinned at the bottom of the conversation
+ * tab. Renders the latest Grok plan snapshot: pending / in_progress /
+ * completed rows with a progress header. Default expanded, manually collapsible.
+ */
+function TodoPanel({ plan }: { plan: Plan | null }) {
+  const [open, setOpen] = useState(true);
+  if (!plan || plan.entries.length === 0) return null;
+  const total = plan.entries.length;
+  const done = plan.entries.filter((e) => e.status === "completed").length;
+  const active = plan.entries.filter((e) => e.status === "in_progress").length;
+  return (
+    <section className="todo-panel" aria-label="计划">
+      <header className="todo-header">
+        <ListTodo size={15} className="todo-head-icon" aria-hidden />
+        <span className="todo-title">计划</span>
+        <span className={`todo-progress${active ? " has-active" : ""}`}>
+          {done}/{total} 完成
+          {active > 0 && <span className="todo-active"> · {active} 进行中</span>}
+        </span>
+        <button
+          type="button"
+          className="icon-btn todo-toggle"
+          aria-expanded={open}
+          title={open ? "折叠计划" : "展开计划"}
+          onClick={() => setOpen(!open)}
+        >
+          {open ? (
+            <ChevronDown size={14} aria-hidden />
+          ) : (
+            <ChevronUp size={14} aria-hidden />
+          )}
+        </button>
+      </header>
+      {open && (
+        <ol className="todo-list">
+          {plan.entries.map((entry, idx) => (
+            <li
+              key={`${idx}-${entry.content}`}
+              className={`todo-item status-${entry.status}`}
+              title={
+                entry.status === "completed"
+                  ? "已完成"
+                  : entry.status === "in_progress"
+                    ? "进行中"
+                    : "未开始"
+              }
+            >
+              <span className="todo-icon" aria-hidden>
+                {entry.status === "completed" ? (
+                  <Check size={13} strokeWidth={3} />
+                ) : entry.status === "in_progress" ? (
+                  <Loader2 size={13} className="todo-spin" />
+                ) : (
+                  <Square size={12} />
+                )}
+              </span>
+              <span className="todo-content">{entry.content}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
 /* ─── dialogs ───────────────────────────────────────────────────────────── */
 
 function ConfirmDialog({
@@ -1477,6 +1551,9 @@ function App() {
     () => deriveLiveActivity(current, events, { steps: collapsedToolSteps }),
     [current, events, collapsedToolSteps],
   );
+
+  // Latest plan snapshot (Grok emits full-list plan events) → bottom todo card.
+  const plan = useMemo(() => planFromEvents(events), [events]);
 
   const bootstrap = useCallback(async () => {
     try {
@@ -2611,6 +2688,8 @@ function App() {
                 <DetailsPanel agent={current} turns={detail?.turns || []} />
               </div>
             )}
+
+            {tab === "conversation" && <TodoPanel plan={plan} />}
 
             <ActivityBar
               activity={liveActivity}

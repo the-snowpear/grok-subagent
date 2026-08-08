@@ -235,6 +235,121 @@ a {
   letter-spacing: 0;
 }
 
+/* Codex-style plan/todo card: centered, fixed-width, pinned above the
+   activity bar (bottom of page) — not a full-width bar. */
+.todo-panel {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  width: min(440px, calc(100% - 32px));
+  margin: 8px auto;
+  max-height: 260px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-elevated) 94%, var(--surface-2));
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+
+.todo-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  min-width: 0;
+}
+
+.todo-head-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.todo-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.todo-progress {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.todo-progress.has-active {
+  color: var(--cyan);
+}
+
+.todo-active {
+  font-weight: 500;
+}
+
+.todo-toggle {
+  flex-shrink: 0;
+}
+
+.todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 14px 9px;
+  overflow: auto;
+  min-width: 0;
+}
+
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  min-width: 0;
+}
+
+.todo-icon {
+  flex-shrink: 0;
+  margin-top: 3px;
+  color: var(--faint);
+  display: inline-flex;
+}
+
+.todo-item.status-in_progress .todo-icon {
+  color: var(--amber);
+}
+
+.todo-item.status-completed .todo-icon {
+  color: var(--accent);
+}
+
+.todo-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.todo-item.status-in_progress .todo-content {
+  color: var(--text);
+}
+
+.todo-item.status-completed .todo-content {
+  color: var(--faint);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--faint) 55%, transparent);
+}
+
+@keyframes todo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.todo-spin {
+  animation: todo-spin 1s linear infinite;
+}
+
 /* SSE disconnect strip (active agent only) */
 .stream-conn-banner {
   flex-shrink: 0;

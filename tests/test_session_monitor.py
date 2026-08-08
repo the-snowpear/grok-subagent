@@ -129,6 +129,40 @@ class ContentParseTest(unittest.TestCase):
             if isinstance(ro, dict) and "output" in ro:
                 self.assertFalse(isinstance(ro.get("output"), list) and ro.get("output") and isinstance(ro["output"][0], int))
 
+    def test_plan_event_summary_counts_entries(self):
+        obj = {
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "plan",
+                    "entries": [
+                        {"content": "a", "priority": "medium", "status": "in_progress"},
+                        {"content": "b", "priority": "medium", "status": "pending"},
+                        {"content": "c", "priority": "medium", "status": "completed"},
+                        {"content": "d", "priority": "medium", "status": "completed"},
+                    ],
+                },
+            },
+        }
+        etype, summary, payload = daemon.summarize_session_update(obj, "updates.jsonl")
+        self.assertEqual(etype, "plan")
+        self.assertIn("4 项", summary)
+        self.assertIn("1 进行中", summary)
+        self.assertIn("2 完成", summary)
+        # entries survive into the stored payload for the frontend panel
+        self.assertIn("entries", json.dumps(payload, ensure_ascii=False))
+
+    def test_plan_event_without_entries_keeps_summary_fallback(self):
+        obj = {
+            "method": "session/update",
+            "params": {"sessionId": "s", "update": {"sessionUpdate": "plan"}},
+        }
+        etype, summary, payload = daemon.summarize_session_update(obj, "updates.jsonl")
+        self.assertEqual(etype, "plan")
+        self.assertIsInstance(summary, str)
+        self.assertTrue(summary)
+
 
 class SessionMonitorFixtureTest(_DbMixin, unittest.TestCase):
     def test_content_list_and_byte_output_and_bad_structure_continue(self):

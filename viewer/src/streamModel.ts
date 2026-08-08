@@ -60,6 +60,8 @@ export const HIDDEN_TYPES = new Set([
   "turn_completed",
   "usage",
   "context_usage",
+  // Plan snapshots render in the persistent todo panel, not the stream.
+  "plan",
 ]);
 
 export const TOOL_TYPES = new Set([
@@ -1096,4 +1098,76 @@ export function deriveLiveActivity(
     tone: "thinking",
     visible: true,
   };
+}
+
+/* ── plan / todo snapshot (Codex-style persistent todo panel) ────────────── */
+
+export type PlanStatus = "pending" | "in_progress" | "completed";
+
+export type PlanEntry = {
+  content: string;
+  status: PlanStatus;
+  priority?: string;
+};
+
+export type Plan = {
+  entries: PlanEntry[];
+  updatedAt?: string;
+};
+
+/** Normalize a Grok plan entry status; unknown values degrade to pending. */
+function normalizePlanStatus(value: unknown): PlanStatus {
+  const s = String(value || "").toLowerCase();
+  if (s === "in_progress" || s === "running" || s === "active") {
+    return "in_progress";
+  }
+  if (s === "completed" || s === "done") {
+    return "completed";
+  }
+  return "pending";
+}
+
+/**
+ * Pull the entry list out of a stored plan payload.
+ * Known shapes: params.update.entries (updates.jsonl), update.entries,
+ * or a bare top-level entries array (flattened streaming variants).
+ */
+function planEntriesFromPayload(payload: unknown): PlanEntry[] | null {
+  const rec = asRecord(payload);
+  if (!rec) return null;
+  const params = asRecord(rec.params);
+  const update = asRecord(params?.update);
+  let entries: unknown = null;
+  if (update && Array.isArray(update.entries)) entries = update.entries;
+  else if (params && Array.isArray(params.entries)) entries = params.entries;
+  else if (Array.isArray(rec.entries)) entries = rec.entries;
+  if (!Array.isArray(entries)) return null;
+  const out: PlanEntry[] = [];
+  for (const raw of entries) {
+    const entry = asRecord(raw);
+    if (!entry) continue;
+    const content = typeof entry.content === "string" ? entry.content.trim() : "";
+    if (!content) continue;
+    out.push({
+      content,
+      status: normalizePlanStatus(entry.status),
+      priority: typeof entry.priority === "string" ? entry.priority : undefined,
+    });
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Latest plan snapshot for an agent's event stream. Grok emits full-list
+ * snapshots, so the most recent `plan` event always wins — no diffing needed.
+ * Returns null when no plan was ever created (or the last snapshot is empty).
+ */
+export function planFromEvents(events: Event[]): Plan | null {
+  let plan: Plan | null = null;
+  for (const event of events) {
+    if (event.type !== "plan") continue;
+    const entries = planEntriesFromPayload(parsePayload(event));
+    plan = entries ? { entries, updatedAt: event.created_at } : null;
+  }
+  return plan;
 }

@@ -1596,6 +1596,23 @@ def summarize_session_update(obj: dict, path_name: str) -> tuple[str, str, dict]
     if not summary:
         summary = str(obj.get("type") or method or path_name)
 
+    # Plan events carry the full entry list (snapshot semantics) but no title;
+    # surface a searchable progress summary instead of the generic fallback.
+    if event_type == "plan":
+        entries = update.get("entries")
+        if isinstance(entries, list) and entries:
+            active = sum(
+                1
+                for e in entries
+                if isinstance(e, dict) and e.get("status") == "in_progress"
+            )
+            done = sum(
+                1
+                for e in entries
+                if isinstance(e, dict) and e.get("status") == "completed"
+            )
+            summary = f"计划：{len(entries)} 项，{active} 进行中，{done} 完成"
+
     # Keep full structure for frontend ToolStep, but normalize heavy byte arrays.
     payload = normalize_for_storage(obj) if isinstance(obj, dict) else obj
     return event_type, str(summary)[:2000], payload if isinstance(payload, dict) else {"value": payload}

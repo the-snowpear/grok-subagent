@@ -11,6 +11,7 @@ import {
   extractContentText,
   isPlausibleToolTitle,
   lineDiffStats,
+  planFromEvents,
   preferTitle,
   sumToolStepDiffStats,
   summarizeToolchain,
@@ -748,5 +749,88 @@ describe("buildStream toolchain + turn separator", () => {
     );
     const firstToolIdx = stream.findIndex((x) => x.kind === "toolchain");
     expect(pendingIdx).toBeGreaterThan(firstToolIdx);
+  });
+});
+
+describe("planFromEvents", () => {
+  function planEvent(
+    id: number,
+    entries: Array<{ content: string; status: string; priority?: string }>,
+  ): Event {
+    return ev({
+      id,
+      type: "plan",
+      summary: "计划：2 项",
+      payload: JSON.stringify({
+        method: "session/update",
+        params: {
+          sessionId: "s",
+          update: { sessionUpdate: "plan", entries },
+        },
+      }),
+    });
+  }
+
+  it("returns null when no plan event exists", () => {
+    expect(planFromEvents([ev({ id: 1, type: "thought", summary: "x" })])).toBeNull();
+  });
+
+  it("extracts entries from the last plan snapshot (full-snapshot semantics)", () => {
+    const events = [
+      planEvent(1, [
+        { content: "step a", status: "in_progress" },
+        { content: "step b", status: "pending" },
+      ]),
+      planEvent(2, [
+        { content: "step a", status: "completed" },
+        { content: "step b", status: "completed" },
+      ]),
+    ];
+    const plan = planFromEvents(events);
+    expect(plan).not.toBeNull();
+    expect(plan!.entries).toEqual([
+      { content: "step a", status: "completed", priority: undefined },
+      { content: "step b", status: "completed", priority: undefined },
+    ]);
+    expect(plan!.updatedAt).toBe("2026-07-12T00:00:00Z");
+  });
+
+  it("normalizes unknown statuses to pending and keeps priority", () => {
+    const plan = planFromEvents([
+      planEvent(1, [
+        { content: "a", status: "queued", priority: "high" },
+        { content: "b", status: "running" },
+        { content: "c", status: "done" },
+      ]),
+    ]);
+    expect(plan!.entries.map((e) => e.status)).toEqual([
+      "pending",
+      "in_progress",
+      "completed",
+    ]);
+    expect(plan!.entries[0].priority).toBe("high");
+  });
+
+  it("handles flattened payload shapes and drops empty snapshots", () => {
+    const flat = ev({
+      id: 1,
+      type: "plan",
+      summary: "x",
+      payload: JSON.stringify({ entries: [{ content: "flat", status: "pending" }] }),
+    });
+    expect(planFromEvents([flat])!.entries[0].content).toBe("flat");
+
+    const empty = ev({
+      id: 2,
+      type: "plan",
+      summary: "x",
+      payload: JSON.stringify({ entries: [] }),
+    });
+    expect(planFromEvents([empty])).toBeNull();
+  });
+
+  it("hides plan snapshots from the conversation stream", () => {
+    const items = buildStream([planEvent(1, [{ content: "a", status: "pending" }])]);
+    expect(items).toHaveLength(0);
   });
 });
