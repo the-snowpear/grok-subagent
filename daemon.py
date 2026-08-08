@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import socket
 import socketserver
@@ -23,6 +25,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from coordination import AgentRegistry, CoordinationHub, Mailbox, main_peer_id
+
+from prompt_transport import PromptTransport, prepare_prompt_transport, probe_prompt_file_support
 
 if os.name == "nt":
     import msvcrt
@@ -40,6 +46,7 @@ STATE_PATH = DATA / "daemon-state.json"
 LOCK_PATH = DATA / "daemon.lock"
 CONTROL_PORT = 47830
 VIEWER_PORT = 47831
+WORKER_CONTROL_PORT = 47832
 RETENTION_DAYS = 7
 TERMINAL = {"completed", "failed", "cancelled"}
 ACTIVE_TURN = {"queued", "running"}
@@ -109,6 +116,15 @@ FS_EXCLUDE_REL_EXACT = frozenset({
     "data/daemon.lock",
     "data/observer.sqlite",
 })
+
+# Named agent profiles: worktree isolation + max_turns + prompt steering suffix.
+# resolve_agent_settings() merges these with explicit per-call overrides.
+PROFILES = {
+    "default": {"worktree": False, "max_turns": 50, "prompt_suffix": ""},
+    "fast": {"worktree": False, "max_turns": 20, "prompt_suffix": "\n\n(快速模式：优先小步验证，尽快返回结果。)"},
+    "deep": {"worktree": True, "max_turns": 100, "prompt_suffix": "\n\n(深度模式：在独立 worktree 中工作，可进行多轮探索。)"},
+    "isolated": {"worktree": True, "max_turns": 50, "prompt_suffix": ""},
+}
 
 # Held for the lifetime of the daemon process so the OS releases it on crash.
 _LOCK_HANDLE = None
@@ -266,6 +282,27 @@ def connect():
         db.close()
 
 
+def _retry_sqlite_busy(fn, attempts: int = 3):
+    """Run fn() with bounded busy retries on locked/busy SQLite; re-raise others.
+
+    Transient 'database is locked'/'database is busy' errors can surface when
+    another thread holds a write transaction. Short bounded retries keep
+    critical writes (e.g. child identity persistence right after Popen) from
+    spuriously aborting; any other error propagates immediately.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+    return None  # pragma: no cover - attempts >= 1 always returns or raises
+
+
 def init_db() -> None:
     with connect() as db:
         db.executescript(
@@ -309,15 +346,37 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_agents_thread ON agents(thread_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_turns_agent ON turns(agent_id);
             CREATE INDEX IF NOT EXISTS idx_changes_agent ON changes(agent_id);
+            CREATE TABLE IF NOT EXISTS agent_messages(
+              id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES tasks(thread_id),
+              from_peer TEXT NOT NULL, to_peer TEXT NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'message', body TEXT NOT NULL, reply_to TEXT,
+              delivery_mode TEXT NOT NULL DEFAULT 'queue', state TEXT NOT NULL DEFAULT 'pending',
+              target_turn_id INTEGER, error TEXT, created_at TEXT NOT NULL,
+              delivered_at TEXT, consumed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_target_state_created ON agent_messages(to_peer, state, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_thread_created ON agent_messages(thread_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_messages_reply ON agent_messages(reply_to);
             """
         )
         # Best-effort migrations for older local DBs.
         for stmt in (
             "ALTER TABLE agents ADD COLUMN child_pid INTEGER",
             "ALTER TABLE agents ADD COLUMN child_started_at TEXT",
+            "ALTER TABLE turns ADD COLUMN child_started_at TEXT",
+            "ALTER TABLE turns ADD COLUMN child_spawned_at TEXT",
             "ALTER TABLE agents ADD COLUMN display_title TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN hub_token TEXT",
             "ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE agents ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 50",
+            "ALTER TABLE agents ADD COLUMN worktree_path TEXT",
+            "ALTER TABLE agents ADD COLUMN worktree_root TEXT",
+            "ALTER TABLE agents ADD COLUMN original_cwd TEXT",
+            "ALTER TABLE agents ADD COLUMN repo_root TEXT",
+            "ALTER TABLE agents ADD COLUMN repo_rel_cwd TEXT",
+            "ALTER TABLE agents ADD COLUMN worktree_base_sha TEXT",
+            "ALTER TABLE agents ADD COLUMN isolation_mode TEXT DEFAULT 'shared'",
             "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE changes ADD COLUMN source TEXT DEFAULT 'observed'",
@@ -329,6 +388,38 @@ def init_db() -> None:
                 db.execute(stmt)
             except sqlite3.OperationalError:
                 pass
+        # Backfill the delivery marker for pre-migration rows: turns written by
+        # round 3 recorded their OS create time in child_started_at, which is a
+        # valid delivery-start proof (it was only ever set right after Popen).
+        # Idempotent — rows already carrying child_spawned_at are left alone.
+        try:
+            db.execute(
+                "UPDATE turns SET child_spawned_at=child_started_at "
+                "WHERE child_spawned_at IS NULL AND child_started_at IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
+        # Backfill delivery markers for historical round-3 crash rows where
+        # Popen succeeded but the OS create-time lookup returned None: a
+        # running agent with child_pid set, whose current turn is running and
+        # carries no legacy marker. Evidence rationale: child_pid on a running
+        # agent is only ever set right after a successful Popen, and the
+        # running current turn is the one that spawned it — so the delivery
+        # claim is real and recover() must converge, not release. The
+        # correlated EXISTS keeps this strictly agent+current-turn scoped:
+        # queued turns are never touched, non-null child_spawned_at is never
+        # overwritten, and COALESCE(created_at, now()) is the best available
+        # spawn time. Idempotent — a second run matches no rows.
+        try:
+            db.execute(
+                "UPDATE turns SET child_spawned_at=COALESCE(created_at, ?) "
+                "WHERE child_spawned_at IS NULL AND status='running' "
+                "AND EXISTS (SELECT 1 FROM agents a WHERE a.id=turns.agent_id AND a.status='running' "
+                "AND a.child_pid IS NOT NULL AND a.current_turn=turns.id)",
+                (now(),),
+            )
+        except sqlite3.OperationalError:
+            pass
         # Backfill empty display titles from agent name (one-shot, cheap).
         try:
             db.execute(
@@ -339,6 +430,36 @@ def init_db() -> None:
             pass
 
 
+@contextmanager
+def coordination_connect(immediate: bool = False):
+    """Open the observer DB for the coordination kernel.
+
+    With immediate=True, runs a BEGIN IMMEDIATE write transaction that commits
+    on clean exit and rolls back on exception; otherwise behaves like connect().
+    """
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA foreign_keys=ON")
+        if immediate:
+            db.isolation_level = None
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+            except Exception:
+                db.rollback()
+                raise
+            else:
+                db.commit()
+        else:
+            with db:
+                yield db
+    finally:
+        db.close()
+
+
+
 def artifact(agent_id: str, label: str, content: str) -> str:
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
     folder = ARTIFACTS / agent_id
@@ -346,6 +467,24 @@ def artifact(agent_id: str, label: str, content: str) -> str:
     path = folder / f"{label}-{digest}.txt.gz"
     if not path.exists():
         with gzip.open(path, "wt", encoding="utf-8") as handle:
+            handle.write(content)
+    return str(path.relative_to(ROOT))
+
+
+def artifact_bytes(agent_id: str, label: str, content: bytes) -> str:
+    """Persist arbitrary bytes losslessly as base64 text in the existing artifact store."""
+    encoded = base64.b64encode(content).decode("ascii")
+    return artifact(agent_id, label, encoded)
+
+
+def artifact_raw_bytes(agent_id: str, label: str, content: bytes) -> str:
+    """Persist arbitrary bytes losslessly as a raw-gzip artifact (no base64 wrapper)."""
+    digest = hashlib.sha256(content).hexdigest()[:16]
+    folder = ARTIFACTS / agent_id
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{label}-{digest}.gz"
+    if not path.exists():
+        with gzip.open(path, "wb") as handle:
             handle.write(content)
     return str(path.relative_to(ROOT))
 
@@ -1693,6 +1832,208 @@ RUNNERS_LOCK = threading.Lock()
 CONDITIONS: dict[str, threading.Condition] = {}
 CONDITIONS_LOCK = threading.Lock()
 
+# Delivery scheduler: durable, DB-backed follow-up turns for completed workers.
+# The per-agent lock serializes in-process schedulers; the conditional message
+# claim (state='pending' AND target_turn_id IS NULL) is the cross-process net.
+_DELIVERY_LOCKS_GUARD = threading.Lock()
+_DELIVERY_LOCKS: dict[str, threading.Lock] = {}
+
+
+def delivery_lock(agent_id: str) -> threading.Lock:
+    """Return the per-agent lock serializing delivery scheduling."""
+    with _DELIVERY_LOCKS_GUARD:
+        lock = _DELIVERY_LOCKS.get(agent_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DELIVERY_LOCKS[agent_id] = lock
+        return lock
+
+
+def on_hub_message_committed(message) -> None:
+    """Post-commit mailbox hook: schedule delivery for worker-bound messages."""
+    if str(message.to_peer).startswith("main:"):
+        return
+    maybe_schedule_delivery(str(message.to_peer))
+
+
+
+def maybe_schedule_delivery(agent_id: str) -> int:
+    """Render pending worker messages into one durable queued follow-up turn.
+
+    The DB is the execution source of truth. Messages stay state='pending' and
+    are only claimed through target_turn_id here; they become delivered/consumed
+    only after subprocess.Popen succeeds in AgentRunner._run().
+    """
+    max_prompt_bytes = 60 * 1024
+    with delivery_lock(agent_id), CREATE_LOCK:
+        # BEGIN IMMEDIATE serializes the select/claim with inbox drains and other
+        # write-side schedulers. This prevents a turn prompt from containing rows
+        # that were concurrently consumed or claimed elsewhere.
+        with coordination_connect(immediate=True) as db:
+            agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if agent is None or agent["status"] != "completed":
+                return 0
+            active = int(
+                db.execute(
+                    "SELECT COUNT(*) AS c FROM turns WHERE agent_id=? AND status IN ('queued','running')",
+                    (agent_id,),
+                ).fetchone()["c"]
+            )
+            if active:
+                return 0
+            rows = db.execute(
+                "SELECT id,from_peer,body FROM agent_messages "
+                "WHERE to_peer=? AND state='pending' AND consumed_at IS NULL AND target_turn_id IS NULL "
+                "ORDER BY created_at ASC,id ASC LIMIT 100",
+                (agent_id,),
+            ).fetchall()
+            if not rows:
+                return 0
+
+            blocks: list[str] = []
+            message_ids: list[str] = []
+            for row in rows:
+                message_id = str(row["id"])
+                body = str(row["body"] or "")
+                index = len(blocks) + 1
+                block = f"[{index}] (from {row['from_peer']}, id {message_id})\n{body}"
+                header = f"你在 Grok Agent Fabric 中收到 {index} 条协作消息，请统一处理："
+                candidate = header + "\n" + "\n---\n".join([*blocks, block])
+
+                if len(candidate.encode("utf-8")) > max_prompt_bytes:
+                    if blocks:
+                        # Preserve this and all later rows for the next follow-up.
+                        break
+                    # A single legal mailbox message can be up to 64 KiB, slightly
+                    # larger than the delivery envelope. Spill the *full* body to
+                    # a durable artifact instead of truncating it and claiming it.
+                    rel = artifact(agent_id, f"hub-message-{message_id[:12]}", body)
+                    full_path = str((ROOT / rel).resolve())
+                    block = (
+                        f"[1] (from {row['from_peer']}, id {message_id})\n"
+                        "消息正文较大，完整 UTF-8 内容已保存到本地 artifact：\n"
+                        f"{full_path}\n"
+                        "请使用文件读取/终端工具读取完整内容后处理；不要只依据此摘要。"
+                    )
+                    candidate = "你在 Grok Agent Fabric 中收到 1 条协作消息，请统一处理：\n" + block
+                    if len(candidate.encode("utf-8")) > max_prompt_bytes:
+                        raise RuntimeError("hub delivery artifact envelope unexpectedly exceeds cap")
+
+                blocks.append(block)
+                message_ids.append(message_id)
+
+            if not message_ids:
+                return 0
+
+            prompt = (
+                f"你在 Grok Agent Fabric 中收到 {len(message_ids)} 条协作消息，请统一处理：\n"
+                + "\n---\n".join(blocks)
+            )
+            turn_no = int(
+                db.execute(
+                    "SELECT COALESCE(MAX(turn_no),0)+1 AS n FROM turns WHERE agent_id=?",
+                    (agent_id,),
+                ).fetchone()["n"]
+            )
+            cursor = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,?,?,'queued',?)",
+                (agent_id, turn_no, prompt, now()),
+            )
+            turn_id = int(cursor.lastrowid)
+            placeholders = ",".join("?" for _ in message_ids)
+            claimed_count = db.execute(
+                "UPDATE agent_messages SET target_turn_id=? "
+                f"WHERE id IN ({placeholders}) AND state='pending' "
+                "AND consumed_at IS NULL AND target_turn_id IS NULL",
+                (turn_id, *message_ids),
+            ).rowcount
+            if claimed_count != len(message_ids):
+                raise RuntimeError("mailbox delivery claim race; transaction rolled back")
+            db.execute(
+                "UPDATE agents SET status='queued',updated_at=?,revision=revision+1 WHERE id=? AND status='completed'",
+                (now(), agent_id),
+            )
+
+        # Everything above is committed. Notifications/events/queue puts are
+        # wake hints only and must not invalidate durable scheduling.
+        try:
+            notify_agent(agent_id)
+        except Exception:
+            pass
+        try:
+            add_event(
+                agent_id,
+                turn_id,
+                "hub_delivery",
+                f"投递 {claimed_count} 条协作消息",
+                {"messages": claimed_count, "turn_id": turn_id, "prompt_preview": prompt[:200]},
+            )
+        except Exception:
+            pass
+        runner = get_runner(agent_id)
+        if runner is not None:
+            try:
+                runner.enqueue(turn_id, prompt)
+            except Exception as exc:
+                # Durable queued turn remains recoverable from SQLite; the
+                # delivery sweep retries anything that never committed.
+                print(f"delivery wake failed for {agent_id}: {exc}", file=sys.stderr, flush=True)
+                try:
+                    add_event(agent_id, None, "delivery_wake_error", str(exc), {})
+                except Exception:
+                    pass
+        return claimed_count
+
+
+DELIVERY_SWEEP_INTERVAL_S = 2.0
+
+
+def delivery_sweep() -> None:
+    """Retry scheduling for pending mail that missed its post-commit delivery.
+
+    A maybe_schedule_delivery that raised before its durable commit leaves
+    messages pending/unclaimed with the agent still 'completed'; this sweep
+    renders them into a durable queued follow-up turn without a daemon restart.
+    Idempotent by design: the per-agent lock plus the conditional message
+    claim (state='pending' AND target_turn_id IS NULL) plus the completed-only
+    agent filter guarantee at most one follow-up turn per target.
+    """
+    with connect() as db:
+        peers = [
+            row["to_peer"]
+            for row in db.execute(
+                "SELECT DISTINCT m.to_peer FROM agent_messages m "
+                "JOIN agents a ON a.id=m.to_peer "
+                "WHERE m.state='pending' AND m.consumed_at IS NULL "
+                "AND m.target_turn_id IS NULL AND a.status='completed'"
+            )
+        ]
+    for peer in peers:
+        try:
+            maybe_schedule_delivery(peer)
+        except Exception as exc:
+            print(f"delivery sweep failed for {peer}: {exc}", file=sys.stderr, flush=True)
+            try:
+                add_event(peer, None, "delivery_sweep_error", str(exc), {})
+            except Exception:
+                pass
+
+
+def delivery_sweep_loop() -> None:
+    """Background loop: keep sweeping while the daemon runs."""
+    while True:
+        time.sleep(DELIVERY_SWEEP_INTERVAL_S)
+        try:
+            delivery_sweep()
+        except Exception as exc:
+            print(f"delivery sweep loop failed: {exc}", file=sys.stderr, flush=True)
+
+
+# Coordination kernel singletons (thread-scoped peer registry, durable mailbox).
+REGISTRY = AgentRegistry(coordination_connect)
+MAILBOX = Mailbox(coordination_connect, now, on_message_committed=on_hub_message_committed)
+HUB = CoordinationHub(REGISTRY, MAILBOX)
+
 # Streaming / session events that can open or close in-flight tools.
 TOOL_ACTIVITY_TYPES = frozenset({
     "tool_call",
@@ -1782,6 +2123,44 @@ def unique_changed_files(agent_id: str) -> int:
     with connect() as db:
         row = db.execute("SELECT COUNT(DISTINCT path) AS c FROM changes WHERE agent_id=?", (agent_id,)).fetchone()
         return int(row["c"])
+
+
+def grok_command(agent_row: dict, prompt: str | None, first_turn: bool, cwd: Path, prompt_file_flag: str | None = None, prompt_file: str | None = None) -> list[str]:
+    """Build the grok CLI invocation for one turn (fake-grok aware, honors max_turns).
+
+    ``prompt`` may be None when the full prompt travels in a durable prompt
+    file: the ``-p`` positional is then omitted entirely. The native
+    ``prompt_file_flag``/``prompt_file`` pair (when both are set) is appended
+    at the END of the command, after session/resume flags, so existing
+    callers keep byte-identical commands.
+    """
+    fake_grok = os.environ.get("GROK_OBSERVER_FAKE_GROK")
+    executable = [sys.executable, fake_grok] if fake_grok else ["grok"]
+    stored_max = agent_row["max_turns"] if "max_turns" in agent_row.keys() else None
+    command = executable
+    if prompt is not None:
+        command = command + ["-p", prompt]
+    command = command + [
+        "--cwd", str(cwd),
+        "--output-format", "streaming-json",
+        "--always-approve", "--no-subagents",
+        "--max-turns", str(int(stored_max or 50)),
+    ]
+    command += ["--session-id", agent_row["grok_session_id"]] if first_turn else ["--resume", agent_row["grok_session_id"]]
+    if prompt_file_flag and prompt_file:
+        command.extend([prompt_file_flag, prompt_file])
+    return command
+
+
+def reconcile_delivery_turn(turn_id: int, *, started: bool) -> int:
+    """Converge (started=True) or release (started=False) a turn's delivery claim.
+
+    Idempotent crash-consistency primitive over the durable mailbox: a turn
+    whose child actually started must keep its claims delivered so the prompt
+    is never injected twice, while a turn that never spawned must release its
+    claims so the messages become visible again.
+    """
+    return MAILBOX.reconcile_turn_delivery(turn_id=turn_id, started=started)
 
 
 class AgentRunner:
@@ -2130,6 +2509,19 @@ class AgentRunner:
             try:
                 item = self.queue.get(timeout=0.5)
             except queue.Empty:
+                # The queue is only a wake hint: durable queued turns live in the
+                # DB, so poll for them whenever no in-memory item is waiting.
+                with connect() as db:
+                    row = db.execute(
+                        "SELECT id,prompt FROM turns WHERE agent_id=? AND status='queued' ORDER BY id LIMIT 1",
+                        (self.agent_id,),
+                    ).fetchone()
+                if row:
+                    turn_id, prompt = row["id"], row["prompt"]
+                    if self.cancelled.is_set() or self._shutdown.is_set():
+                        self._mark_turn_cancelled(turn_id)
+                        continue
+                    self._run(turn_id, prompt)
                 continue
             if item is None:
                 return
@@ -2154,52 +2546,96 @@ class AgentRunner:
             self._mark_turn_cancelled(turn_id)
             return
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (self.agent_id,)).fetchone()
+            agent = db.execute(
+                "SELECT status,cwd,grok_session_id,max_turns FROM agents WHERE id=?", (self.agent_id,)
+            ).fetchone()
             turn = db.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
             if not agent or not turn:
                 return
             if agent["status"] == "cancelled" or turn["status"] == "cancelled":
                 self._mark_turn_cancelled(turn_id)
                 return
+            # Conditional claim: only a durable 'queued' turn may start. If a
+            # concurrent runner (or recovery) already claimed/cancelled it, abort
+            # silently — the turn stays durable for the DB poll to pick up.
+            cur = db.execute(
+                "UPDATE turns SET status='running',started_at=? WHERE id=? AND status='queued'",
+                (now(), turn_id),
+            )
+            if cur.rowcount == 0:
+                return
             db.execute(
                 "UPDATE agents SET status='running',current_turn=?,updated_at=?,revision=revision+1 WHERE id=?",
                 (turn_id, now(), self.agent_id),
             )
-            db.execute("UPDATE turns SET status='running',started_at=? WHERE id=?", (now(), turn_id))
-        self.begin_turn(turn_id)
-        cwd = Path(agent["cwd"])
-        # Capture workspace + session-log baselines BEFORE process start to avoid races
-        # and to prevent resume turns from replaying historical updates.jsonl.
-        before = workspace_snapshot(cwd)
-        session_baseline = capture_session_log_baseline(cwd, agent["grok_session_id"])
-        monitor_state = SessionMonitorState(session_baseline)
-        add_event(self.agent_id, turn_id, "user", prompt, {"prompt": prompt, "turn": turn["turn_no"]})
-
-        first_turn = int(turn["turn_no"]) == 1
-        fake_grok = os.environ.get("GROK_OBSERVER_FAKE_GROK")
-        executable = [sys.executable, fake_grok] if fake_grok else ["grok"]
-        command = executable + ["-p", prompt, "--cwd", str(cwd), "--output-format", "streaming-json", "--always-approve", "--no-subagents", "--max-turns", "50"]
-        command += ["--session-id", agent["grok_session_id"]] if first_turn else ["--resume", agent["grok_session_id"]]
-        add_event(self.agent_id, turn_id, "process", "启动 Grok Build", {"command": command[:1] + ["<prompt>"] + command[3:]})
-
-        stopped = threading.Event()
+        # A queued turn is only a durable schedule. Hub messages become
+        # delivered/consumed after subprocess.Popen succeeds below. One try
+        # covers claim → process exit: any failure before the child exists
+        # releases the delivery claim; any failure after it exists converges it.
+        # Milestones: child_created = Popen returned a process; delivery_started
+        # = the delivery marker (agents.child_pid + turns.child_spawned_at) was
+        # durably persisted (M2 marker). agents.child_started_at holds OS
+        # process-creation identity only and is never a delivery proof.
+        child_created = False
+        delivery_started = False
+        monitor = None
+        monitor_state = None
         monitor_errors: list[str] = []
-        monitor = threading.Thread(
-            target=monitor_session,
-            args=(self.agent_id, turn_id, cwd, agent["grok_session_id"], stopped, monitor_state, monitor_errors),
-            name=f"mon-{self.agent_id[:8]}-{turn_id}",
-            daemon=True,
-        )
-        monitor.start()
-        chunks: list[str] = []
-        errors: list[str] = []
-        stop_reason = ""
-        returncode = 1
+        before = None
         try:
+            chunks: list[str] = []
+            errors: list[str] = []
+            stop_reason = ""
+            returncode = 1
+            self.begin_turn(turn_id)
+            cwd = Path(agent["cwd"])
+            # Capture workspace + session-log baselines BEFORE process start to avoid races
+            # and to prevent resume turns from replaying historical updates.jsonl.
+            before = workspace_snapshot(cwd)
+            session_baseline = capture_session_log_baseline(cwd, agent["grok_session_id"])
+            monitor_state = SessionMonitorState(session_baseline)
+            add_event(self.agent_id, turn_id, "user", prompt, {"prompt": prompt, "turn": turn["turn_no"]})
+
+            first_turn = int(turn["turn_no"]) == 1
+            # Large prompts never travel in full in argv on Windows: oversized
+            # prompts go to a durable file under data/prompts (retained with
+            # agent data) and argv carries only the transport's short prompt.
+            # The transport probes the CLI lazily — only when a file transport
+            # is actually needed, so short prompts never spawn a probe process.
+            transport = prepare_prompt_transport(self.agent_id, turn_id, prompt)
+            command = grok_command(
+                agent,
+                transport.argv_prompt,
+                first_turn,
+                cwd,
+                prompt_file_flag=transport.prompt_file_flag,
+                prompt_file=transport.prompt_file,
+            )
+            add_event(
+                self.agent_id,
+                turn_id,
+                "process",
+                "启动 Grok Build",
+                {
+                    "command": command[:1] + ["<prompt>"] + command[3:],
+                    "prompt_mode": transport.mode,
+                    "prompt_file": transport.prompt_file,
+                },
+            )
+
+            stopped = threading.Event()
+            monitor = threading.Thread(
+                target=monitor_session,
+                args=(self.agent_id, turn_id, cwd, agent["grok_session_id"], stopped, monitor_state, monitor_errors),
+                name=f"mon-{self.agent_id[:8]}-{turn_id}",
+                daemon=True,
+            )
+            monitor.start()
             if self.cancelled.is_set():
                 raise RuntimeError("cancelled before start")
             child_env, proxy_source = system_proxy_environment(os.environ.copy())
             child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            child_env.update(worker_bridge_env(self.agent_id))
             if proxy_source:
                 add_event(self.agent_id, turn_id, "network", f"Grok 已使用代理：{proxy_source}", {"source": proxy_source})
             with self._proc_lock:
@@ -2218,14 +2654,75 @@ class AgentRunner:
                     creationflags=NO_WINDOW,
                 )
             proc = self.process
-            # Persist child PID + its creation time so recover() can reap orphans
-            # after a daemon crash without risking a reused-PID mis-kill.
-            created = process_create_time(proc.pid)
-            with connect() as db:
-                db.execute(
-                    "UPDATE agents SET child_pid=?,child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
-                    (proc.pid, str(created) if created is not None else None, now(), self.agent_id),
-                )
+            # Popen succeeded: the execution backend has received the full
+            # turn prompt. Auto-injected hub messages are now consumed.
+            child_created = True
+            # M2: durably persist the delivery marker FIRST — agents.child_pid
+            # plus turns.child_spawned_at in ONE transaction. That marker is
+            # what recover() consults to decide converge-vs-release for this
+            # turn's delivery claim. Bounded busy retry keeps transient DB
+            # contention from aborting bookkeeping for an already-started
+            # child. The OS process identity (child_started_at) is written
+            # afterwards, agents only, so a slow/None create-time lookup can
+            # never delay the delivery marker.
+            # Invariant: the moment agents.child_pid=new becomes durable,
+            # agents.child_started_at is already NULL — both writes share one
+            # transaction and one spawn_stamp. The OS lookup below is the ONLY
+            # writer that may repopulate child_started_at, and only when it
+            # succeeds for the CURRENT pid, so a stale identity from a previous
+            # child can never survive a new spawn.
+            def persist_child_marker():
+                spawn_stamp = now()
+                with connect() as db:
+                    db.execute(
+                        "UPDATE agents SET child_pid=?,child_started_at=NULL,updated_at=?,revision=revision+1 WHERE id=?",
+                        (proc.pid, spawn_stamp, self.agent_id),
+                    )
+                    db.execute(
+                        "UPDATE turns SET child_spawned_at=? WHERE id=?",
+                        (spawn_stamp, turn_id),
+                    )
+
+            _retry_sqlite_busy(persist_child_marker)
+            # The child exists AND its delivery marker is durable: from here on
+            # this turn's delivery claim must converge, never be released.
+            delivery_started = True
+            # OS identity (PID-reuse detection only): record the child's
+            # creation time on agents — never on turns, whose child_started_at
+            # is legacy and only backfilled. Best-effort: a None lookup — or a
+            # raising lookup — simply means recovery cannot identity-verify
+            # this pid and will not kill it. An optional metadata failure must
+            # never fail an already-spawned Grok turn.
+            created = None
+            try:
+                created = process_create_time(proc.pid)
+            except (OSError, ValueError) as exc:
+                try:
+                    add_event(
+                        self.agent_id,
+                        turn_id,
+                        "process_identity_error",
+                        str(exc),
+                        {"pid": proc.pid},
+                    )
+                except Exception:
+                    pass
+            if created is not None:
+                identity_stamp = str(created)
+
+                def persist_child_identity():
+                    with connect() as db:
+                        db.execute(
+                            "UPDATE agents SET child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
+                            (identity_stamp, now(), self.agent_id),
+                        )
+
+                _retry_sqlite_busy(persist_child_identity)
+            try:
+                reconcile_delivery_turn(turn_id, started=True)
+            except Exception:
+                # Mailbox bookkeeping must never kill an already-started Grok.
+                pass
 
             def read_stderr():
                 assert proc and proc.stderr
@@ -2285,6 +2782,22 @@ class AgentRunner:
             returncode = proc.wait()
             stderr_thread.join(timeout=2)
         except Exception as exc:
+            # Pre-spawn failures (child never existed) release the delivery claim
+            # so messages become visible again. Once the child exists the prompt
+            # is with the execution backend, so the claim converges to delivered —
+            # never release, or the message would be injected twice.
+            if child_created:
+                try:
+                    reconcile_delivery_turn(turn_id, started=True)
+                except Exception:
+                    pass
+            elif not delivery_started:
+                try:
+                    released = MAILBOX.release_scheduled_for_turn(turn_id=turn_id)
+                    if released:
+                        MAILBOX.notify(self.agent_id)
+                except Exception:
+                    pass
             returncode = 1
             errors.append(str(exc))
             add_event(self.agent_id, turn_id, "error", str(exc), {"exception": repr(exc)})
@@ -2293,17 +2806,20 @@ class AgentRunner:
             # race; release boundary waiters once the process path is done.
             self.end_turn(turn_id)
             # Stop monitor so it runs final drain (flush wait + two deterministic passes).
-            stopped.set()
-            monitor.join(timeout=5)
-            if monitor.is_alive():
-                add_event(
-                    self.agent_id,
-                    turn_id,
-                    "observer_monitor_error",
-                    "monitor thread did not exit after final drain timeout",
-                    {"phase": "join_timeout"},
-                )
-            if monitor_errors or monitor_state.fatal:
+            # Guarded: a pre-monitor failure must not mask the original exception.
+            if monitor is not None:
+                stopped.set()
+                if monitor.ident is not None:
+                    monitor.join(timeout=5)
+                if monitor.is_alive():
+                    add_event(
+                        self.agent_id,
+                        turn_id,
+                        "observer_monitor_error",
+                        "monitor thread did not exit after final drain timeout",
+                        {"phase": "join_timeout"},
+                    )
+            if monitor_errors or (monitor_state is not None and monitor_state.fatal):
                 # Surface monitor death to runner diagnostics (not silent).
                 detail = monitor_state.fatal or (monitor_errors[-1] if monitor_errors else "unknown")
                 errors.append(f"observer_monitor: {detail}")
@@ -2338,6 +2854,16 @@ class AgentRunner:
         if self.cancelled.is_set():
             turn_status = "cancelled"
 
+        # Final delivery-claim reconciliation (idempotent): converges if the child
+        # existed, else releases. Covers a persistent M2-reconcile failure; kept
+        # best-effort so a mailbox failure can never block the terminal turn
+        # update — recover() re-reconciles from the durable child_spawned_at
+        # marker on the next daemon start.
+        try:
+            reconcile_delivery_turn(turn_id, started=child_created)
+        except Exception:
+            pass
+
         with connect() as db:
             current_status = db.execute("SELECT status FROM agents WHERE id=?", (self.agent_id,)).fetchone()["status"]
             if current_status == "cancelled" or self.cancelled.is_set():
@@ -2364,7 +2890,7 @@ class AgentRunner:
                 (agent_status, final_text, error_text, now(), self.agent_id),
             )
             db.execute("INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)", (self.agent_id, "result", final_text + "\n" + error_text))
-        if turn_status != "cancelled":
+        if turn_status != "cancelled" and before is not None:
             record_changes(self.agent_id, turn_id, before, workspace_snapshot(cwd, prior=before))
         terminal_summary = {
             "completed": "Grok 已完成",
@@ -2373,6 +2899,8 @@ class AgentRunner:
         }.get(turn_status, "Grok 执行失败")
         add_event(self.agent_id, turn_id, turn_status, terminal_summary, {"returncode": returncode, "stop_reason": stop_reason})
         notify_agent(self.agent_id)
+        if agent_status == "completed":
+            maybe_schedule_delivery(self.agent_id)
 
 
 def get_runner(agent_id: str, *, create: bool = True) -> AgentRunner | None:
@@ -2382,6 +2910,50 @@ def get_runner(agent_id: str, *, create: bool = True) -> AgentRunner | None:
             runner = AgentRunner(agent_id)
             RUNNERS[agent_id] = runner
         return runner
+
+
+
+def worker_coordination_instructions() -> str:
+    """Stable discoverability hint for current `grok -p` workers.
+
+    Grok 1.0.0 cannot auto-register the native MCP bridge on the headless -p
+    transport, so the CLI remains the functional fallback. The prompt contains
+    no capability token; credentials stay in child-only environment variables.
+    """
+    python_path = str(Path(sys.executable).resolve())
+    cli_path = str((ROOT / "grok_hub.py").resolve())
+    return (
+        "\n\n[Agent Fabric coordination]\n"
+        "You can coordinate with Main and sibling workers through the durable hub. "
+        "Use the worker CLI when coordination is useful; do not invent peer messages.\n"
+        f"Python executable: {python_path}\n"
+        f"Hub CLI script: {cli_path}\n"
+        "Invoke that Python executable with the hub script and one of: `peers`, `inbox`, "
+        "`send --to <peer-id> --message <text>`, or `wait --timeout 120`; adapt quoting to the active shell."
+    )
+
+
+def worker_bridge_env(agent_id: str) -> dict:
+    """Return child-only worker bridge credentials and discoverability paths."""
+    with connect() as db:
+        row = db.execute("SELECT hub_token FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if row is None:
+            raise ValueError("worker not found")
+        token = row["hub_token"]
+        if not token:
+            token = secrets.token_urlsafe(32)
+            db.execute(
+                "UPDATE agents SET hub_token=?,updated_at=? WHERE id=?",
+                (token, now(), agent_id),
+            )
+    return {
+        "GROK_OBSERVER_AGENT_ID": agent_id,
+        "GROK_OBSERVER_AGENT_TOKEN": token,
+        "GROK_OBSERVER_WORKER_CONTROL_PORT": str(ACTUAL_WORKER_CONTROL_PORT),
+        "GROK_OBSERVER_PYTHON": str(Path(sys.executable).resolve()),
+        "GROK_OBSERVER_HUB_CLI": str((ROOT / "grok_hub.py").resolve()),
+        "GROK_OBSERVER_NATIVE_BRIDGE": str((ROOT / "native_bridge.py").resolve()),
+    }
 
 
 def reclaim_agent_resources(agent_id: str) -> None:
@@ -2398,10 +2970,31 @@ def rowdict(row) -> dict | None:
     return dict(row) if row else None
 
 
+# Fields safe to serialize to the viewer. Never hub_token / child_pid /
+# child_started_at (worker credentials and process internals stay server-side).
+PUBLIC_AGENT_FIELDS = (
+    "id", "thread_id", "name", "cwd", "status", "revision", "current_turn",
+    "final_text", "error", "signoff_verdict", "signoff_summary", "verification",
+    "display_title", "pinned", "archived", "max_turns", "worktree_path",
+    "created_at", "updated_at",
+)
+
+
+def public_agent_dict(row) -> dict:
+    """Project an agent row onto the public viewer shape."""
+    return {key: row[key] for key in PUBLIC_AGENT_FIELDS if key in row.keys()}
+
+
 def agent_wait_done(agent_id: str) -> tuple[bool, dict]:
     """done only when no process, no active turns, queue empty, and agent terminal."""
     with connect() as db:
-        agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+        agent = rowdict(
+            db.execute(
+                "SELECT id,name,status,revision,updated_at,signoff_verdict,final_text,error,"
+                "signoff_summary,verification FROM agents WHERE id=?",
+                (agent_id,),
+            ).fetchone()
+        )
         if not agent:
             raise ValueError("agent not found")
         pending = db.execute(
@@ -2519,26 +3112,310 @@ def build_search_snippet(content: str, term: str, radius: int = 40) -> dict:
     return {"text": snippet, "matches": []}
 
 
-def action(name: str, args: dict, context: dict) -> dict:
-    if name == "ping":
-        return {"status": "ok", "viewer_url": viewer_url()}
-    if name == "start_viewer":
-        opened = ensure_viewer(args.get("agent_id"))
-        return {"viewer_url": viewer_url(), "browser_opened": opened}
-    if name == "create_agent":
-        prompt = str(args.get("prompt", "")).strip()
-        agent_name = str(args.get("agent_name", "")).strip()
-        if not prompt or not agent_name:
-            raise ValueError("agent_name and prompt are required")
-        agent_id = str(uuid.uuid4())
-        thread_id = context.get("codex_thread_id") or "unknown"
-        cwd = str(Path(args.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
-        stamp = now()
+def resolve_agent_settings(profile: str, worktree, max_turns) -> tuple[dict, bool, int]:
+    """Merge a named profile with explicit create_agent overrides.
+
+    Returns (defaults, effective_worktree, effective_max_turns). Raises
+    ValueError on unknown profile or out-of-range max_turns.
+    """
+    profile = str(profile or "default")
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile: {profile}")
+    defaults = PROFILES[profile]
+    effective_worktree = defaults["worktree"] if worktree is None else bool(worktree)
+    if max_turns is None:
+        effective_max_turns = defaults["max_turns"]
+    else:
+        try:
+            effective_max_turns = int(max_turns)
+        except (TypeError, ValueError):
+            raise ValueError("max_turns must be an integer") from None
+        if not 1 <= effective_max_turns <= 500:
+            raise ValueError("max_turns must be between 1 and 500")
+    return (defaults, effective_worktree, effective_max_turns)
+
+
+
+def create_agent_worktree(cwd: Path, agent_id: str, original_cwd: Path) -> tuple[str, dict]:
+    """Create a detached git worktree; return (worker_cwd, metadata)."""
+    repo = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if repo.returncode != 0:
+        raise ValueError("worktree isolation requires a git repository")
+    repo_root = repo.stdout.strip()
+    repo_rel_cwd = str(Path(cwd).resolve().relative_to(Path(repo_root).resolve())).replace("\\", "/") or "."
+    base = subprocess.run(
+        ["git", "-C", repo_root, "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if base.returncode != 0 or not base.stdout.strip():
+        raise ValueError("failed to resolve worktree base")
+    base_sha = base.stdout.strip()
+    status = subprocess.run(
+        ["git", "-C", repo_root, "status", "--porcelain"],
+        capture_output=True, text=True, timeout=20,
+    )
+    dirty_parent = bool(status.stdout.strip())
+
+    worktree_root = DATA / "worktrees" / agent_id
+    worktree_root.parent.mkdir(parents=True, exist_ok=True)
+    if worktree_root.exists():
+        shutil.rmtree(worktree_root, ignore_errors=True)
+    result = subprocess.run(
+        ["git", "-C", repo_root, "worktree", "add", "--detach", str(worktree_root), base_sha],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(worktree_root, ignore_errors=True)
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ValueError("failed to create worktree: " + detail[-200:])
+
+    worker_cwd = worktree_root if repo_rel_cwd == "." else worktree_root / repo_rel_cwd
+    worker_cwd.mkdir(parents=True, exist_ok=True)
+    return str(worker_cwd), {
+        "repo_root": repo_root,
+        "repo_rel_cwd": repo_rel_cwd,
+        "worktree_root": str(worktree_root),
+        "worktree_base_sha": base_sha,
+        "original_cwd": str(original_cwd),
+        "dirty_parent": dirty_parent,
+    }
+
+
+
+def _resolve_worktree_root(repo_root: str | None, candidate: str) -> str | None:
+    """Resolve legacy worker-subdir paths to the actual registered worktree root.
+
+    Returns None when no safe root can be resolved. The main repository root is
+    never a valid worktree root: a stale DATA/worktrees/<id> path inside the repo
+    would otherwise match it and poison cleanup/removal.
+    """
+    main_root: str | None = None
+    if repo_root:
+        try:
+            probe = subprocess.run(
+                ["git", "-C", repo_root, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                main_root = probe.stdout.strip()
+        except Exception:
+            pass
+
+    def is_main_root(root: str) -> bool:
+        if not main_root:
+            return False
+        try:
+            return os.path.normcase(os.path.realpath(root)) == os.path.normcase(
+                os.path.realpath(main_root)
+            )
+        except OSError:
+            return False
+
+    path = Path(candidate)
+    if path.exists():
+        try:
+            resolved = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if resolved.returncode == 0 and resolved.stdout.strip():
+                root = resolved.stdout.strip()
+                if not is_main_root(root):
+                    return root
+        except Exception:
+            pass
+    if repo_root:
+        try:
+            listed = subprocess.run(
+                ["git", "-C", repo_root, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if listed.returncode == 0:
+                target = path.resolve()
+                roots = []
+                for line in listed.stdout.splitlines():
+                    if line.startswith("worktree "):
+                        roots.append(Path(line[9:].strip()))
+                for root in roots:
+                    if is_main_root(str(root)):
+                        continue
+                    try:
+                        target.relative_to(root.resolve())
+                        return str(root)
+                    except (ValueError, OSError):
+                        continue
+        except Exception:
+            pass
+    return None
+
+
+def _safe_worktree_delete_target(path: str | Path) -> Path | None:
+    """Resolve a removal candidate, requiring it to live strictly under DATA/worktrees.
+
+    Structural guard for worktree cleanup: rmtree is only ever permitted on a
+    strict descendant of DATA/worktrees. Returns None when the candidate equals
+    DATA/worktrees itself, lies outside it, or cannot be resolved.
+    """
+    try:
+        base = (DATA / "worktrees").resolve(strict=False)
+        candidate = Path(path).resolve(strict=False)
+    except OSError:
+        return None
+    if candidate == base:
+        return None
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+    return candidate
+
+
+def remove_agent_worktree(repo_root: str | None, worktree_path: str) -> None:
+    """Best-effort removal using the registered worktree root, never worker cwd.
+
+    Removal is structurally confined to registered worktree roots under
+    DATA/worktrees; any candidate outside that tree is refused before any git
+    or filesystem operation, regardless of repo_root state.
+    """
+    actual_root = _resolve_worktree_root(repo_root, worktree_path)
+    if actual_root is None:
+        return
+    safe = _safe_worktree_delete_target(actual_root or worktree_path)
+    if safe is None:
+        print(
+            f"refusing to remove worktree outside DATA/worktrees: {worktree_path}",
+            file=sys.stderr,
+        )
+        return
+    if repo_root is not None:
+        try:
+            same_root = os.path.normcase(os.path.realpath(safe)) == os.path.normcase(
+                os.path.realpath(repo_root)
+            )
+        except OSError:
+            same_root = False
+        if same_root:
+            return
+    if repo_root:
+        try:
+            subprocess.run(
+                ["git", "-C", repo_root, "worktree", "remove", "--force", str(safe)],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["git", "-C", repo_root, "worktree", "prune"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception:
+            pass
+    shutil.rmtree(safe, ignore_errors=True)
+
+
+
+def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
+    """Snapshot isolated changes into a tracked patch plus lossless untracked artifacts."""
+    with connect() as db:
+        row = db.execute(
+            "SELECT worktree_root,worktree_path,worktree_base_sha,repo_root FROM agents WHERE id=?",
+            (agent_id,),
+        ).fetchone()
+    if not row:
+        return None, []
+    candidate = row["worktree_root"] or row["worktree_path"]
+    if not candidate:
+        return None, []
+    worktree_root = _resolve_worktree_root(row["repo_root"], candidate)
+    if worktree_root is None:
+        return None, []
+    if _safe_worktree_delete_target(worktree_root) is None:
+        return None, []
+    if not os.path.isdir(worktree_root):
+        return None, []
+
+    base_sha = row["worktree_base_sha"]
+    patch_path = None
+    if base_sha:
+        diff = subprocess.run(
+            ["git", "-C", worktree_root, "diff", "--binary", base_sha],
+            capture_output=True, timeout=60,
+        )
+        if diff.returncode == 0 and diff.stdout.strip():
+            patch_path = artifact_raw_bytes(agent_id, "worktree_patch", diff.stdout)
+
+    untracked: list[dict] = []
+    listed = subprocess.run(
+        ["git", "-C", worktree_root, "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True, timeout=60,
+    )
+    if listed.returncode == 0:
+        for raw in listed.stdout.split(b"\0"):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", errors="replace")
+            try:
+                content = (Path(worktree_root) / rel).read_bytes()
+            except OSError:
+                continue
+            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", rel)[:100] or "file"
+            artifact_path = artifact_bytes(agent_id, "untracked_" + safe_label, content)
+            untracked.append({
+                "path": rel,
+                "artifact": artifact_path,
+                "encoding": "base64",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            })
+    return patch_path, untracked
+
+
+
+def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None) -> dict:
+    """Create a single agent with optional isolated worktree."""
+    agent_id = str(uuid.uuid4())
+    defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns)
+    prompt_effective = prompt + defaults["prompt_suffix"] + worker_coordination_instructions()
+    thread_id = context.get("codex_thread_id") or "unknown"
+    stamp = now()
+    original_cwd_value = str(Path(cwd).resolve())
+    worktree_path = None  # worker cwd (legacy/public compatibility)
+    worktree_root = None
+    worktree_meta = {}
+    try:
+        if eff_worktree:
+            # Cheap limit pre-check BEFORE creating disk/git resources.
+            with CREATE_LOCK, connect() as db:
+                thread_active = db.execute(
+                    "SELECT COUNT(*) AS c FROM agents WHERE thread_id=? AND status IN ('queued','running')",
+                    (thread_id,),
+                ).fetchone()["c"]
+                if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
+                    raise ValueError(
+                        f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
+                        f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
+                    )
+                active_count = db.execute(
+                    "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
+                ).fetchone()["c"]
+                if int(active_count) >= MAX_ACTIVE_AGENTS:
+                    raise ValueError(
+                        f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
+                        f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
+                    )
+            worktree_path, worktree_meta = create_agent_worktree(
+                Path(original_cwd_value), agent_id, Path(original_cwd_value)
+            )
+            worktree_root = worktree_meta.get("worktree_root")
+            cwd = worktree_path
+
         with CREATE_LOCK, connect() as db:
-            # 1) Per-conversation (thread) cap — primary product limit.
             thread_active = db.execute(
-                "SELECT COUNT(*) AS c FROM agents "
-                "WHERE thread_id=? AND status IN ('queued','running')",
+                "SELECT COUNT(*) AS c FROM agents WHERE thread_id=? AND status IN ('queued','running')",
                 (thread_id,),
             ).fetchone()["c"]
             if int(thread_active) >= MAX_ACTIVE_PER_THREAD:
@@ -2546,7 +3423,6 @@ def action(name: str, args: dict, context: dict) -> dict:
                     f"同一对话活跃代理已达上限 MAX_ACTIVE_PER_THREAD={MAX_ACTIVE_PER_THREAD} "
                     f"(set GROK_OBSERVER_MAX_PER_THREAD to raise)"
                 )
-            # 2) Global safety net across all conversations.
             active_count = db.execute(
                 "SELECT COUNT(*) AS c FROM agents WHERE status IN ('queued','running')"
             ).fetchone()["c"]
@@ -2555,36 +3431,61 @@ def action(name: str, args: dict, context: dict) -> dict:
                     f"已达全局并发上限 MAX_ACTIVE_AGENTS={MAX_ACTIVE_AGENTS} "
                     f"(set GROK_OBSERVER_MAX_ACTIVE to raise)"
                 )
-            # Same cwd is allowed (parallel subagents); used only for soft warning.
             same_cwd = db.execute(
                 "SELECT id,name FROM agents WHERE cwd=? AND status IN ('queued','running')",
                 (cwd,),
             ).fetchall()
-            task_title = str(args.get("codex_thread_title") or "").strip() or thread_id
+            task_title = str(codex_thread_title or "").strip() or thread_id
             display_title = derive_display_title(agent_name, prompt)
+            # Task/project metadata remains anchored to the user's original cwd;
+            # an isolated worker cwd is an execution detail, not the conversation root.
             db.execute(
                 "INSERT OR IGNORE INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (thread_id, task_title, cwd, context.get("codex_origin", "Codex"), stamp, stamp),
+                (thread_id, task_title, original_cwd_value, context.get("codex_origin", "Codex"), stamp, stamp),
             )
-            # Refresh path/title for known threads; keep user pin/archive flags.
             db.execute(
                 "UPDATE tasks SET title=?,cwd=?,updated_at=? WHERE thread_id=?",
-                (task_title, cwd, stamp, thread_id),
+                (task_title, original_cwd_value, stamp, thread_id),
             )
             db.execute(
-                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?,?)",
-                (agent_id, thread_id, agent_name, cwd, agent_id, display_title, stamp, stamp),
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,"
+                "worktree_path,worktree_root,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    agent_id, thread_id, agent_name, cwd, agent_id, display_title,
+                    secrets.token_urlsafe(32), eff_max_turns,
+                    str(cwd) if eff_worktree else None,
+                    worktree_root,
+                    worktree_meta.get("original_cwd"), worktree_meta.get("repo_root"),
+                    worktree_meta.get("repo_rel_cwd"), worktree_meta.get("worktree_base_sha"),
+                    "worktree" if eff_worktree else "shared", stamp, stamp,
+                ),
             )
-            cursor = db.execute("INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)", (agent_id, prompt, stamp))
+            cursor = db.execute(
+                "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'queued',?)",
+                (agent_id, prompt_effective, stamp),
+            )
             turn_id = cursor.lastrowid
             db.execute(
                 "INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)",
-                (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt}\n{thread_id}\n{task_title}"),
+                (agent_id, "metadata", f"{agent_name}\n{display_title}\n{prompt_effective}\n{thread_id}\n{task_title}"),
+            )
+
+        if worktree_meta.get("dirty_parent"):
+            add_event(
+                agent_id,
+                turn_id,
+                "worktree_warning",
+                "隔离代理从已提交的 HEAD 开始；父工作区未提交更改未包含",
+                {"dirty_parent": True, "base_sha": worktree_meta["worktree_base_sha"]},
             )
         with CONDITIONS_LOCK:
             CONDITIONS[agent_id] = threading.Condition()
-        rule_sources = [str(path) for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md") if path.exists()]
+        rule_sources = [
+            str(path)
+            for path in (Path.home() / ".grok" / "AGENTS.md", Path.home() / ".claude" / "Claude.md")
+            if path.exists()
+        ]
         add_event(agent_id, turn_id, "rules", "已加载 Grok 规则来源", {"sources": rule_sources})
         if same_cwd:
             add_event(
@@ -2601,7 +3502,6 @@ def action(name: str, args: dict, context: dict) -> dict:
         assert runner is not None
         with CREATE_LOCK:
             if runner.queue.qsize() >= MAX_QUEUE_DEPTH:
-                # Roll back the just-inserted agent so a full queue leaves no ghost row/FTS.
                 with connect() as db:
                     db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                     db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
@@ -2610,15 +3510,117 @@ def action(name: str, args: dict, context: dict) -> dict:
                     f"队列已满 MAX_QUEUE_DEPTH={MAX_QUEUE_DEPTH} "
                     f"(set GROK_OBSERVER_MAX_QUEUE to raise)"
                 )
-            runner.enqueue(turn_id, prompt)
+            runner.enqueue(turn_id, prompt_effective)
         opened = ensure_viewer(agent_id)
-        return {"agent_id": agent_id, "status": "queued", "viewer_url": f"{viewer_url()}/#/agents/{agent_id}", "browser_opened": opened}
+    except Exception:
+        cleanup_target = worktree_root or worktree_path
+        if cleanup_target:
+            remove_agent_worktree(worktree_meta.get("repo_root"), cleanup_target)
+        raise
+    return {
+        "agent_id": agent_id,
+        "status": "queued",
+        "viewer_url": f"{viewer_url()}/#/agents/{agent_id}",
+        "browser_opened": opened,
+    }
+
+
+def action(name: str, args: dict, context: dict) -> dict:
+    if name == "ping":
+        return {"status": "ok", "viewer_url": viewer_url()}
+    if name == "start_viewer":
+        opened = ensure_viewer(args.get("agent_id"))
+        return {"viewer_url": viewer_url(), "browser_opened": opened}
+    if name == "hub":
+        thread_id = str(context.get("codex_thread_id") or "unknown")
+        return HUB.handle_main(thread_id=thread_id, args=args)
+    if name == "create_agent":
+        prompt = str(args.get("prompt", "")).strip()
+        agent_name = str(args.get("agent_name", "")).strip()
+        if not prompt or not agent_name:
+            raise ValueError("agent_name and prompt are required")
+        cwd = str(Path(args.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
+        return _create_agent_one(
+            agent_name, prompt, cwd, args.get("codex_thread_title"), context,
+            profile=args.get("profile"), worktree=args.get("worktree"), max_turns=args.get("max_turns"),
+        )
+    if name == "create_agents":
+        agents = args.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise ValueError("agents must be a non-empty list")
+        if len(agents) > 20:
+            raise ValueError("at most 20 agents per batch")
+        results = []
+        errors = []
+        for i, item in enumerate(agents):
+            if not isinstance(item, dict):
+                errors.append({"index": i, "error": "agent entry must be an object"})
+                continue
+            prompt = str(item.get("prompt", "")).strip()
+            agent_name = str(item.get("agent_name", "")).strip()
+            if not prompt or not agent_name:
+                errors.append({"index": i, "error": "agent_name and prompt are required"})
+                continue
+            cwd = str(Path(item.get("cwd") or context.get("cwd") or os.getcwd()).resolve())
+            try:
+                created = _create_agent_one(
+                    agent_name, prompt, cwd, item.get("codex_thread_title"), context,
+                    profile=item.get("profile"), worktree=item.get("worktree"), max_turns=item.get("max_turns"),
+                )
+                results.append({"index": i, **created})
+            except ValueError as exc:
+                errors.append({"index": i, "error": str(exc)})
+        return {"agents": results, "created": len(results), "errors": errors}
+    if name == "wait_any":
+        raw_ids = args.get("agent_ids") or []
+        if not isinstance(raw_ids, list) or any(not str(x).strip() for x in raw_ids):
+            raise ValueError("agent_ids must be a list of non-empty strings")
+        agent_ids = list(dict.fromkeys(str(x).strip() for x in raw_ids))
+        raw_timeout = args.get("timeout_seconds", 120)
+        if not isinstance(raw_timeout, int):
+            raise ValueError("timeout_seconds must be an integer")
+        timeout = max(1, min(300, raw_timeout))
+        from_peer = str(args.get("from") or "").strip() or None
+        thread_id = context.get("codex_thread_id") or "unknown"
+        caller = main_peer_id(thread_id)
+        # Thread-scoped resolution: cross-thread and unknown ids both resolve to
+        # None, so an id from another conversation cannot be waited on or leaked.
+        for aid in agent_ids:
+            if REGISTRY.resolve_worker(thread_id, aid) is None:
+                raise ValueError(f"agent not found: {aid}")
+        if from_peer and from_peer != caller and REGISTRY.resolve_worker(thread_id, from_peer) is None:
+            raise ValueError("peer not found")
+        deadline = time.monotonic() + timeout
+        while True:
+            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
+            if msg is not None:
+                return {"kind": "message", "message": msg.to_dict()}
+            for aid in agent_ids:
+                done, data = agent_wait_done(aid)
+                if done:
+                    return {"kind": "agent", "agent_id": aid, "status": data["status"], "revision": data["revision"], "turns": data["turns"]}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"kind": "timeout"}
+            condition, revision = MAILBOX.wait_surface(caller)
+            # Second DB check closes the send-between-check-and-sleep race.
+            msg = MAILBOX.peek_one(peer_id=caller, from_peer=from_peer)
+            if msg is not None:
+                return {"kind": "message", "message": msg.to_dict()}
+            for aid in agent_ids:
+                done, data = agent_wait_done(aid)
+                if done:
+                    return {"kind": "agent", "agent_id": aid, "status": data["status"], "revision": data["revision"], "turns": data["turns"]}
+            with condition:
+                if MAILBOX.revision(caller) != revision:
+                    continue
+                condition.wait(min(remaining, 0.25))
     if name == "send":
         agent_id, prompt = args.get("agent_id"), str(args.get("prompt", "")).strip()
         if not prompt:
             raise ValueError("prompt is required")
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute("SELECT status FROM agents WHERE id=?", (agent_id,)).fetchone()
             if not agent:
                 raise ValueError("agent not found")
             if agent["status"] == "cancelled":
@@ -2665,7 +3667,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         timeout_seconds = min(max(timeout_seconds, 1), 300)
 
         with connect() as db:
-            agent = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            agent = db.execute("SELECT status,current_turn FROM agents WHERE id=?", (agent_id,)).fetchone()
             if not agent:
                 raise ValueError("agent not found")
             if agent["status"] == "cancelled":
@@ -2798,7 +3800,14 @@ def action(name: str, args: dict, context: dict) -> dict:
         }
     if name in {"status", "result"}:
         with connect() as db:
-            agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (args.get("agent_id"),)).fetchone())
+            agent = rowdict(
+                db.execute(
+                    "SELECT id,name,status,revision,updated_at,signoff_verdict,final_text,error,"
+                    "signoff_summary,verification,cwd,worktree_path,worktree_root,worktree_base_sha,repo_root,"
+                    "repo_rel_cwd,original_cwd FROM agents WHERE id=?",
+                    (args.get("agent_id"),),
+                ).fetchone()
+            )
             if not agent:
                 raise ValueError("agent not found")
             turns = db.execute("SELECT COUNT(*) AS count FROM turns WHERE agent_id=?", (agent["id"],)).fetchone()["count"]
@@ -2819,18 +3828,50 @@ def action(name: str, args: dict, context: dict) -> dict:
                 ).fetchone()
                 if last_done and last_done["result"]:
                     last_completed_result = str(last_done["result"])
+                changes = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT path,kind,preexisting,added,deleted,source,shared,tool_name FROM changes WHERE agent_id=? ORDER BY id",
+                        (agent["id"],),
+                    )
+                ]
         base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "signoff_verdict")}
         base.update({"turns": turns, "changed_files": unique_changed_files(agent["id"])})
         if name == "result":
             # Prefer agent.final_text; fall back to last completed turn.result when empty.
             final_text = (agent["final_text"] or "").strip() or last_completed_result
             base.update({
+                "kind": "agent_result",
                 "final_text": final_text,
                 "error": agent["error"],
                 "signoff_summary": agent["signoff_summary"],
                 "verification": agent["verification"],
                 "turn_results": turn_rows,
+                "changes": changes,
             })
+            isolation = {"mode": "shared"}
+            if agent.get("worktree_root") or agent.get("worktree_path"):
+                patch_path, untracked = build_worktree_result(agent["id"])
+                isolation = {
+                    "mode": "worktree",
+                    "base_sha": agent.get("worktree_base_sha"),
+                    "repo_root": agent.get("repo_root"),
+                    "original_cwd": agent.get("original_cwd"),
+                    "repo_rel_cwd": agent.get("repo_rel_cwd"),
+                    "worktree_root": agent.get("worktree_root"),
+                    "worker_cwd": agent.get("cwd") or agent.get("worktree_path"),
+                    "worktree_path": agent.get("worktree_path"),
+                    "patch_artifact": patch_path,
+                    "untracked_artifacts": untracked,
+                    "changed_files": [c["path"] for c in changes],
+                }
+                if patch_path is not None:
+                    with gzip.open(ROOT / patch_path, "rb") as handle:
+                        patch_raw = handle.read()
+                    isolation["patch_encoding"] = "raw-gzip"
+                    isolation["patch_size"] = len(patch_raw)
+                    isolation["patch_sha256"] = hashlib.sha256(patch_raw).hexdigest()
+            base["isolation"] = isolation
         return base
     if name == "wait":
         agent_id = args.get("agent_id")
@@ -2903,6 +3944,37 @@ class ControlHandler(socketserver.StreamRequestHandler):
         try:
             request = json.loads(self.rfile.readline().decode("utf-8"))
             data = action(request.get("action", ""), request.get("args") or {}, request.get("context") or {})
+            response = {"ok": True, "data": data}
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+        self.wfile.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def authenticate_worker(worker_id: str, token: str) -> str:
+    """Validate a worker's hub token; returns the worker id on success."""
+    with connect() as db:
+        row = db.execute("SELECT hub_token FROM agents WHERE id=?", (worker_id,)).fetchone()
+    if row is None or not row["hub_token"] or not secrets.compare_digest(str(row["hub_token"]), token):
+        raise ValueError("worker authentication failed")
+    return worker_id
+
+
+def worker_hub_request(worker_id: str, token: str, op_args: dict) -> dict:
+    """Authenticated worker hub op; the wire protocol has no generic action field."""
+    authenticate_worker(worker_id, token)
+    return HUB.handle_worker(worker_id=worker_id, args=op_args)
+
+
+class WorkerControlHandler(socketserver.StreamRequestHandler):
+    """Worker-only control surface: one JSON request line, hub ops only."""
+
+    def handle(self):
+        try:
+            request = json.loads(self.rfile.readline().decode("utf-8"))
+            worker_id = str(request.get("worker_id") or "")
+            token = str(request.get("worker_token") or "")
+            op_args = {k: v for k, v in request.items() if k not in ("worker_id", "worker_token")}
+            data = worker_hub_request(worker_id, token, op_args)
             response = {"ok": True, "data": data}
         except Exception as exc:
             response = {"ok": False, "error": str(exc)}
@@ -2995,12 +4067,19 @@ class ViewerHandler(BaseHTTPRequestHandler):
             if agent_id in {"meta", "delete"} or not re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or ""):
                 return json_response(self, {"error": "not found"}, 404)
             with connect() as db:
-                agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+                agent = rowdict(
+                    db.execute(
+                        "SELECT id,thread_id,name,cwd,status,revision,current_turn,final_text,error,"
+                        "signoff_verdict,signoff_summary,verification,display_title,pinned,archived,"
+                        "max_turns,worktree_path,created_at,updated_at FROM agents WHERE id=?",
+                        (agent_id,),
+                    ).fetchone()
+                )
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 turns = [dict(row) for row in db.execute("SELECT * FROM turns WHERE agent_id=? ORDER BY turn_no", (agent_id,))]
                 changes = [dict(row) for row in db.execute("SELECT * FROM changes WHERE agent_id=? ORDER BY id", (agent_id,))]
-            return json_response(self, {"agent": agent, "turns": turns, "changes": changes})
+            return json_response(self, {"agent": public_agent_dict(agent), "turns": turns, "changes": changes})
         if parsed.path == "/api/events":
             agent_id = query.get("agent_id", [""])[0]
             after = _safe_int(query.get("after", ["0"])[0])
@@ -3117,19 +4196,23 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if match:
             agent_id = match.group(1)
             with connect() as db:
-                agent = db.execute("SELECT id,thread_id,status FROM agents WHERE id=?", (agent_id,)).fetchone()
+                agent = db.execute("SELECT id,status,worktree_path,worktree_root,repo_root FROM agents WHERE id=?", (agent_id,)).fetchone()
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 if agent["status"] in {"queued", "running"}:
                     return json_response(self, {"error": "running agents cannot be removed from the observer"}, 409)
-                thread_id = agent["thread_id"]
             # Reclaim in-memory resources before deleting durable state.
             reclaim_agent_resources(agent_id)
+            cleanup_target = agent["worktree_root"] or agent["worktree_path"]
+            if cleanup_target:
+                remove_agent_worktree(agent["repo_root"], cleanup_target)
             with connect() as db:
                 db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
                 db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
-                db.execute("DELETE FROM tasks WHERE thread_id=? AND NOT EXISTS(SELECT 1 FROM agents WHERE thread_id=?)", (thread_id, thread_id))
+                # Keep the task while its thread still has mailbox messages.
+                delete_orphan_tasks(db)
             shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
+            cleanup_agent_prompt_files(agent_id)
             notify_catalog(agent_id)
             return json_response(self, {"deleted": True, "agent_id": agent_id})
         match = re.fullmatch(r"/api/agents/([0-9a-fA-F-]{36})/meta", self.path)
@@ -3140,7 +4223,12 @@ class ViewerHandler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 return json_response(self, {"error": str(exc)}, 400)
             with connect() as db:
-                agent = rowdict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+                agent = rowdict(
+                    db.execute(
+                        "SELECT thread_id,name,display_title,pinned,archived FROM agents WHERE id=?",
+                        (agent_id,),
+                    ).fetchone()
+                )
                 if not agent:
                     return json_response(self, {"error": "not found"}, 404)
                 pinned = agent.get("pinned") or 0
@@ -3399,6 +4487,7 @@ def write_state() -> None:
     payload = {
         "pid": os.getpid(),
         "control_port": ACTUAL_CONTROL_PORT,
+        "worker_control_port": ACTUAL_WORKER_CONTROL_PORT,
         "viewer_port": ACTUAL_VIEWER_PORT if VIEWER_SERVER else None,
         "updated_at": now(),
     }
@@ -3630,25 +4719,57 @@ def release_singleton_lock() -> None:
             pass
 
 
+def delete_orphan_tasks(db) -> None:
+    """Drop tasks whose conversation is gone: no agents and no mailbox messages.
+
+    agent_messages rows keep a task alive so a worker's history (and any pending
+    delivery) is not deleted out from under it.
+    """
+    db.execute(
+        "DELETE FROM tasks WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.thread_id = tasks.thread_id) "
+        "AND NOT EXISTS (SELECT 1 FROM agent_messages WHERE agent_messages.thread_id = tasks.thread_id)"
+    )
+
+
+
+def cleanup_agent_prompt_files(agent_id: str) -> None:
+    """Remove one agent's durable prompt files (deletion / retention only).
+
+    Prompt files live under ``data/prompts/<agent_id>/`` and are retained
+    while the agent exists (crash recovery, debugging). They are removed
+    exactly when the agent itself is removed — manually via the delete
+    endpoint or by ``cleanup()`` retention — never at turn completion.
+    """
+    shutil.rmtree(DATA / "prompts" / agent_id, ignore_errors=True)
+
+
 def cleanup() -> None:
-    """Delete expired terminal agents only; reclaim runners/conditions/threads first."""
+    """Delete expired terminal agents; reclaim worktree roots correctly."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
     with connect() as db:
         ids = [
-            row["id"]
+            (row["id"], row["worktree_root"], row["worktree_path"], row["repo_root"])
             for row in db.execute(
-                "SELECT id FROM agents WHERE updated_at<? AND status NOT IN ('running','queued')",
+                "SELECT id,worktree_root,worktree_path,repo_root FROM agents "
+                "WHERE updated_at<? AND status NOT IN ('running','queued')",
                 (cutoff,),
             )
         ]
-    for agent_id in ids:
+    for agent_id, worktree_root, worktree_path, repo_root in ids:
         reclaim_agent_resources(agent_id)
+        cleanup_target = worktree_root or worktree_path
+        if cleanup_target:
+            remove_agent_worktree(repo_root, cleanup_target)
         with connect() as db:
             db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
             db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
         shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
+        cleanup_agent_prompt_files(agent_id)
+
     with connect() as db:
-        db.execute("DELETE FROM tasks WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM agents)")
+        # Preserve the existing mailbox-history retention contract in this
+        # focused fix. Message expiry / failed-recipient policy remains a P2.
+        delete_orphan_tasks(db)
         if ids:
             try:
                 db.execute("PRAGMA optimize")
@@ -3659,64 +4780,168 @@ def cleanup() -> None:
 def cleanup_loop() -> None:
     while True:
         time.sleep(24 * 60 * 60)
-        cleanup()
+        try:
+            cleanup()
+        except Exception as exc:
+            print(f"cleanup failed: {exc}", file=sys.stderr, flush=True)
 
 
-def recover() -> None:
-    """On daemon restart: kill recorded orphan children and fail in-flight agents."""
+
+def recover(*, start_runners: bool = True) -> None:
+    """Repair crash state without destroying durable queued turns.
+
+    Only turns that were actually `running` at daemon death are failed. Queued
+    turns remain queued and are resumed after the control ports are bound.
+    """
     with connect() as db:
         stale = db.execute(
-            "SELECT id, child_pid, child_started_at FROM agents WHERE status IN ('running','queued')"
+            "SELECT id,child_pid,child_started_at FROM agents WHERE status='running'"
         ).fetchall()
+
     for row in stale:
         agent_id = row["id"]
         child_pid = row["child_pid"]
         reaped = False
-        skipped_reuse = False
+        identity_unverified = False
+        identity_lookup_error = None
+        pid = 0
         if child_pid is not None:
             try:
                 pid = int(child_pid)
             except (TypeError, ValueError):
                 pid = 0
             if pid > 0 and pid_is_alive(pid):
-                # Guard against PID reuse: only kill if the live process's creation
-                # time still matches what we recorded for this child (±2s tolerance).
+                verified = False
                 expected = row["child_started_at"]
-                actual = process_create_time(pid)
+                actual = None
+                try:
+                    actual = process_create_time(pid)
+                except (OSError, ValueError) as exc:
+                    identity_lookup_error = str(exc)
                 if expected is not None and actual is not None:
                     try:
-                        mismatch = abs(actual - float(expected)) > 2.0
+                        verified = abs(float(actual) - float(expected)) <= 2.0
                     except (TypeError, ValueError):
-                        mismatch = False
-                    if mismatch:
-                        skipped_reuse = True
-                if not skipped_reuse:
+                        verified = False
+                if verified:
                     terminate_pid(pid)
                     reaped = True
-        error = "Observer daemon restarted before completion"
+                else:
+                    identity_unverified = True
+
+        error = "Observer daemon restarted during a running turn"
         if reaped:
             error += f"; orphan process reaped (pid={pid})"
-        elif skipped_reuse:
-            error += f"; recorded pid={pid} was reused by another process, not killed"
+        elif identity_unverified:
+            if identity_lookup_error is not None:
+                error += (
+                    f"; process identity lookup failed ({identity_lookup_error}); pid not killed"
+                )
+            else:
+                error += f"; recorded pid={pid} could not be identity-verified, not killed"
         stamp = now()
         with connect() as db:
-            db.execute(
-                "UPDATE agents SET status='failed',error=?,child_pid=NULL,updated_at=?,revision=revision+1 WHERE id=?",
-                (error, stamp, agent_id),
-            )
+            # Do not fail durable queued turns. A running turn may have partial
+            # external side effects, so conservative recovery still fails it.
             db.execute(
                 "UPDATE turns SET status='failed',completed_at=COALESCE(completed_at, ?) "
-                "WHERE agent_id=? AND status IN ('queued','running')",
+                "WHERE agent_id=? AND status='running'",
                 (stamp, agent_id),
             )
+            queued_left = int(
+                db.execute(
+                    "SELECT COUNT(*) AS c FROM turns WHERE agent_id=? AND status='queued'",
+                    (agent_id,),
+                ).fetchone()["c"]
+            )
+            db.execute(
+                "UPDATE agents SET status=?,error=?,child_pid=NULL,current_turn=NULL,updated_at=?,revision=revision+1 "
+                "WHERE id=?",
+                ("queued" if queued_left else "failed", error, stamp, agent_id),
+            )
+
+    # Delivery claims of pre-crash turns are reconciled per turn against the
+    # durable child_spawned_at marker (the first durable write after Popen,
+    # set in turns; agents.child_started_at is OS process-creation identity
+    # only and is not consulted here). A turn whose child actually started
+    # must keep its claims delivered — the prompt was already injected —
+    # while a turn that never spawned (or crashed before the marker) releases
+    # its claims so the messages become visible again. Still-queued turns are
+    # skipped: their claims stay attached and are consumed when the turn runs
+    # after recovery. Runs after the running-turn failure loop so every failed
+    # turn is reconciled by marker.
+    with connect() as db:
+        claimed_turn_ids = [
+            row["target_turn_id"]
+            for row in db.execute(
+                "SELECT DISTINCT target_turn_id FROM agent_messages "
+                "WHERE state='pending' AND target_turn_id IS NOT NULL"
+            )
+        ]
+    for turn_id in claimed_turn_ids:
+        with connect() as db:
+            row = db.execute("SELECT child_spawned_at,status FROM turns WHERE id=?", (turn_id,)).fetchone()
+        if row and row["status"] == "queued":
+            # Durable queued delivery turns keep their claims; they run after recovery.
+            continue
+        started = bool(row and row["child_spawned_at"])
+        try:
+            reconcile_delivery_turn(turn_id, started=started)
+        except Exception:
+            # One mailbox failure must not abort reconciliation of the
+            # remaining claimed turns; markers are durable and the loop
+            # re-runs on the next daemon start.
+            pass
+
+    if start_runners:
+        recover_runners()
+
+
+def recover_runners() -> None:
+    """Start post-recovery schedulers/runners after worker control ports are live."""
+    # First turn unscheduled pending mail for idle completed workers into durable
+    # queued turns. maybe_schedule_delivery itself is idempotent per target.
+    with connect() as db:
+        peers = [
+            row["to_peer"]
+            for row in db.execute(
+                "SELECT DISTINCT m.to_peer FROM agent_messages m "
+                "JOIN agents a ON a.id=m.to_peer "
+                "WHERE m.state='pending' AND m.consumed_at IS NULL "
+                "AND m.target_turn_id IS NULL AND a.status='completed'"
+            )
+        ]
+    for peer in peers:
+        maybe_schedule_delivery(peer)
+
+    with connect() as db:
+        # Filter cancelled agents AT QUERY TIME so the runner never even starts
+        # for them: a cancelled agent with a stale queued turn must stay dead.
+        agent_ids = [
+            row["agent_id"]
+            for row in db.execute(
+                "SELECT DISTINCT t.agent_id FROM turns t "
+                "JOIN agents a ON a.id=t.agent_id "
+                "WHERE t.status='queued' AND a.status NOT IN ('cancelled')"
+            )
+        ]
+        for agent_id in agent_ids:
+            db.execute(
+                "UPDATE agents SET status='queued',updated_at=? "
+                "WHERE id=? AND status NOT IN ('cancelled','running')",
+                (now(), agent_id),
+            )
+    for agent_id in agent_ids:
+        get_runner(agent_id)
 
 
 ACTUAL_CONTROL_PORT = CONTROL_PORT
+ACTUAL_WORKER_CONTROL_PORT = WORKER_CONTROL_PORT
 _WE_OWN_STATE = False
 
 
 def main() -> None:
-    global ACTUAL_CONTROL_PORT, _WE_OWN_STATE
+    global ACTUAL_CONTROL_PORT, ACTUAL_WORKER_CONTROL_PORT, _WE_OWN_STATE
 
     # If a healthy daemon already owns this data dir, exit without overwriting state.
     existing = healthy_existing_daemon()
@@ -3739,8 +4964,7 @@ def main() -> None:
     print(f"observer daemon starting pid={os.getpid()}", file=sys.stderr, flush=True)
     init_db()
     cleanup()
-    recover()
-    threading.Thread(target=cleanup_loop, daemon=True).start()
+    recover(start_runners=False)
 
     # Prefer the configured control port; only fall back if it is free and we own the lock.
     server = None
@@ -3755,7 +4979,27 @@ def main() -> None:
         release_singleton_lock()
         raise RuntimeError("no control port available")
 
+    # Worker-only control surface on its own port range, so host credentials
+    # (and the host control protocol) are never exposed to workers. Optional:
+    # a bind failure degrades to "no worker transport" but keeps the daemon up.
+    worker_server = None
+    for port in range(WORKER_CONTROL_PORT, WORKER_CONTROL_PORT + 20):
+        try:
+            worker_server = ReusableTCPServer(("127.0.0.1", port), WorkerControlHandler)
+            ACTUAL_WORKER_CONTROL_PORT = port
+            break
+        except OSError:
+            continue
+    if worker_server is not None:
+        threading.Thread(target=worker_server.serve_forever, daemon=True).start()
+    else:
+        print("worker control server unavailable (no free port)", file=sys.stderr, flush=True)
+
     write_state()
+    # Recovered workers receive the actual bound worker-control port.
+    recover_runners()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=delivery_sweep_loop, daemon=True).start()
     try:
         server.serve_forever()
     finally:

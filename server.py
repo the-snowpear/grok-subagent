@@ -42,7 +42,9 @@ TOOLS = [
             "Create an asynchronous observable Grok subagent and return immediately. After this tool "
             "succeeds, tell the user once: agent_name, agent_id, status, and a clickable Markdown "
             "link using viewer_url. Do not hide viewer_url only inside the tool call. Do not repeat "
-            "the observer link on later turns unless the user asks."
+            "the observer link on later turns unless the user asks. Optional profile: default, fast, "
+            "deep, or isolated (deep/isolated run the agent in a dedicated git worktree); worktree and "
+            "max_turns override profile defaults."
         ),
         "inputSchema": {
             "type": "object",
@@ -51,6 +53,9 @@ TOOLS = [
                 "prompt": {"type": "string"},
                 "cwd": {"type": "string"},
                 "codex_thread_title": {"type": "string"},
+                "profile": {"type": "string"},
+                "worktree": {"type": "boolean"},
+                "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
             },
             "required": ["agent_name", "prompt"],
             "additionalProperties": False,
@@ -169,6 +174,98 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "hub",
+        "description": (
+            "Coordinate agents in the current Codex conversation. "
+            "Ops: list peers, send a durable message, inspect Main inbox, "
+            "or wait for a Main-directed message."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["list", "send", "inbox", "wait"],
+                },
+                "to": {"type": "string"},
+                "message": {"type": "string"},
+                "reply_to": {"type": "string"},
+                "from": {"type": "string"},
+                "peek": {"type": "boolean", "default": False},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 300,
+                    "default": 120,
+                },
+            },
+            "required": ["op"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "create_agents",
+        "description": (
+            "Batch-spawn 1-20 Grok subagents that share the caller's conversation "
+            "context (thread, origin, cwd) and can coordinate with each other and "
+            "Main through the hub tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent_name": {"type": "string"},
+                            "prompt": {"type": "string"},
+                            "cwd": {"type": "string"},
+                            "codex_thread_title": {"type": "string"},
+                            "profile": {"type": "string"},
+                            "worktree": {"type": "boolean"},
+                            "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
+                        },
+                        "required": ["agent_name", "prompt"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                    "maxItems": 20,
+                },
+            },
+            "required": ["agents"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wait_any",
+        "description": (
+            "Unified wait returning the first of: a new hub mailbox message addressed "
+            "to Main, any listed agent reaching a terminal state "
+            "(completed/failed/cancelled), or the timeout. Agent-terminal latency is "
+            "at most ~0.25s."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "from": {"type": "string"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "default": 120,
+                },
+            },
+            "required": ["agent_ids"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -245,16 +342,32 @@ def _ensure_daemon() -> None:
     raise RuntimeError("Grok Observer daemon did not start" + detail)
 
 
+def request_timeout_for(name: str, args: dict) -> float:
+    """Socket timeout for a daemon request.
+
+    Wait-like ops honor the requested duration (bounded 1..300s) plus a 5s
+    margin so the daemon can answer within the client's wait window; all
+    other ops get a short fixed timeout.
+    """
+    if name == "wait":
+        requested = int(args.get("timeout_seconds", 300))
+        return min(max(requested, 1), 300) + 5
+    if name == "wait_any" or (name == "hub" and str(args.get("op") or "").lower() == "wait"):
+        requested = int(args.get("timeout_seconds", 120))
+        return min(max(requested, 1), 300) + 5
+    return 15
+
+
 def call_tool(name: str, args: dict) -> dict:
     _ensure_daemon()
     payload = {"action": name, "args": args}
-    if name == "create_agent":
+    if name in {"create_agent", "hub", "create_agents", "wait_any"}:
         payload["context"] = {
             "codex_thread_id": os.environ.get("CODEX_THREAD_ID", "unknown"),
             "codex_origin": os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "Codex"),
             "cwd": os.getcwd(),
         }
-    timeout = min(max(int(args.get("timeout_seconds", 300)), 1), 300) + 5 if name == "wait" else 15
+    timeout = request_timeout_for(name, args)
     data = _request(payload, timeout=timeout)
     # Keep the original JSON text first for compatibility with existing model/client behavior.
     result = {
