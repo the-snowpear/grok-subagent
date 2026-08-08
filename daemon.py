@@ -2689,10 +2689,24 @@ class AgentRunner:
             delivery_started = True
             # OS identity (PID-reuse detection only): record the child's
             # creation time on agents — never on turns, whose child_started_at
-            # is legacy and only backfilled. Best-effort: a None lookup simply
-            # means recovery cannot identity-verify this pid and will not kill
-            # it.
-            created = process_create_time(proc.pid)
+            # is legacy and only backfilled. Best-effort: a None lookup — or a
+            # raising lookup — simply means recovery cannot identity-verify
+            # this pid and will not kill it. An optional metadata failure must
+            # never fail an already-spawned Grok turn.
+            created = None
+            try:
+                created = process_create_time(proc.pid)
+            except (OSError, ValueError) as exc:
+                try:
+                    add_event(
+                        self.agent_id,
+                        turn_id,
+                        "process_identity_error",
+                        str(exc),
+                        {"pid": proc.pid},
+                    )
+                except Exception:
+                    pass
             if created is not None:
                 identity_stamp = str(created)
 

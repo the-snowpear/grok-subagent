@@ -492,6 +492,56 @@ class FinalMergeRegressionTests(Round4Mixin, unittest.TestCase):
         self.assertEqual(msg_c["state"], "delivered")
         self.assertIsNotNone(msg_c["consumed_at"])
 
+    def test_live_process_identity_lookup_exception_does_not_fail_started_turn(self):
+        # A raising best-effort OS identity lookup must be equivalent to a
+        # None lookup: the already-spawned Grok turn keeps executing, the
+        # durable delivery marker survives, the identity stays NULL, and the
+        # linked message is delivered+consumed — never released.
+        for exc in (
+            OSError("injected live identity lookup failure"),
+            ValueError("injected live identity lookup failure"),
+        ):
+            with self.subTest(exc_type=type(exc).__name__):
+                thread_id = f"fm-live-lookup-{type(exc).__name__.lower()}"
+                aid, mid, turn_id, prompt = self._schedule(thread_id)
+                runner = daemon.get_runner(aid)
+                proc = _FakeProc()
+                proc.wait_called = False
+
+                def wait_recorder() -> int:
+                    proc.wait_called = True
+                    return 0
+
+                proc.wait = wait_recorder
+
+                with (
+                    mock.patch.object(daemon.subprocess, "Popen", return_value=proc),
+                    mock.patch.object(daemon, "process_create_time", side_effect=exc),
+                    mock.patch.object(daemon, "probe_prompt_file_support", return_value=None),
+                ):
+                    runner._run(turn_id, prompt)
+                # The exception must not have aborted the turn: the child ran
+                # to completion (wait called) and the turn succeeded.
+                self.assertTrue(proc.wait_called, "fake proc.wait() must have been called")
+                with daemon.connect() as db:
+                    turn = db.execute("SELECT status,child_spawned_at FROM turns WHERE id=?", (turn_id,)).fetchone()
+                    agent = db.execute(
+                        "SELECT status,child_pid,child_started_at FROM agents WHERE id=?", (aid,)
+                    ).fetchone()
+                    msg = db.execute("SELECT state,consumed_at FROM agent_messages WHERE id=?", (mid,)).fetchone()
+                    events = db.execute(
+                        "SELECT COUNT(*) AS c FROM events WHERE agent_id=? AND type='process_identity_error'",
+                        (aid,),
+                    ).fetchone()
+                self.assertEqual(turn["status"], "completed")
+                self.assertIsNotNone(turn["child_spawned_at"])
+                self.assertEqual(agent["status"], "completed")
+                self.assertIsNone(agent["child_pid"])
+                self.assertIsNone(agent["child_started_at"])
+                self.assertEqual(msg["state"], "delivered")
+                self.assertIsNotNone(msg["consumed_at"])
+                self.assertGreaterEqual(events["c"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
