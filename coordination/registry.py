@@ -37,6 +37,7 @@ class AgentRegistry:
                     name,
                     COALESCE(display_title, '') AS display_title,
                     status,
+                    role,
                     updated_at
                 FROM agents
                 WHERE thread_id=?
@@ -55,6 +56,7 @@ class AgentRegistry:
                     display_title=str(row["display_title"] or ""),
                     kind="worker",
                     status=str(row["status"] or ""),
+                    role=row["role"],
                     updated_at=str(row["updated_at"] or ""),
                 )
             )
@@ -78,6 +80,7 @@ class AgentRegistry:
                     name,
                     COALESCE(display_title, '') AS display_title,
                     status,
+                    role,
                     updated_at
                 FROM agents
                 WHERE id=? AND thread_id=?
@@ -95,6 +98,7 @@ class AgentRegistry:
             display_title=str(row["display_title"] or ""),
             kind="worker",
             status=str(row["status"] or ""),
+            role=row["role"],
             updated_at=str(row["updated_at"] or ""),
         )
 
@@ -118,6 +122,7 @@ class AgentRegistry:
                     name,
                     COALESCE(display_title, '') AS display_title,
                     status,
+                    role,
                     updated_at
                 FROM agents
                 WHERE id=?
@@ -135,5 +140,6 @@ class AgentRegistry:
             display_title=str(row["display_title"] or ""),
             kind="worker",
             status=str(row["status"] or ""),
+            role=row["role"],
             updated_at=str(row["updated_at"] or ""),
         )
