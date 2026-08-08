@@ -433,5 +433,200 @@ class RoleResolutionTests(OrchestrateV2Mixin, unittest.TestCase):
         self.assertIn("--always-approve", command)
 
 
+class OrchestrationFlowTests(OrchestrateV2Mixin, unittest.TestCase):
+    """C1-C2: thin-orchestrator control flow over the real runtime.
+
+    Main (the test) is the ONLY decision maker; the runtime must transport
+    the flow without making product decisions:
+    Explorer evidence -> Main decision -> Implementer (isolated worktree +
+    stored effort) -> fresh Reviewer -> Main-issued Fix Order via
+    ``daemon.MAILBOX.send`` -> exactly one durable follow-up turn on the SAME
+    agent row with the stored effort and session contract intact, the message
+    claimed via ``target_turn_id`` and delivered+consumed after the follow-up
+    runs, and a flat ``--no-subagents`` topology for every built command. A
+    reviewer's finding alone must never mutate the runtime (no extra turns,
+    no messages), proving the control plane requires Main to issue the Fix
+    Order. All assertions are behavioral (DB rows, action responses, command
+    builder output); no source-string inspection.
+    """
+
+    def test_thin_orchestrator_control_flow(self):
+        thread_id = "t-thin-orchestrator"
+        finding = "Fix Order: add input validation for empty payloads before the API call"
+
+        # 1) Explorer: read-only policy role, shared cwd, effort omitted -> 'max'.
+        explorer = self._create(
+            thread_id,
+            name="explorer",
+            prompt="investigate the API surface and collect evidence for missing validation",
+            role="explore",
+        )
+        explorer_aid = explorer["agent_id"]
+        self._wait_terminal(explorer_aid)
+        explorer_row = self._agent_row(explorer_aid)
+        self.assertEqual(explorer_row["isolation_mode"], "shared")
+        self.assertIsNone(explorer_row["worktree_root"])
+        self.assertEqual(Path(explorer_row["cwd"]), self.root)
+        explorer_result = daemon.action(
+            "result", {"agent_id": explorer_aid}, {"codex_thread_id": thread_id}
+        )
+        self.assertEqual(
+            explorer_result["reasoning_effort"], "max", "omitted effort must default to 'max'"
+        )
+
+        # 2) Main consumes the evidence and decides (the decision itself is
+        #    simulated in test code; the runtime only has to carry the
+        #    evidence). No semantic check on the payload.
+        self.assertTrue(
+            str(explorer_result["final_text"]).strip(),
+            "explorer result must carry decision evidence (final_text non-empty)",
+        )
+
+        # 3) Implementer: worktree default -> isolated worktree, explicit 'high' effort.
+        repo = self._make_git_repo(self.root / "repo")
+        implementer = self._create(
+            thread_id,
+            name="implementer",
+            prompt="implement the validated change",
+            cwd=str(repo),
+            role="implement",
+            reasoning_effort="high",
+        )
+        impl_aid = implementer["agent_id"]
+        self._wait_terminal(impl_aid)
+        impl_row = self._agent_row(impl_aid)
+        self.assertEqual(impl_row["isolation_mode"], "worktree")
+        self.assertIsNotNone(impl_row["worktree_root"])
+        self.assertIsNotNone(impl_row["worktree_path"])
+        self.assertEqual(impl_row["reasoning_effort"], "high")
+        impl_session = impl_row["grok_session_id"]
+        impl_command = self._command(impl_aid)
+        self.assertEqual(self._effort_arg(impl_command), "high", "command must carry the stored effort")
+        self.assertIn("--no-subagents", impl_command)
+
+        # 4) Fresh Reviewer: different agent id, shared cwd, explicit 'max' effort.
+        reviewer = self._create(
+            thread_id,
+            name="reviewer",
+            prompt="review the implementation and report findings only",
+            role="review",
+            reasoning_effort="max",
+        )
+        review_aid = reviewer["agent_id"]
+        self._wait_terminal(review_aid)
+        self.assertNotEqual(review_aid, impl_aid, "reviewer must be a fresh agent")
+        review_row = self._agent_row(review_aid)
+        self.assertEqual(review_row["isolation_mode"], "shared")
+        self.assertIsNone(review_row["worktree_root"])
+        self.assertEqual(Path(review_row["cwd"]), self.root)
+
+        # 5) Main adjudicates (test code) and issues the Fix Order over the
+        #    durable mailbox; the completed implementer must receive exactly
+        #    one follow-up turn on the SAME agent row.
+        daemon.MAILBOX.send(
+            thread_id=thread_id,
+            from_peer=main_peer_id(thread_id),
+            to_peer=impl_aid,
+            body=finding,
+        )
+        with daemon.connect() as db:
+            message = db.execute(
+                "SELECT id,state,consumed_at,target_turn_id FROM agent_messages "
+                "WHERE to_peer=? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (impl_aid,),
+            ).fetchone()
+            followups = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id,agent_id,turn_no,prompt,status FROM turns WHERE agent_id=? AND turn_no=2",
+                    (impl_aid,),
+                )
+            ]
+            impl_after = dict(db.execute("SELECT * FROM agents WHERE id=?", (impl_aid,)).fetchone())
+        self.assertIsNotNone(message, "the fix order must be a durable mailbox message")
+        self.assertEqual(len(followups), 1, "exactly one follow-up turn (turn_no 2) may exist")
+        followup = followups[0]
+        self.assertEqual(followup["agent_id"], impl_aid, "follow-up must reuse the same agent row")
+        self.assertEqual(followup["turn_no"], 2)
+        self.assertEqual(
+            message["target_turn_id"], followup["id"], "delivery must claim the message via target_turn_id"
+        )
+        self.assertIn(finding, followup["prompt"], "the follow-up prompt must carry the fix order body")
+        self.assertEqual(impl_after["reasoning_effort"], "high", "scheduling must not re-resolve effort")
+        self.assertEqual(impl_after["grok_session_id"], impl_session, "session contract must be unchanged")
+
+        # 6) No duplicate follow-up; once the follow-up runs, the claimed
+        #    message is delivered AND consumed.
+        self._wait_terminal(impl_aid)
+        with daemon.connect() as db:
+            turn_count = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=?", (impl_aid,)
+            ).fetchone()["c"]
+            message_after = db.execute(
+                "SELECT state,consumed_at FROM agent_messages WHERE id=?", (message["id"],)
+            ).fetchone()
+            followup_after = db.execute(
+                "SELECT status FROM turns WHERE agent_id=? AND turn_no=2", (impl_aid,)
+            ).fetchone()
+        self.assertEqual(turn_count, 2, "the implementer must have exactly turn 1 + one follow-up")
+        self.assertEqual(message_after["state"], "delivered")
+        self.assertIsNotNone(message_after["consumed_at"])
+        self.assertEqual(followup_after["status"], "completed")
+
+        # 7) Flat topology: every grok_command built for these agents is flat.
+        for aid, label in ((explorer_aid, "explorer"), (impl_aid, "implementer"), (review_aid, "reviewer")):
+            command = self._command(aid)
+            self.assertIn("--no-subagents", command, f"{label} command must stay flat")
+            self.assertIn("--always-approve", command)
+        followup_command = self._command(impl_aid, "resume after fix order", first_turn=False)
+        self.assertIn("--no-subagents", followup_command)
+        self.assertIn("--resume", followup_command)
+        self.assertEqual(self._effort_arg(followup_command), "high")
+
+    def test_reviewer_finding_does_not_mutate_runtime(self):
+        """C2: a completed reviewer leaves no turn/message residue behind.
+
+        The reviewer's finding is produced, but the read-only role cannot
+        authorize mutation: no follow-up turn, no queued work, and no
+        messages from (or to) the reviewer peer. Only Main issuing a Fix
+        Order mutates the runtime (covered by the control-flow test).
+        """
+        thread_id = "t-reviewer-readonly"
+        reviewer = self._create(
+            thread_id,
+            name="reviewer",
+            prompt="review the work and report findings; do not change anything",
+            role="review",
+        )
+        review_aid = reviewer["agent_id"]
+        self._wait_terminal(review_aid)
+        result = daemon.action("result", {"agent_id": review_aid}, {"codex_thread_id": thread_id})
+        self.assertTrue(str(result["final_text"]).strip(), "the reviewer finding must be produced")
+        with daemon.connect() as db:
+            turns = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT turn_no,status FROM turns WHERE agent_id=? ORDER BY turn_no", (review_aid,)
+                )
+            ]
+            outgoing = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages WHERE from_peer=?", (review_aid,)
+            ).fetchone()["c"]
+            incoming = db.execute(
+                "SELECT COUNT(*) AS c FROM agent_messages WHERE to_peer=?", (review_aid,)
+            ).fetchone()["c"]
+            queued = db.execute(
+                "SELECT COUNT(*) AS c FROM turns WHERE agent_id=? AND status='queued'", (review_aid,)
+            ).fetchone()["c"]
+            status = db.execute("SELECT status FROM agents WHERE id=?", (review_aid,)).fetchone()["status"]
+        self.assertEqual(
+            turns, [{"turn_no": 1, "status": "completed"}], "a reviewer runs exactly one turn"
+        )
+        self.assertEqual(outgoing, 0, "a read-only reviewer must not send any message")
+        self.assertEqual(incoming, 0, "no message may target the reviewer")
+        self.assertEqual(queued, 0, "the reviewer must not leave queued work behind")
+        self.assertEqual(status, "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
