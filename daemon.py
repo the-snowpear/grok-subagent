@@ -126,6 +126,45 @@ PROFILES = {
     "isolated": {"worktree": True, "max_turns": 50, "prompt_suffix": ""},
 }
 
+# Canonical control-plane field for per-agent reasoning effort. The installed
+# grok CLI accepts arbitrary --reasoning-effort values (no enum is documented
+# or enforced client-side; "max" is the verified runtime default), so we
+# shape-validate only: fail early on malformed input while passing the
+# resolved value through verbatim.
+REASONING_EFFORT_DEFAULT = "max"
+_REASONING_EFFORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+
+
+def validate_reasoning_effort(value) -> str:
+    """Validate a reasoning-effort value; return it unchanged on success.
+
+    Shape validation only (no invented enum): the installed CLI accepts
+    arbitrary strings, and an unsupported-value set would reject values a
+    future CLI version may legitimately accept.
+    """
+    if value is None or not isinstance(value, str) or not value.strip():
+        raise ValueError("reasoning_effort must be a non-empty string")
+    if not _REASONING_EFFORT_RE.match(value):
+        raise ValueError(
+            f"reasoning_effort must match ^[A-Za-z][A-Za-z0-9_-]{{0,31}}$ (got {value!r})"
+        )
+    return value
+
+
+def resolve_reasoning_effort(batch_default, explicit) -> str:
+    """Resolve the effective reasoning effort for a new agent.
+
+    Precedence: per-agent explicit > batch/workflow override > runtime
+    default. PROFILES deliberately has no effort field, so profile defaults
+    are skipped in resolution.
+    """
+    if explicit is not None:
+        return validate_reasoning_effort(explicit)
+    if batch_default is not None:
+        return validate_reasoning_effort(batch_default)
+    return REASONING_EFFORT_DEFAULT
+
+
 # Held for the lifetime of the daemon process so the OS releases it on crash.
 _LOCK_HANDLE = None
 
@@ -377,6 +416,7 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN repo_rel_cwd TEXT",
             "ALTER TABLE agents ADD COLUMN worktree_base_sha TEXT",
             "ALTER TABLE agents ADD COLUMN isolation_mode TEXT DEFAULT 'shared'",
+            "ALTER TABLE agents ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'max'",
             "ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE changes ADD COLUMN source TEXT DEFAULT 'observed'",
@@ -2145,6 +2185,8 @@ def grok_command(agent_row: dict, prompt: str | None, first_turn: bool, cwd: Pat
         "--output-format", "streaming-json",
         "--always-approve", "--no-subagents",
         "--max-turns", str(int(stored_max or 50)),
+        "--reasoning-effort",
+        str(agent_row["reasoning_effort"] if "reasoning_effort" in agent_row.keys() else REASONING_EFFORT_DEFAULT),
     ]
     command += ["--session-id", agent_row["grok_session_id"]] if first_turn else ["--resume", agent_row["grok_session_id"]]
     if prompt_file_flag and prompt_file:
@@ -2547,7 +2589,7 @@ class AgentRunner:
             return
         with connect() as db:
             agent = db.execute(
-                "SELECT status,cwd,grok_session_id,max_turns FROM agents WHERE id=?", (self.agent_id,)
+                "SELECT status,cwd,grok_session_id,max_turns,reasoning_effort FROM agents WHERE id=?", (self.agent_id,)
             ).fetchone()
             turn = db.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
             if not agent or not turn:
@@ -2975,7 +3017,7 @@ def rowdict(row) -> dict | None:
 PUBLIC_AGENT_FIELDS = (
     "id", "thread_id", "name", "cwd", "status", "revision", "current_turn",
     "final_text", "error", "signoff_verdict", "signoff_summary", "verification",
-    "display_title", "pinned", "archived", "max_turns", "worktree_path",
+    "display_title", "pinned", "archived", "max_turns", "reasoning_effort", "worktree_path",
     "created_at", "updated_at",
 )
 
@@ -3375,10 +3417,13 @@ def build_worktree_result(agent_id: str) -> tuple[str | None, list[dict]]:
 
 
 
-def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None) -> dict:
+def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title, context: dict, *, profile: str = "default", worktree=None, max_turns=None, reasoning_effort=None) -> dict:
     """Create a single agent with optional isolated worktree."""
     agent_id = str(uuid.uuid4())
     defaults, eff_worktree, eff_max_turns = resolve_agent_settings(profile, worktree, max_turns)
+    # Resolve + validate BEFORE any worktree creation or DB insert so an
+    # invalid effort can never leave durable or disk ghost state behind.
+    eff_reasoning_effort = resolve_reasoning_effort(None, reasoning_effort)
     prompt_effective = prompt + defaults["prompt_suffix"] + worker_coordination_instructions()
     thread_id = context.get("codex_thread_id") or "unknown"
     stamp = now()
@@ -3449,11 +3494,11 @@ def _create_agent_one(agent_name: str, prompt: str, cwd: str, codex_thread_title
             )
             db.execute(
                 "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,display_title,hub_token,max_turns,"
-                "worktree_path,worktree_root,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?)",
+                "reasoning_effort,worktree_path,worktree_root,original_cwd,repo_root,repo_rel_cwd,worktree_base_sha,isolation_mode,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     agent_id, thread_id, agent_name, cwd, agent_id, display_title,
-                    secrets.token_urlsafe(32), eff_max_turns,
+                    secrets.token_urlsafe(32), eff_max_turns, eff_reasoning_effort,
                     str(cwd) if eff_worktree else None,
                     worktree_root,
                     worktree_meta.get("original_cwd"), worktree_meta.get("repo_root"),
@@ -3543,6 +3588,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         return _create_agent_one(
             agent_name, prompt, cwd, args.get("codex_thread_title"), context,
             profile=args.get("profile"), worktree=args.get("worktree"), max_turns=args.get("max_turns"),
+            reasoning_effort=args.get("reasoning_effort"),
         )
     if name == "create_agents":
         agents = args.get("agents")
@@ -3552,6 +3598,11 @@ def action(name: str, args: dict, context: dict) -> dict:
             raise ValueError("at most 20 agents per batch")
         results = []
         errors = []
+        # Validate the batch-level default ONCE up front: an invalid default
+        # aborts the whole batch before any agent is created.
+        batch_effort = args.get("reasoning_effort")
+        if batch_effort is not None:
+            validate_reasoning_effort(batch_effort)
         for i, item in enumerate(agents):
             if not isinstance(item, dict):
                 errors.append({"index": i, "error": "agent entry must be an object"})
@@ -3566,6 +3617,7 @@ def action(name: str, args: dict, context: dict) -> dict:
                 created = _create_agent_one(
                     agent_name, prompt, cwd, item.get("codex_thread_title"), context,
                     profile=item.get("profile"), worktree=item.get("worktree"), max_turns=item.get("max_turns"),
+                    reasoning_effort=item.get("reasoning_effort", batch_effort),
                 )
                 results.append({"index": i, **created})
             except ValueError as exc:
@@ -3802,7 +3854,7 @@ def action(name: str, args: dict, context: dict) -> dict:
         with connect() as db:
             agent = rowdict(
                 db.execute(
-                    "SELECT id,name,status,revision,updated_at,signoff_verdict,final_text,error,"
+                    "SELECT id,name,status,revision,updated_at,reasoning_effort,signoff_verdict,final_text,error,"
                     "signoff_summary,verification,cwd,worktree_path,worktree_root,worktree_base_sha,repo_root,"
                     "repo_rel_cwd,original_cwd FROM agents WHERE id=?",
                     (args.get("agent_id"),),
@@ -3835,7 +3887,7 @@ def action(name: str, args: dict, context: dict) -> dict:
                         (agent["id"],),
                     )
                 ]
-        base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "signoff_verdict")}
+        base = {key: agent[key] for key in ("id", "name", "status", "revision", "updated_at", "reasoning_effort", "signoff_verdict")}
         base.update({"turns": turns, "changed_files": unique_changed_files(agent["id"])})
         if name == "result":
             # Prefer agent.final_text; fall back to last completed turn.result when empty.
@@ -4048,7 +4100,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     dict(row)
                     for row in db.execute(
                         "SELECT id,thread_id,name,cwd,status,revision,signoff_verdict,"
-                        "display_title,pinned,archived,created_at,updated_at "
+                        "reasoning_effort,display_title,pinned,archived,created_at,updated_at "
                         "FROM agents ORDER BY pinned DESC, archived ASC, updated_at DESC"
                     )
                 ]
@@ -4071,7 +4123,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     db.execute(
                         "SELECT id,thread_id,name,cwd,status,revision,current_turn,final_text,error,"
                         "signoff_verdict,signoff_summary,verification,display_title,pinned,archived,"
-                        "max_turns,worktree_path,created_at,updated_at FROM agents WHERE id=?",
+                        "max_turns,reasoning_effort,worktree_path,created_at,updated_at FROM agents WHERE id=?",
                         (agent_id,),
                     ).fetchone()
                 )
