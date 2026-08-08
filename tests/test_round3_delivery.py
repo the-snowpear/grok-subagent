@@ -3,12 +3,12 @@
 Contract under test (daemon.py + coordination/mailbox.py):
 - AgentRunner._run has ONE try covering begin_turn -> Popen -> child identity
   persistence -> reconcile. child_created = Popen returned a proc;
-  delivery_started = child identity (agents.child_pid + turns.child_started_at)
+  delivery_started = the delivery marker (agents.child_pid + turns.child_spawned_at)
   durably persisted.
 - except: child_created -> reconcile(started=True); not delivery_started ->
   release claim + notify.
 - The terminal phase reconciles started=child_created.
-- recover() reconciles every pending linked turn by its turns.child_started_at
+- recover() reconciles every pending linked turn by its turns.child_spawned_at
   marker (queued turns keep their claims; failed pre-spawn turns release them).
 - recover_runners() filters cancelled agents out of the queued-turn query.
 - Mailbox.reconcile_turn_delivery: started=True converges pending linked rows
@@ -122,31 +122,38 @@ class DeliveryCrashConsistencyTests(Round2Mixin, unittest.TestCase):
 
         def spy(*, turn_id: int, started: bool) -> int:
             # The first reconcile (started=True, immediately after identity
-            # persistence) must already observe the child identity in the DB.
+            # persistence) must already observe the child identity in the DB:
+            # child_pid plus the turns.child_spawned_at delivery marker. The
+            # legacy turns.child_started_at column is never written anymore.
             if started and not checked["done"]:
                 with daemon.connect() as db:
-                    agent = db.execute("SELECT child_pid FROM agents WHERE id=?", (aid,)).fetchone()
-                    turn = db.execute("SELECT child_started_at FROM turns WHERE id=?", (turn_id,)).fetchone()
+                    agent = db.execute("SELECT child_pid,child_started_at FROM agents WHERE id=?", (aid,)).fetchone()
+                    turn = db.execute("SELECT child_spawned_at,child_started_at FROM turns WHERE id=?", (turn_id,)).fetchone()
                 self.assertEqual(agent["child_pid"], 424242)
-                self.assertIsNotNone(turn["child_started_at"])
+                self.assertEqual(agent["child_started_at"], "12345.0")
+                self.assertIsNotNone(turn["child_spawned_at"])
+                self.assertIsNone(turn["child_started_at"])
                 checked["done"] = True
             return real_reconcile(daemon.MAILBOX, turn_id=turn_id, started=started)
 
         with (
             mock.patch.object(daemon.MAILBOX, "reconcile_turn_delivery", new=spy),
             mock.patch.object(daemon.subprocess, "Popen", return_value=_FakeProc()),
+            mock.patch.object(daemon, "probe_prompt_file_support", return_value=None),
             mock.patch.object(daemon, "process_create_time", return_value=12345.0),
         ):
             runner._run(turn_id, prompt)
         self.assertTrue(checked["done"], "reconcile spy never observed the persisted child identity")
         with daemon.connect() as db:
             agent = db.execute("SELECT child_pid,child_started_at FROM agents WHERE id=?", (aid,)).fetchone()
-            turn = db.execute("SELECT child_started_at FROM turns WHERE id=?", (turn_id,)).fetchone()
-        # PID marker is dropped post-run; the durable identity (child_started_at)
-        # persists so recover() can still decide converge-vs-release by marker.
+            turn = db.execute("SELECT child_spawned_at,child_started_at FROM turns WHERE id=?", (turn_id,)).fetchone()
+        # PID marker is dropped post-run; the delivery marker
+        # (turns.child_spawned_at) and the OS identity (agents.child_started_at)
+        # persist so recover() can converge the claim and identity-verify the pid.
         self.assertIsNone(agent["child_pid"])
         self.assertEqual(agent["child_started_at"], "12345.0")
-        self.assertEqual(turn["child_started_at"], "12345.0")
+        self.assertIsNotNone(turn["child_spawned_at"])
+        self.assertIsNone(turn["child_started_at"])
 
     def test_initial_delivery_mark_failure_eventually_reconciles(self):
         thread_id = "r3-mark-flaky"
@@ -164,6 +171,7 @@ class DeliveryCrashConsistencyTests(Round2Mixin, unittest.TestCase):
         with (
             mock.patch.object(daemon.MAILBOX, "reconcile_turn_delivery", new=flaky),
             mock.patch.object(daemon.subprocess, "Popen", return_value=_FakeProc()),
+            mock.patch.object(daemon, "probe_prompt_file_support", return_value=None),
             mock.patch.object(daemon, "process_create_time", return_value=12345.0),
         ):
             runner._run(turn_id, prompt)
@@ -180,7 +188,7 @@ class DeliveryCrashConsistencyTests(Round2Mixin, unittest.TestCase):
         # Crash state: the child had started (marker durably set) and the turn
         # was left failed by a daemon restart mid-turn.
         with daemon.connect() as db:
-            db.execute("UPDATE turns SET status='failed',child_started_at=? WHERE id=?", ("12345.0", turn_id))
+            db.execute("UPDATE turns SET status='failed',child_spawned_at=? WHERE id=?", ("12345.0", turn_id))
             db.execute("UPDATE agents SET status='running' WHERE id=?", (aid,))
         daemon.recover(start_runners=False)
         with daemon.connect() as db:

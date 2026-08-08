@@ -364,6 +364,7 @@ def init_db() -> None:
             "ALTER TABLE agents ADD COLUMN child_pid INTEGER",
             "ALTER TABLE agents ADD COLUMN child_started_at TEXT",
             "ALTER TABLE turns ADD COLUMN child_started_at TEXT",
+            "ALTER TABLE turns ADD COLUMN child_spawned_at TEXT",
             "ALTER TABLE agents ADD COLUMN display_title TEXT DEFAULT ''",
             "ALTER TABLE agents ADD COLUMN hub_token TEXT",
             "ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
@@ -387,6 +388,17 @@ def init_db() -> None:
                 db.execute(stmt)
             except sqlite3.OperationalError:
                 pass
+        # Backfill the delivery marker for pre-migration rows: turns written by
+        # round 3 recorded their OS create time in child_started_at, which is a
+        # valid delivery-start proof (it was only ever set right after Popen).
+        # Idempotent — rows already carrying child_spawned_at are left alone.
+        try:
+            db.execute(
+                "UPDATE turns SET child_spawned_at=child_started_at "
+                "WHERE child_spawned_at IS NULL AND child_started_at IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
         # Backfill empty display titles from agent name (one-shot, cheap).
         try:
             db.execute(
@@ -2536,7 +2548,9 @@ class AgentRunner:
         # covers claim → process exit: any failure before the child exists
         # releases the delivery claim; any failure after it exists converges it.
         # Milestones: child_created = Popen returned a process; delivery_started
-        # = the child's identity was durably persisted (M2 marker).
+        # = the delivery marker (agents.child_pid + turns.child_spawned_at) was
+        # durably persisted (M2 marker). agents.child_started_at holds OS
+        # process-creation identity only and is never a delivery proof.
         child_created = False
         delivery_started = False
         monitor = None
@@ -2611,28 +2625,46 @@ class AgentRunner:
             # Popen succeeded: the execution backend has received the full
             # turn prompt. Auto-injected hub messages are now consumed.
             child_created = True
-            # M2: durably persist child identity FIRST — the turns.child_started_at
-            # marker is what recover() consults to decide converge-vs-release for
-            # this turn's delivery claim. Bounded busy retry keeps transient DB
-            # contention from aborting bookkeeping for an already-started child.
-            created = process_create_time(proc.pid)
-            identity_stamp = str(created) if created is not None else None
-
-            def persist_child_identity():
+            # M2: durably persist the delivery marker FIRST — agents.child_pid
+            # plus turns.child_spawned_at in ONE transaction. That marker is
+            # what recover() consults to decide converge-vs-release for this
+            # turn's delivery claim. Bounded busy retry keeps transient DB
+            # contention from aborting bookkeeping for an already-started
+            # child. The OS process identity (child_started_at) is written
+            # afterwards, agents only, so a slow/None create-time lookup can
+            # never delay the delivery marker.
+            def persist_child_marker():
                 with connect() as db:
                     db.execute(
-                        "UPDATE agents SET child_pid=?,child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
-                        (proc.pid, identity_stamp, now(), self.agent_id),
+                        "UPDATE agents SET child_pid=?,updated_at=?,revision=revision+1 WHERE id=?",
+                        (proc.pid, now(), self.agent_id),
                     )
                     db.execute(
-                        "UPDATE turns SET child_started_at=? WHERE id=?",
-                        (identity_stamp, turn_id),
+                        "UPDATE turns SET child_spawned_at=? WHERE id=?",
+                        (now(), turn_id),
                     )
 
-            _retry_sqlite_busy(persist_child_identity)
-            # The child exists AND its identity is durably recorded: from here on
+            _retry_sqlite_busy(persist_child_marker)
+            # The child exists AND its delivery marker is durable: from here on
             # this turn's delivery claim must converge, never be released.
             delivery_started = True
+            # OS identity (PID-reuse detection only): record the child's
+            # creation time on agents — never on turns, whose child_started_at
+            # is legacy and only backfilled. Best-effort: a None lookup simply
+            # means recovery cannot identity-verify this pid and will not kill
+            # it.
+            created = process_create_time(proc.pid)
+            if created is not None:
+                identity_stamp = str(created)
+
+                def persist_child_identity():
+                    with connect() as db:
+                        db.execute(
+                            "UPDATE agents SET child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
+                            (identity_stamp, now(), self.agent_id),
+                        )
+
+                _retry_sqlite_busy(persist_child_identity)
             try:
                 reconcile_delivery_turn(turn_id, started=True)
             except Exception:
@@ -2772,7 +2804,7 @@ class AgentRunner:
         # Final delivery-claim reconciliation (idempotent): converges if the child
         # existed, else releases. Covers a persistent M2-reconcile failure; kept
         # best-effort so a mailbox failure can never block the terminal turn
-        # update — recover() re-reconciles from the durable child_started_at
+        # update — recover() re-reconciles from the durable child_spawned_at
         # marker on the next daemon start.
         try:
             reconcile_delivery_turn(turn_id, started=child_created)
@@ -4704,7 +4736,7 @@ def recover(*, start_runners: bool = True) -> None:
         agent_id = row["id"]
         child_pid = row["child_pid"]
         reaped = False
-        skipped_reuse = False
+        identity_unverified = False
         pid = 0
         if child_pid is not None:
             try:
@@ -4712,22 +4744,25 @@ def recover(*, start_runners: bool = True) -> None:
             except (TypeError, ValueError):
                 pid = 0
             if pid > 0 and pid_is_alive(pid):
+                verified = False
                 expected = row["child_started_at"]
                 actual = process_create_time(pid)
                 if expected is not None and actual is not None:
                     try:
-                        skipped_reuse = abs(actual - float(expected)) > 2.0
+                        verified = abs(float(actual) - float(expected)) <= 2.0
                     except (TypeError, ValueError):
-                        skipped_reuse = False
-                if not skipped_reuse:
+                        verified = False
+                if verified:
                     terminate_pid(pid)
                     reaped = True
+                else:
+                    identity_unverified = True
 
         error = "Observer daemon restarted during a running turn"
         if reaped:
             error += f"; orphan process reaped (pid={pid})"
-        elif skipped_reuse:
-            error += f"; recorded pid={pid} was reused by another process, not killed"
+        elif identity_unverified:
+            error += f"; recorded pid={pid} could not be identity-verified, not killed"
         stamp = now()
         with connect() as db:
             # Do not fail durable queued turns. A running turn may have partial
@@ -4750,11 +4785,12 @@ def recover(*, start_runners: bool = True) -> None:
             )
 
     # Delivery claims of pre-crash turns are reconciled per turn against the
-    # durable child_started_at marker (the first durable write after Popen,
-    # set in both agents and turns). A turn whose child actually started must
-    # keep its claims delivered — the prompt was already injected — while a
-    # turn that never spawned (or crashed before the marker) releases its
-    # claims so the messages become visible again. Still-queued turns are
+    # durable child_spawned_at marker (the first durable write after Popen,
+    # set in turns; agents.child_started_at is OS process-creation identity
+    # only and is not consulted here). A turn whose child actually started
+    # must keep its claims delivered — the prompt was already injected —
+    # while a turn that never spawned (or crashed before the marker) releases
+    # its claims so the messages become visible again. Still-queued turns are
     # skipped: their claims stay attached and are consumed when the turn runs
     # after recovery. Runs after the running-turn failure loop so every failed
     # turn is reconciled by marker.
@@ -4768,11 +4804,11 @@ def recover(*, start_runners: bool = True) -> None:
         ]
     for turn_id in claimed_turn_ids:
         with connect() as db:
-            row = db.execute("SELECT child_started_at,status FROM turns WHERE id=?", (turn_id,)).fetchone()
+            row = db.execute("SELECT child_spawned_at,status FROM turns WHERE id=?", (turn_id,)).fetchone()
         if row and row["status"] == "queued":
             # Durable queued delivery turns keep their claims; they run after recovery.
             continue
-        started = bool(row and row["child_started_at"])
+        started = bool(row and row["child_spawned_at"])
         reconcile_delivery_turn(turn_id, started=started)
 
     if start_runners:

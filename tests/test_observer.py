@@ -1271,15 +1271,21 @@ class ChildPidRecoverTest(_IsolatedDbMixin, unittest.TestCase):
         alive_id = str(uuid.uuid4())
         dead_id = str(uuid.uuid4())
         stamp = daemon.now()
+        # Round-4 policy: recover kills a pid only on verified identity. Seed
+        # the child's real OS create time (queried right after spawn, well
+        # inside the 2.0s tolerance) as the expected identity evidence.
+        created = daemon.process_create_time(alive.pid)
+        if created is None:
+            self.skipTest("process_create_time unavailable on this platform")
         with daemon.connect() as db:
             db.execute(
                 "INSERT INTO tasks(thread_id,title,cwd,origin,created_at,updated_at) VALUES(?,?,?,?,?,?)",
                 ("rec", "rec", str(self.folder), "t", stamp, stamp),
             )
             db.execute(
-                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,child_pid,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'running',?,?,?)",
-                (alive_id, "rec", "alive", str(self.folder), alive_id, alive.pid, stamp, stamp),
+                "INSERT INTO agents(id,thread_id,name,cwd,grok_session_id,status,child_pid,child_started_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'running',?,?,?,?)",
+                (alive_id, "rec", "alive", str(self.folder), alive_id, alive.pid, str(created), stamp, stamp),
             )
             db.execute(
                 "INSERT INTO turns(agent_id,turn_no,prompt,status,created_at) VALUES(?,1,?,'running',?)",
@@ -1359,7 +1365,7 @@ class ChildPidRecoverTest(_IsolatedDbMixin, unittest.TestCase):
                 row = db.execute("SELECT status,error,child_pid FROM agents WHERE id=?", (agent_id,)).fetchone()
             self.assertEqual(row["status"], "failed")
             self.assertIsNone(row["child_pid"])
-            self.assertIn("reused", (row["error"] or "").lower())
+            self.assertIn("could not be identity-verified, not killed", row["error"] or "")
         finally:
             if daemon.pid_is_alive(alive.pid):
                 daemon.terminate_pid(alive.pid)
