@@ -11,6 +11,7 @@ Critical invariants:
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 import uuid
@@ -188,6 +189,48 @@ class Mailbox:
                 (turn_id,),
             )
             return cursor.rowcount
+
+    def reconcile_turn_delivery(self, *, turn_id: int, started: bool) -> int:
+        """Idempotent crash-consistency primitive for one turn's delivery claim.
+
+        started=True converges pending claims to delivered+consumed: the child
+        received the turn prompt, so the message must never be injected twice.
+        started=False releases claims: the child never spawned, so the messages
+        become visible again. Safe to call repeatedly; rows already in the
+        target state are untouched. Bounded busy retry absorbs transient
+        locked/busy contention; other errors propagate immediately.
+        """
+        stamp = self._now()
+        if started:
+            sql = (
+                "UPDATE agent_messages "
+                "SET state='delivered', delivered_at=COALESCE(delivered_at, ?), "
+                "consumed_at=COALESCE(consumed_at, ?) "
+                "WHERE target_turn_id=? AND state='pending'"
+            )
+            params: tuple = (stamp, stamp, turn_id)
+        else:
+            sql = (
+                "UPDATE agent_messages "
+                "SET target_turn_id=NULL "
+                "WHERE target_turn_id=? AND state='pending' AND consumed_at IS NULL"
+            )
+            params = (turn_id,)
+        retries = (0.02, 0.04, 0.06)
+        attempt = 0
+        while True:
+            try:
+                with self._connect() as db:
+                    cursor = db.execute(sql, params)
+                    return cursor.rowcount
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if attempt >= len(retries):
+                    raise
+                time.sleep(retries[attempt])
+                attempt += 1
 
     def _select_unconsumed(
         self,

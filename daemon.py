@@ -280,6 +280,27 @@ def connect():
         db.close()
 
 
+def _retry_sqlite_busy(fn, attempts: int = 3):
+    """Run fn() with bounded busy retries on locked/busy SQLite; re-raise others.
+
+    Transient 'database is locked'/'database is busy' errors can surface when
+    another thread holds a write transaction. Short bounded retries keep
+    critical writes (e.g. child identity persistence right after Popen) from
+    spuriously aborting; any other error propagates immediately.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+    return None  # pragma: no cover - attempts >= 1 always returns or raises
+
+
 def init_db() -> None:
     with connect() as db:
         db.executescript(
@@ -340,6 +361,7 @@ def init_db() -> None:
         for stmt in (
             "ALTER TABLE agents ADD COLUMN child_pid INTEGER",
             "ALTER TABLE agents ADD COLUMN child_started_at TEXT",
+            "ALTER TABLE turns ADD COLUMN child_started_at TEXT",
             "ALTER TABLE agents ADD COLUMN display_title TEXT DEFAULT ''",
             "ALTER TABLE agents ADD COLUMN hub_token TEXT",
             "ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
@@ -2022,6 +2044,17 @@ def grok_command(agent_row: dict, prompt: str, first_turn: bool, cwd: Path) -> l
     return command
 
 
+def reconcile_delivery_turn(turn_id: int, *, started: bool) -> int:
+    """Converge (started=True) or release (started=False) a turn's delivery claim.
+
+    Idempotent crash-consistency primitive over the durable mailbox: a turn
+    whose child actually started must keep its claims delivered so the prompt
+    is never injected twice, while a turn that never spawned must release its
+    claims so the messages become visible again.
+    """
+    return MAILBOX.reconcile_turn_delivery(turn_id=turn_id, started=started)
+
+
 class AgentRunner:
     def __init__(self, agent_id: str):
         self.agent_id = agent_id
@@ -2428,35 +2461,43 @@ class AgentRunner:
                 (turn_id, now(), self.agent_id),
             )
         # A queued turn is only a durable schedule. Hub messages become
-        # delivered/consumed after subprocess.Popen succeeds below.
-        self.begin_turn(turn_id)
-        cwd = Path(agent["cwd"])
-        # Capture workspace + session-log baselines BEFORE process start to avoid races
-        # and to prevent resume turns from replaying historical updates.jsonl.
-        before = workspace_snapshot(cwd)
-        session_baseline = capture_session_log_baseline(cwd, agent["grok_session_id"])
-        monitor_state = SessionMonitorState(session_baseline)
-        add_event(self.agent_id, turn_id, "user", prompt, {"prompt": prompt, "turn": turn["turn_no"]})
-
-        first_turn = int(turn["turn_no"]) == 1
-        command = grok_command(agent, prompt, first_turn, cwd)
-        add_event(self.agent_id, turn_id, "process", "启动 Grok Build", {"command": command[:1] + ["<prompt>"] + command[3:]})
-
-        stopped = threading.Event()
-        monitor_errors: list[str] = []
-        monitor = threading.Thread(
-            target=monitor_session,
-            args=(self.agent_id, turn_id, cwd, agent["grok_session_id"], stopped, monitor_state, monitor_errors),
-            name=f"mon-{self.agent_id[:8]}-{turn_id}",
-            daemon=True,
-        )
-        monitor.start()
-        chunks: list[str] = []
-        errors: list[str] = []
-        stop_reason = ""
-        returncode = 1
+        # delivered/consumed after subprocess.Popen succeeds below. One try
+        # covers claim → process exit: any failure before the child exists
+        # releases the delivery claim; any failure after it exists converges it.
+        # Milestones: child_created = Popen returned a process; delivery_started
+        # = the child's identity was durably persisted (M2 marker).
+        child_created = False
         delivery_started = False
+        monitor = None
+        monitor_state = None
+        monitor_errors: list[str] = []
+        before = None
         try:
+            chunks: list[str] = []
+            errors: list[str] = []
+            stop_reason = ""
+            returncode = 1
+            self.begin_turn(turn_id)
+            cwd = Path(agent["cwd"])
+            # Capture workspace + session-log baselines BEFORE process start to avoid races
+            # and to prevent resume turns from replaying historical updates.jsonl.
+            before = workspace_snapshot(cwd)
+            session_baseline = capture_session_log_baseline(cwd, agent["grok_session_id"])
+            monitor_state = SessionMonitorState(session_baseline)
+            add_event(self.agent_id, turn_id, "user", prompt, {"prompt": prompt, "turn": turn["turn_no"]})
+
+            first_turn = int(turn["turn_no"]) == 1
+            command = grok_command(agent, prompt, first_turn, cwd)
+            add_event(self.agent_id, turn_id, "process", "启动 Grok Build", {"command": command[:1] + ["<prompt>"] + command[3:]})
+
+            stopped = threading.Event()
+            monitor = threading.Thread(
+                target=monitor_session,
+                args=(self.agent_id, turn_id, cwd, agent["grok_session_id"], stopped, monitor_state, monitor_errors),
+                name=f"mon-{self.agent_id[:8]}-{turn_id}",
+                daemon=True,
+            )
+            monitor.start()
             if self.cancelled.is_set():
                 raise RuntimeError("cancelled before start")
             child_env, proxy_source = system_proxy_environment(os.environ.copy())
@@ -2482,20 +2523,34 @@ class AgentRunner:
             proc = self.process
             # Popen succeeded: the execution backend has received the full
             # turn prompt. Auto-injected hub messages are now consumed.
+            child_created = True
+            # M2: durably persist child identity FIRST — the turns.child_started_at
+            # marker is what recover() consults to decide converge-vs-release for
+            # this turn's delivery claim. Bounded busy retry keeps transient DB
+            # contention from aborting bookkeeping for an already-started child.
+            created = process_create_time(proc.pid)
+            identity_stamp = str(created) if created is not None else None
+
+            def persist_child_identity():
+                with connect() as db:
+                    db.execute(
+                        "UPDATE agents SET child_pid=?,child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
+                        (proc.pid, identity_stamp, now(), self.agent_id),
+                    )
+                    db.execute(
+                        "UPDATE turns SET child_started_at=? WHERE id=?",
+                        (identity_stamp, turn_id),
+                    )
+
+            _retry_sqlite_busy(persist_child_identity)
+            # The child exists AND its identity is durably recorded: from here on
+            # this turn's delivery claim must converge, never be released.
             delivery_started = True
             try:
-                MAILBOX.mark_delivered_for_turn(turn_id=turn_id)
+                reconcile_delivery_turn(turn_id, started=True)
             except Exception:
                 # Mailbox bookkeeping must never kill an already-started Grok.
                 pass
-            # Persist child PID + its creation time so recover() can reap orphans
-            # after a daemon crash without risking a reused-PID mis-kill.
-            created = process_create_time(proc.pid)
-            with connect() as db:
-                db.execute(
-                    "UPDATE agents SET child_pid=?,child_started_at=?,updated_at=?,revision=revision+1 WHERE id=?",
-                    (proc.pid, str(created) if created is not None else None, now(), self.agent_id),
-                )
 
             def read_stderr():
                 assert proc and proc.stderr
@@ -2555,7 +2610,16 @@ class AgentRunner:
             returncode = proc.wait()
             stderr_thread.join(timeout=2)
         except Exception as exc:
-            if not delivery_started:
+            # Pre-spawn failures (child never existed) release the delivery claim
+            # so messages become visible again. Once the child exists the prompt
+            # is with the execution backend, so the claim converges to delivered —
+            # never release, or the message would be injected twice.
+            if child_created:
+                try:
+                    reconcile_delivery_turn(turn_id, started=True)
+                except Exception:
+                    pass
+            elif not delivery_started:
                 try:
                     released = MAILBOX.release_scheduled_for_turn(turn_id=turn_id)
                     if released:
@@ -2570,17 +2634,20 @@ class AgentRunner:
             # race; release boundary waiters once the process path is done.
             self.end_turn(turn_id)
             # Stop monitor so it runs final drain (flush wait + two deterministic passes).
-            stopped.set()
-            monitor.join(timeout=5)
-            if monitor.is_alive():
-                add_event(
-                    self.agent_id,
-                    turn_id,
-                    "observer_monitor_error",
-                    "monitor thread did not exit after final drain timeout",
-                    {"phase": "join_timeout"},
-                )
-            if monitor_errors or monitor_state.fatal:
+            # Guarded: a pre-monitor failure must not mask the original exception.
+            if monitor is not None:
+                stopped.set()
+                if monitor.ident is not None:
+                    monitor.join(timeout=5)
+                if monitor.is_alive():
+                    add_event(
+                        self.agent_id,
+                        turn_id,
+                        "observer_monitor_error",
+                        "monitor thread did not exit after final drain timeout",
+                        {"phase": "join_timeout"},
+                    )
+            if monitor_errors or (monitor_state is not None and monitor_state.fatal):
                 # Surface monitor death to runner diagnostics (not silent).
                 detail = monitor_state.fatal or (monitor_errors[-1] if monitor_errors else "unknown")
                 errors.append(f"observer_monitor: {detail}")
@@ -2615,6 +2682,16 @@ class AgentRunner:
         if self.cancelled.is_set():
             turn_status = "cancelled"
 
+        # Final delivery-claim reconciliation (idempotent): converges if the child
+        # existed, else releases. Covers a persistent M2-reconcile failure; kept
+        # best-effort so a mailbox failure can never block the terminal turn
+        # update — recover() re-reconciles from the durable child_started_at
+        # marker on the next daemon start.
+        try:
+            reconcile_delivery_turn(turn_id, started=child_created)
+        except Exception:
+            pass
+
         with connect() as db:
             current_status = db.execute("SELECT status FROM agents WHERE id=?", (self.agent_id,)).fetchone()["status"]
             if current_status == "cancelled" or self.cancelled.is_set():
@@ -2641,7 +2718,7 @@ class AgentRunner:
                 (agent_status, final_text, error_text, now(), self.agent_id),
             )
             db.execute("INSERT INTO search_index(agent_id,kind,content) VALUES(?,?,?)", (self.agent_id, "result", final_text + "\n" + error_text))
-        if turn_status != "cancelled":
+        if turn_status != "cancelled" and before is not None:
             record_changes(self.agent_id, turn_id, before, workspace_snapshot(cwd, prior=before))
         terminal_summary = {
             "completed": "Grok 已完成",
@@ -4544,13 +4621,31 @@ def recover(*, start_runners: bool = True) -> None:
                 ("queued" if queued_left else "failed", error, stamp, agent_id),
             )
 
-    # A delivery claim attached to a failed pre-crash running turn must be made
-    # visible again. Claims attached to queued turns are intentionally preserved.
+    # Delivery claims of pre-crash turns are reconciled per turn against the
+    # durable child_started_at marker (the first durable write after Popen,
+    # set in both agents and turns). A turn whose child actually started must
+    # keep its claims delivered — the prompt was already injected — while a
+    # turn that never spawned (or crashed before the marker) releases its
+    # claims so the messages become visible again. Still-queued turns are
+    # skipped: their claims stay attached and are consumed when the turn runs
+    # after recovery. Runs after the running-turn failure loop so every failed
+    # turn is reconciled by marker.
     with connect() as db:
-        db.execute(
-            "UPDATE agent_messages SET target_turn_id=NULL "
-            "WHERE state='pending' AND target_turn_id IN (SELECT id FROM turns WHERE status='failed')"
-        )
+        claimed_turn_ids = [
+            row["target_turn_id"]
+            for row in db.execute(
+                "SELECT DISTINCT target_turn_id FROM agent_messages "
+                "WHERE state='pending' AND target_turn_id IS NOT NULL"
+            )
+        ]
+    for turn_id in claimed_turn_ids:
+        with connect() as db:
+            row = db.execute("SELECT child_started_at,status FROM turns WHERE id=?", (turn_id,)).fetchone()
+        if row and row["status"] == "queued":
+            # Durable queued delivery turns keep their claims; they run after recovery.
+            continue
+        started = bool(row and row["child_started_at"])
+        reconcile_delivery_turn(turn_id, started=started)
 
     if start_runners:
         recover_runners()
@@ -4574,9 +4669,15 @@ def recover_runners() -> None:
         maybe_schedule_delivery(peer)
 
     with connect() as db:
+        # Filter cancelled agents AT QUERY TIME so the runner never even starts
+        # for them: a cancelled agent with a stale queued turn must stay dead.
         agent_ids = [
             row["agent_id"]
-            for row in db.execute("SELECT DISTINCT agent_id FROM turns WHERE status='queued'")
+            for row in db.execute(
+                "SELECT DISTINCT t.agent_id FROM turns t "
+                "JOIN agents a ON a.id=t.agent_id "
+                "WHERE t.status='queued' AND a.status NOT IN ('cancelled')"
+            )
         ]
         for agent_id in agent_ids:
             db.execute(

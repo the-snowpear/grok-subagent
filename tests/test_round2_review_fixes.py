@@ -174,11 +174,6 @@ class DurableDeliveryTests(Round2Mixin, unittest.TestCase):
         self.assertEqual(row["body"], "durable first")
         self.assertEqual(row["state"], "pending")
 
-    def test_runner_source_marks_delivery_only_after_popen_and_has_release_path(self):
-        source = inspect.getsource(daemon.AgentRunner._run)
-        self.assertLess(source.index("subprocess.Popen"), source.index("mark_delivered_for_turn"))
-        self.assertIn("release_scheduled_for_turn", source)
-
 
 class WorktreeRound2Tests(Round2Mixin, unittest.TestCase):
     def make_repo(self) -> Path:
