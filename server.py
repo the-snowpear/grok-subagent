@@ -56,6 +56,26 @@ TOOLS = [
                 "profile": {"type": "string"},
                 "worktree": {"type": "boolean"},
                 "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
+                "role": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "review"],
+                    "description": (
+                        "Orchestration worker role. explore/review are read-only "
+                        "roles (prompt policy) that collect evidence/findings; "
+                        "implement owns file changes. Defaults drive worktree "
+                        "isolation and prompt steering; an explicit worktree "
+                        "argument always wins."
+                    ),
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "description": (
+                        "Per-agent reasoning effort passed to the grok child via "
+                        "--reasoning-effort. Defaults to 'max' when omitted. "
+                        "Arbitrary strings are accepted (the CLI does not enforce "
+                        "an enum); shape-validated only."
+                    ),
+                },
             },
             "required": ["agent_name", "prompt"],
             "additionalProperties": False,
@@ -226,12 +246,42 @@ TOOLS = [
                             "profile": {"type": "string"},
                             "worktree": {"type": "boolean"},
                             "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
+                            "role": {
+                                "type": "string",
+                                "enum": ["explore", "implement", "review"],
+                                "description": (
+                                    "Per-item orchestration role; overrides the "
+                                    "batch-level role default. See create_agent."
+                                ),
+                            },
+                            "reasoning_effort": {
+                                "type": "string",
+                                "description": (
+                                    "Per-item reasoning effort; overrides the "
+                                    "batch-level reasoning_effort default."
+                                ),
+                            },
                         },
                         "required": ["agent_name", "prompt"],
                         "additionalProperties": False,
                     },
                     "minItems": 1,
                     "maxItems": 20,
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "review"],
+                    "description": (
+                        "Batch-level role default applied to every item that "
+                        "does not carry its own role. See create_agent."
+                    ),
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "description": (
+                        "Batch-level reasoning effort default applied to every "
+                        "item that does not carry its own reasoning_effort."
+                    ),
                 },
             },
             "required": ["agents"],
