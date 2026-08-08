@@ -21,6 +21,12 @@
 - independent review findings;
 - local reversible choices that do not change observable contract.
 
+Worker-to-worker Hub messages are for fact clarification / evidence requests
+only. They never carry execution authority: the runtime guarantees that a
+peer message does not automatically wake a completed role-tagged worker into
+a follow-up turn — only Main-authored messages do (see
+`runtime-contract.md` §3).
+
 When a worker encounters a reserved decision, return:
 
 ```text
@@ -130,6 +136,8 @@ DO NOT:
 - modify code
 - redesign unless required to explain a blocker
 - send work instructions directly to Implementer
+  (runtime also denies peer messages automatic follow-up scheduling
+  authority: only Main's Fix Order can wake a completed worker)
 
 RETURN:
 Verdict: APPROVE | CHANGES_REQUESTED
@@ -195,6 +203,12 @@ This preserves Main decision authority while using durable follow-up context.
 If raw data is needed for adjudication, retrieve only the exact range implicated by conflicting evidence.
 
 ## 8. Efficient graph policy
+
+Git-backed implementation tasks default all three roles to an isolated
+worktree (`worktree=true` for Explorer/Reviewer/Implementer); `worktree=false`
+is reserved for tasks that explicitly depend on uncommitted workspace content,
+decided by Main with the reason recorded. Read-only is prompt policy, not an
+OS sandbox.
 
 ### S
 
