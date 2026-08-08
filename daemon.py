@@ -399,6 +399,27 @@ def init_db() -> None:
             )
         except sqlite3.OperationalError:
             pass
+        # Backfill delivery markers for historical round-3 crash rows where
+        # Popen succeeded but the OS create-time lookup returned None: a
+        # running agent with child_pid set, whose current turn is running and
+        # carries no legacy marker. Evidence rationale: child_pid on a running
+        # agent is only ever set right after a successful Popen, and the
+        # running current turn is the one that spawned it — so the delivery
+        # claim is real and recover() must converge, not release. The
+        # correlated EXISTS keeps this strictly agent+current-turn scoped:
+        # queued turns are never touched, non-null child_spawned_at is never
+        # overwritten, and COALESCE(created_at, now()) is the best available
+        # spawn time. Idempotent — a second run matches no rows.
+        try:
+            db.execute(
+                "UPDATE turns SET child_spawned_at=COALESCE(created_at, ?) "
+                "WHERE child_spawned_at IS NULL AND status='running' "
+                "AND EXISTS (SELECT 1 FROM agents a WHERE a.id=turns.agent_id AND a.status='running' "
+                "AND a.child_pid IS NOT NULL AND a.current_turn=turns.id)",
+                (now(),),
+            )
+        except sqlite3.OperationalError:
+            pass
         # Backfill empty display titles from agent name (one-shot, cheap).
         try:
             db.execute(
@@ -2644,15 +2665,22 @@ class AgentRunner:
             # child. The OS process identity (child_started_at) is written
             # afterwards, agents only, so a slow/None create-time lookup can
             # never delay the delivery marker.
+            # Invariant: the moment agents.child_pid=new becomes durable,
+            # agents.child_started_at is already NULL — both writes share one
+            # transaction and one spawn_stamp. The OS lookup below is the ONLY
+            # writer that may repopulate child_started_at, and only when it
+            # succeeds for the CURRENT pid, so a stale identity from a previous
+            # child can never survive a new spawn.
             def persist_child_marker():
+                spawn_stamp = now()
                 with connect() as db:
                     db.execute(
-                        "UPDATE agents SET child_pid=?,updated_at=?,revision=revision+1 WHERE id=?",
-                        (proc.pid, now(), self.agent_id),
+                        "UPDATE agents SET child_pid=?,child_started_at=NULL,updated_at=?,revision=revision+1 WHERE id=?",
+                        (proc.pid, spawn_stamp, self.agent_id),
                     )
                     db.execute(
                         "UPDATE turns SET child_spawned_at=? WHERE id=?",
-                        (now(), turn_id),
+                        (spawn_stamp, turn_id),
                     )
 
             _retry_sqlite_busy(persist_child_marker)
@@ -4761,6 +4789,7 @@ def recover(*, start_runners: bool = True) -> None:
         child_pid = row["child_pid"]
         reaped = False
         identity_unverified = False
+        identity_lookup_error = None
         pid = 0
         if child_pid is not None:
             try:
@@ -4770,7 +4799,11 @@ def recover(*, start_runners: bool = True) -> None:
             if pid > 0 and pid_is_alive(pid):
                 verified = False
                 expected = row["child_started_at"]
-                actual = process_create_time(pid)
+                actual = None
+                try:
+                    actual = process_create_time(pid)
+                except (OSError, ValueError) as exc:
+                    identity_lookup_error = str(exc)
                 if expected is not None and actual is not None:
                     try:
                         verified = abs(float(actual) - float(expected)) <= 2.0
@@ -4786,7 +4819,12 @@ def recover(*, start_runners: bool = True) -> None:
         if reaped:
             error += f"; orphan process reaped (pid={pid})"
         elif identity_unverified:
-            error += f"; recorded pid={pid} could not be identity-verified, not killed"
+            if identity_lookup_error is not None:
+                error += (
+                    f"; process identity lookup failed ({identity_lookup_error}); pid not killed"
+                )
+            else:
+                error += f"; recorded pid={pid} could not be identity-verified, not killed"
         stamp = now()
         with connect() as db:
             # Do not fail durable queued turns. A running turn may have partial
