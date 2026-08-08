@@ -28,7 +28,7 @@ from pathlib import Path
 
 from coordination import AgentRegistry, CoordinationHub, Mailbox, main_peer_id
 
-from prompt_transport import PromptTransport, prepare_prompt_transport, probe_prompt_file_support, PROMPT_ARG_SAFE_CHARS
+from prompt_transport import PromptTransport, prepare_prompt_transport, probe_prompt_file_support
 
 if os.name == "nt":
     import msvcrt
@@ -2104,26 +2104,30 @@ def unique_changed_files(agent_id: str) -> int:
         return int(row["c"])
 
 
-def grok_command(agent_row: dict, prompt: str, first_turn: bool, cwd: Path, extra_args: list[str] | None = None) -> list[str]:
+def grok_command(agent_row: dict, prompt: str | None, first_turn: bool, cwd: Path, prompt_file_flag: str | None = None, prompt_file: str | None = None) -> list[str]:
     """Build the grok CLI invocation for one turn (fake-grok aware, honors max_turns).
 
-    extra_args (e.g. a native prompt-file flag from PromptTransport) are
-    appended at the END of the command, after session/resume flags, so
-    existing callers keep byte-identical commands.
+    ``prompt`` may be None when the full prompt travels in a durable prompt
+    file: the ``-p`` positional is then omitted entirely. The native
+    ``prompt_file_flag``/``prompt_file`` pair (when both are set) is appended
+    at the END of the command, after session/resume flags, so existing
+    callers keep byte-identical commands.
     """
     fake_grok = os.environ.get("GROK_OBSERVER_FAKE_GROK")
     executable = [sys.executable, fake_grok] if fake_grok else ["grok"]
     stored_max = agent_row["max_turns"] if "max_turns" in agent_row.keys() else None
-    command = executable + [
-        "-p", prompt,
+    command = executable
+    if prompt is not None:
+        command = command + ["-p", prompt]
+    command = command + [
         "--cwd", str(cwd),
         "--output-format", "streaming-json",
         "--always-approve", "--no-subagents",
         "--max-turns", str(int(stored_max or 50)),
     ]
     command += ["--session-id", agent_row["grok_session_id"]] if first_turn else ["--resume", agent_row["grok_session_id"]]
-    if extra_args:
-        command.extend(extra_args)
+    if prompt_file_flag and prompt_file:
+        command.extend([prompt_file_flag, prompt_file])
     return command
 
 
@@ -2575,10 +2579,17 @@ class AgentRunner:
             # Large prompts never travel in full in argv on Windows: oversized
             # prompts go to a durable file under data/prompts (retained with
             # agent data) and argv carries only the transport's short prompt.
-            transport = prepare_prompt_transport(
-                self.agent_id, turn_id, prompt, prompt_file_support=probe_prompt_file_support()
+            # The transport probes the CLI lazily — only when a file transport
+            # is actually needed, so short prompts never spawn a probe process.
+            transport = prepare_prompt_transport(self.agent_id, turn_id, prompt)
+            command = grok_command(
+                agent,
+                transport.argv_prompt,
+                first_turn,
+                cwd,
+                prompt_file_flag=transport.prompt_file_flag,
+                prompt_file=transport.prompt_file,
             )
-            command = grok_command(agent, transport.argv_prompt, first_turn, cwd, extra_args=transport.extra_args)
             add_event(
                 self.agent_id,
                 turn_id,
@@ -4159,6 +4170,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 # Keep the task while its thread still has mailbox messages.
                 delete_orphan_tasks(db)
             shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
+            cleanup_agent_prompt_files(agent_id)
             notify_catalog(agent_id)
             return json_response(self, {"deleted": True, "agent_id": agent_id})
         match = re.fullmatch(r"/api/agents/([0-9a-fA-F-]{36})/meta", self.path)
@@ -4678,6 +4690,17 @@ def delete_orphan_tasks(db) -> None:
 
 
 
+def cleanup_agent_prompt_files(agent_id: str) -> None:
+    """Remove one agent's durable prompt files (deletion / retention only).
+
+    Prompt files live under ``data/prompts/<agent_id>/`` and are retained
+    while the agent exists (crash recovery, debugging). They are removed
+    exactly when the agent itself is removed — manually via the delete
+    endpoint or by ``cleanup()`` retention — never at turn completion.
+    """
+    shutil.rmtree(DATA / "prompts" / agent_id, ignore_errors=True)
+
+
 def cleanup() -> None:
     """Delete expired terminal agents; reclaim worktree roots correctly."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
@@ -4699,6 +4722,7 @@ def cleanup() -> None:
             db.execute("DELETE FROM search_index WHERE agent_id=?", (agent_id,))
             db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
         shutil.rmtree(ARTIFACTS / agent_id, ignore_errors=True)
+        cleanup_agent_prompt_files(agent_id)
 
     with connect() as db:
         # Preserve the existing mailbox-history retention contract in this

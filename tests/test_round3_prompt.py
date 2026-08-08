@@ -2,7 +2,7 @@
 
 Contract under test (prompt_transport.py + daemon.py):
 - Small prompts travel in argv; large prompts never travel in full in argv on
-  the Windows character-based policy (windows_argv_limit=True makes the policy
+  the Windows UTF-16 code-unit policy (windows_argv_limit=True makes the policy
   testable on any OS; POSIX always uses argv).
 - Large prompts are written durably to data/prompts/<agent_id>/<turn_id>.txt
   and delivered either through a probed native --prompt-file flag or through a
@@ -55,7 +55,7 @@ class PromptTransportTests(Round3Mixin, unittest.TestCase):
         self.assertEqual(transport.mode, "argv")
         self.assertEqual(transport.argv_prompt, "short prompt")
         self.assertIsNone(transport.prompt_file)
-        self.assertEqual(transport.extra_args, [])
+        self.assertIsNone(transport.prompt_file_flag)
 
     def test_large_ascii_prompt_uses_file_transport(self):
         prompt = "A" * 60000
@@ -67,25 +67,23 @@ class PromptTransportTests(Round3Mixin, unittest.TestCase):
         target = Path(transport.prompt_file)
         self.assertTrue(target.exists())
         self.assertEqual(target.read_text(encoding="utf-8"), prompt)
-        self.assertNotEqual(transport.argv_prompt, prompt)
-        if transport.argv_prompt is not None:
-            self.assertLess(len(transport.argv_prompt), 1000)
-        self.assertEqual(len(transport.extra_args), 2)
-        self.assertEqual(transport.extra_args[0], "--prompt-file")
-        self.assertEqual(transport.extra_args[1], transport.prompt_file)
+        # Exactly one prompt source: no argv/wrapper prompt, only the native flag.
+        self.assertIsNone(transport.argv_prompt)
+        self.assertEqual(transport.prompt_file_flag, "--prompt-file")
 
     def test_large_ascii_prompt_full_content_not_in_argv(self):
         prompt = "A" * 60000
         transport = self.prepare_transport("a", 3, prompt, prompt_file_support=None, windows_argv_limit=True)
         self.assertEqual(transport.mode, "wrapper_file")
-        self.assertEqual(transport.extra_args, [])
+        self.assertIsNone(transport.prompt_file_flag)
         agent_row = {"grok_session_id": "sess-1", "max_turns": 50}
         command = daemon.grok_command(
             agent_row,
             transport.argv_prompt or "wrapper",
             True,
             Path("."),
-            extra_args=transport.extra_args,
+            prompt_file_flag=transport.prompt_file_flag,
+            prompt_file=transport.prompt_file,
         )
         self.assertNotIn(prompt, command)
         self.assertEqual(Path(transport.prompt_file).read_text(encoding="utf-8"), prompt)
@@ -99,7 +97,7 @@ class PromptTransportTests(Round3Mixin, unittest.TestCase):
         self.assertLess(len(transport.argv_prompt), 1000)
         self.assertNotIn(prompt, transport.argv_prompt)
         self.assertEqual(Path(transport.prompt_file).read_text(encoding="utf-8"), prompt)
-        self.assertEqual(transport.extra_args, [])
+        self.assertIsNone(transport.prompt_file_flag)
 
 
 class PromptCapabilityProbeTests(Round3Mixin, unittest.TestCase):
