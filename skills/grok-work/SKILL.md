@@ -43,9 +43,11 @@ strict_subagents = true
 strict_main_decisions = true
 max_fix_rounds = 2
 nested_subagents = false
+max_turns = 100              # per-worker execution budget; Main passes it explicitly
 ```
 
 - `reasoning_effort` 是 **runtime 真实字段**：`create_agent` / `create_agents` 支持传入（含 batch default 与 per-item override），未传时默认 `max` 并持久化在 agent 行上，durable follow-up 继承原值；child CLI 使用已验证的表示 `--reasoning-effort <value>`（grok 1.0.0）。不要把“max”只写在 prompt 里。能力边界见 `references/runtime-contract.md`。
+- `max_turns` 默认设为 `100`；Main 创建每个 worker 时必须显式传入 `max_turns=100`，以给多阶段探索、Hub 协作和 review 留出足够回合；runtime 仍保留 `1–500` 的安全范围。
 - `efficient` 的含义是**最小充分 agent graph**，不是降低 worker 思考强度。不要因为并发能力存在就无条件 fan-out。
 
 ## Workspace 隔离（git-backed 任务默认）
