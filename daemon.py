@@ -4871,7 +4871,13 @@ def recover(*, start_runners: bool = True) -> None:
             # Durable queued delivery turns keep their claims; they run after recovery.
             continue
         started = bool(row and row["child_spawned_at"])
-        reconcile_delivery_turn(turn_id, started=started)
+        try:
+            reconcile_delivery_turn(turn_id, started=started)
+        except Exception:
+            # One mailbox failure must not abort reconciliation of the
+            # remaining claimed turns; markers are durable and the loop
+            # re-runs on the next daemon start.
+            pass
 
     if start_runners:
         recover_runners()
