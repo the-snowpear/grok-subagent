@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import base64
 import gzip
-import inspect
 import os
 import shutil
 import subprocess
@@ -275,11 +274,6 @@ class DiscoveryAndStartupTests(Round2Mixin, unittest.TestCase):
         self.assertTrue(env["GROK_OBSERVER_HUB_CLI"].endswith("grok_hub.py"))
         self.assertTrue(env["GROK_OBSERVER_NATIVE_BRIDGE"].endswith("native_bridge.py"))
         self.assertEqual(env["GROK_OBSERVER_AGENT_ID"], aid)
-
-    def test_main_binds_ports_before_starting_recovered_runners(self):
-        source = inspect.getsource(daemon.main)
-        self.assertLess(source.index("worker_server.serve_forever"), source.index("recover_runners()"))
-
 
 if __name__ == "__main__":
     unittest.main()

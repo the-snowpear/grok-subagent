@@ -28,6 +28,8 @@ from pathlib import Path
 
 from coordination import AgentRegistry, CoordinationHub, Mailbox, main_peer_id
 
+from prompt_transport import PromptTransport, prepare_prompt_transport, probe_prompt_file_support, PROMPT_ARG_SAFE_CHARS
+
 if os.name == "nt":
     import msvcrt
     import winreg
@@ -1939,10 +1941,60 @@ def maybe_schedule_delivery(agent_id: str) -> int:
         if runner is not None:
             try:
                 runner.enqueue(turn_id, prompt)
-            except ValueError:
-                # Durable queued turn remains recoverable from SQLite.
-                pass
+            except Exception as exc:
+                # Durable queued turn remains recoverable from SQLite; the
+                # delivery sweep retries anything that never committed.
+                print(f"delivery wake failed for {agent_id}: {exc}", file=sys.stderr, flush=True)
+                try:
+                    add_event(agent_id, None, "delivery_wake_error", str(exc), {})
+                except Exception:
+                    pass
         return claimed_count
+
+
+DELIVERY_SWEEP_INTERVAL_S = 2.0
+
+
+def delivery_sweep() -> None:
+    """Retry scheduling for pending mail that missed its post-commit delivery.
+
+    A maybe_schedule_delivery that raised before its durable commit leaves
+    messages pending/unclaimed with the agent still 'completed'; this sweep
+    renders them into a durable queued follow-up turn without a daemon restart.
+    Idempotent by design: the per-agent lock plus the conditional message
+    claim (state='pending' AND target_turn_id IS NULL) plus the completed-only
+    agent filter guarantee at most one follow-up turn per target.
+    """
+    with connect() as db:
+        peers = [
+            row["to_peer"]
+            for row in db.execute(
+                "SELECT DISTINCT m.to_peer FROM agent_messages m "
+                "JOIN agents a ON a.id=m.to_peer "
+                "WHERE m.state='pending' AND m.consumed_at IS NULL "
+                "AND m.target_turn_id IS NULL AND a.status='completed'"
+            )
+        ]
+    for peer in peers:
+        try:
+            maybe_schedule_delivery(peer)
+        except Exception as exc:
+            print(f"delivery sweep failed for {peer}: {exc}", file=sys.stderr, flush=True)
+            try:
+                add_event(peer, None, "delivery_sweep_error", str(exc), {})
+            except Exception:
+                pass
+
+
+def delivery_sweep_loop() -> None:
+    """Background loop: keep sweeping while the daemon runs."""
+    while True:
+        time.sleep(DELIVERY_SWEEP_INTERVAL_S)
+        try:
+            delivery_sweep()
+        except Exception as exc:
+            print(f"delivery sweep loop failed: {exc}", file=sys.stderr, flush=True)
+
 
 # Coordination kernel singletons (thread-scoped peer registry, durable mailbox).
 REGISTRY = AgentRegistry(coordination_connect)
@@ -2040,8 +2092,13 @@ def unique_changed_files(agent_id: str) -> int:
         return int(row["c"])
 
 
-def grok_command(agent_row: dict, prompt: str, first_turn: bool, cwd: Path) -> list[str]:
-    """Build the grok CLI invocation for one turn (fake-grok aware, honors max_turns)."""
+def grok_command(agent_row: dict, prompt: str, first_turn: bool, cwd: Path, extra_args: list[str] | None = None) -> list[str]:
+    """Build the grok CLI invocation for one turn (fake-grok aware, honors max_turns).
+
+    extra_args (e.g. a native prompt-file flag from PromptTransport) are
+    appended at the END of the command, after session/resume flags, so
+    existing callers keep byte-identical commands.
+    """
     fake_grok = os.environ.get("GROK_OBSERVER_FAKE_GROK")
     executable = [sys.executable, fake_grok] if fake_grok else ["grok"]
     stored_max = agent_row["max_turns"] if "max_turns" in agent_row.keys() else None
@@ -2053,6 +2110,8 @@ def grok_command(agent_row: dict, prompt: str, first_turn: bool, cwd: Path) -> l
         "--max-turns", str(int(stored_max or 50)),
     ]
     command += ["--session-id", agent_row["grok_session_id"]] if first_turn else ["--resume", agent_row["grok_session_id"]]
+    if extra_args:
+        command.extend(extra_args)
     return command
 
 
@@ -2499,8 +2558,24 @@ class AgentRunner:
             add_event(self.agent_id, turn_id, "user", prompt, {"prompt": prompt, "turn": turn["turn_no"]})
 
             first_turn = int(turn["turn_no"]) == 1
-            command = grok_command(agent, prompt, first_turn, cwd)
-            add_event(self.agent_id, turn_id, "process", "启动 Grok Build", {"command": command[:1] + ["<prompt>"] + command[3:]})
+            # Large prompts never travel in full in argv on Windows: oversized
+            # prompts go to a durable file under data/prompts (retained with
+            # agent data) and argv carries only the transport's short prompt.
+            transport = prepare_prompt_transport(
+                self.agent_id, turn_id, prompt, prompt_file_support=probe_prompt_file_support()
+            )
+            command = grok_command(agent, transport.argv_prompt, first_turn, cwd, extra_args=transport.extra_args)
+            add_event(
+                self.agent_id,
+                turn_id,
+                "process",
+                "启动 Grok Build",
+                {
+                    "command": command[:1] + ["<prompt>"] + command[3:],
+                    "prompt_mode": transport.mode,
+                    "prompt_file": transport.prompt_file,
+                },
+            )
 
             stopped = threading.Event()
             monitor = threading.Thread(
@@ -4806,6 +4881,7 @@ def main() -> None:
     # Recovered workers receive the actual bound worker-control port.
     recover_runners()
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=delivery_sweep_loop, daemon=True).start()
     try:
         server.serve_forever()
     finally:
